@@ -385,10 +385,14 @@ Analyze the current state and write a Python program using the FLE API to progre
                     # Generate response using Inspect's model with reasoning support
                     generation_config = {
                         "max_tokens": 4096,  # More tokens for complex programs
-                        "transforms": ["middle-out"],
                         "reasoning_effort": "minimal",
                         # "temperature": 0.1
                     }
+                    _model_name = str(get_model())
+                    if "openrouter" in _model_name:
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     state.output = await get_model().generate(
                         input=state.messages,

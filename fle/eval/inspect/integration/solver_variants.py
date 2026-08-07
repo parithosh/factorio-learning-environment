@@ -337,12 +337,9 @@ Progress: {(step / trajectory_length) * 100:.1f}% of trajectory complete
                     "cache": CachePolicy(per_epoch=False),
                 }
                 _model = get_model()
-                # Safely access model name - handle cases where get_model() returns unexpected types
-                model_name_str = (
-                    getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                )
+                model_name_str = str(_model)
                 if model_name_str and "openrouter" in model_name_str:
-                    generation_config["transforms"] = ["middle-out"]
+                    generation_config["extra_body"] = {"transforms": ["middle-out"]}
 
                 inference_start = time.time()
                 output = await _model.generate(
@@ -1070,12 +1067,11 @@ Now begin building your factory step by step."""
                         "cache": CachePolicy(per_epoch=False),
                     }
                     _model = get_model()
-                    # Safely access model name - handle cases where get_model() returns unexpected types
-                    model_name_str = (
-                        getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                    )
+                    model_name_str = str(_model)
                     if model_name_str and "openrouter" in model_name_str:
-                        generation_config["transforms"] = ["middle-out"]
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     inference_start = time.time()
                     output = await _model.generate(
@@ -1557,12 +1553,11 @@ Analyze the current state and write a Python program using the FLE API to expand
                         "cache": CachePolicy(per_epoch=False),
                     }
                     _model = get_model()
-                    # Safely access model name - handle cases where get_model() returns unexpected types
-                    model_name_str = (
-                        getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                    )
+                    model_name_str = str(_model)
                     if model_name_str and "openrouter" in model_name_str:
-                        generation_config["transforms"] = ["middle-out"]
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     inference_start = time.time()
                     output = await _model.generate(
@@ -2111,12 +2106,11 @@ Analyze the current state and write a Python program using the FLE API to expand
                         "cache": CachePolicy(per_epoch=False),
                     }
                     _model = get_model()
-                    # Safely access model name - handle cases where get_model() returns unexpected types
-                    model_name_str = (
-                        getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                    )
+                    model_name_str = str(_model)
                     if model_name_str and "openrouter" in model_name_str:
-                        generation_config["transforms"] = ["middle-out"]
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     inference_start = time.time()
                     output = await _model.generate(
@@ -2612,12 +2606,11 @@ Analyze the current state and write a Python program using the FLE API to expand
                         "cache": CachePolicy(per_epoch=False),
                     }
                     _model = get_model()
-                    # Safely access model name - handle cases where get_model() returns unexpected types
-                    model_name_str = (
-                        getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                    )
+                    model_name_str = str(_model)
                     if model_name_str and "openrouter" in model_name_str:
-                        generation_config["transforms"] = ["middle-out"]
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     inference_start = time.time()
                     output = await _model.generate(
@@ -3059,12 +3052,11 @@ Analyze the current state and write a Python program using the FLE API to expand
                         "cache": CachePolicy(per_epoch=False),
                     }
                     _model = get_model()
-                    # Safely access model name - handle cases where get_model() returns unexpected types
-                    model_name_str = (
-                        getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                    )
+                    model_name_str = str(_model)
                     if model_name_str and "openrouter" in model_name_str:
-                        generation_config["transforms"] = ["middle-out"]
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     inference_start = time.time()
                     output = await _model.generate(
