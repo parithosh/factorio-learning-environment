@@ -922,12 +922,13 @@ def factorio_unbounded_solver():
                         # "reasoning_effort": "minimal",
                     }
                     _model = get_model()
-                    # Safely access model name - handle cases where get_model() returns unexpected types
-                    model_name_str = (
-                        getattr(_model, "name", "") if hasattr(_model, "name") else ""
-                    )
+                    # str(_model) includes the provider prefix (e.g. "openrouter/...");
+                    # Model.name does not, so it can never match here.
+                    model_name_str = str(_model)
                     if model_name_str and "openrouter" in model_name_str:
-                        generation_config["transforms"] = ["middle-out"]
+                        generation_config["extra_body"] = {
+                            "transforms": ["middle-out"]
+                        }
 
                     # Track inference latency
                     inference_start = time.time()
