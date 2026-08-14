@@ -108,7 +108,7 @@ class EntitySpritesheetExtractor:
                 temp_path = Path(temp_dir)
 
                 # Run basisu transcoder
-                cmd = ["basisu", "-unpack", str(basis_path)]
+                cmd = ["basisu", "-unpack", str(basis_path.resolve())]
                 result = subprocess.run(
                     cmd, cwd=temp_path, capture_output=True, text=True
                 )

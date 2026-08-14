@@ -33,6 +33,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vendored pi's `packages/ai/src` (the reference implementation for the
   Claude Code OAuth flow and request shaping) under `vendor/pi-ai` via
   `git subtree`; see the subtree commit for the update recipe.
+- Bench stack support: `bench/llm.py` gained a `ClaudeClient` (`claude/<model>`)
+  that reuses the same OAuth credentials via `fle.eval.inspect.claude.auth` —
+  Claude Code identity headers + spoofed first system block, explicit
+  `temperature=1.0` (keeps the Exp-3 persona gate on), prompt caching on the
+  shared FLE system prompt with per-call `cache_read/write_tokens` journaled.
+- Bench stack: `bench/llm.py` also gained an `OpenRouterClient`
+  (`openrouter/<vendor>/<model>`, `OPENROUTER_API_KEY`/`OPENROUTER_KEY`) —
+  metered fallback for experiments whose burn exceeds subscription windows.
+  Upstream pinning via `OPENROUTER_PROVIDER` (fallbacks disabled when set, the
+  serving upstream journaled per call), no transforms sent, explicit
+  `temperature=1.0`, hardened retry for pinned single-upstream routes.
+
+**Benchmark harness (`bench/`)**
+
+- New `bench/` package: the experiment harness used for the fork's tier-0/0.5/1
+  and Exp-1/2/3 benchmark studies (arms, runners, analysis, farplane compute
+  glue, LLM clients, fixtures). Experiment data (`bench/journal/`,
+  `bench/results/`) is gitignored.
+- `FactorioGymEnv` gained `bench_mode`: skips per-step `task.verify()` (which
+  sleeps through repeated 60s throughput windows), never terminates on quota,
+  and skips per-step `GameState` capture. Exposed in the sandbox image via
+  `FLE_BENCH_MODE`.
+- The sandbox bridge (`bridge_service.py`) now also serves its API over HTTP
+  (`FLE_BRIDGE_PORT`, default 8730) alongside the existing UDS listener, for
+  use by out-of-sandbox harnesses (`bench/bridge_client.py`).
+- Experimental agent-driven branching in the Inspect solver (`FLE_BRANCHING=true`):
+  injects `snapshot()`/`restore()` into the agent namespace, backed by
+  `GameState` capture/restore.
+- `basisu -unpack` is now invoked with a resolved absolute path so sprite
+  extraction works regardless of the caller's working directory.
+
+**Bench review hardening (PR #5 review fixes)**
+
+- Bridge security: the TCP listener now requires `Authorization: Bearer
+  $FLE_BRIDGE_TOKEN` when a token is configured (UDS exempt); without a token
+  it only starts under `FLE_BRIDGE_ALLOW_INSECURE=1`. Request bodies are
+  bounded and parsed before the global state lock, error responses no longer
+  leak tracebacks (correlation id instead), and a failed `/probe` re-pauses
+  the game.
+- `bench/bridge_client.py` retries only idempotent requests — mutating POSTs
+  (`/execute`, `/probe`, `/reset`, `/state-restore`) are never replayed after
+  ambiguous transport failures (`BridgeError.ambiguous`).
+- `bench/common.py`: `resource_name()` no longer truncates away the seat role
+  (multi-seat name collisions); `RunJournal` records carry a per-invocation
+  `session` id and consumers read via the new `load_journal_records()`
+  (fail-closed on corrupt/multi-session journals); new `atomic_write_json()`
+  used for every result artifact.
+- Fail-closed measurement across the tiers: tier-0 no longer fabricates
+  `cap=1` without soak evidence, includes parity-probe forks in throughput,
+  scores every computed fidelity invariant, and gates on complete evidence;
+  tier-0.5 enforces the LLM/materialization overlap gate, refuses to freeze
+  configs from missing or infeasible calibrations, reads the real tier-0
+  schema, and resets the loopback bridge between models; tier-0.5 merge
+  validates gate K, rejects incomplete/duplicated tracks, and never silently
+  relaxes the block budget.
+- `bench/arms.py`: endpoints are `partial` unless every seat probed at T,
+  timed-out probes and unreadable baselines are excluded from selection,
+  timed-out `/execute` calls are drained (node quarantined) before reuse,
+  sandboxes are owned from creation (no leak on failed attach), and
+  cancellation propagates through every recovery path.
+- `bench/run_tier1.py`: slot pool refuses over-wide cells, every cell outcome
+  is accounted (setup failures, cancellations, second dead provider), `--keep`
+  is additive, `--cells` merges are config-fingerprint checked, per-cell LLM
+  clients are closed, and the process exits nonzero on incomplete matrices.
+- `bench/farplane.py`: honest absolute deadlines across all phases, operation
+  ids are never mistaken for sandbox ids, `--env` values are redacted from
+  errors/journals, and the reaper paginates, settles unresolved operations,
+  and retains source snapshots of pending forks.
+- `bench/llm.py`: billed empty-completion retries are counted in usage,
+  OpenRouter middle-out is explicitly disabled, stream failures retry, and
+  end-to-end sample latency includes retries.
+- Exp-1/2/3 analysis integrity: exp-1 equalizes forked children at a restore
+  barrier, requires full-K draws, resamples the bootstrap at strategy level,
+  and pins the third-wave read point; exp-2's extractor is memory-bounded and
+  fail-closed with a three-state verdict; exp-3 validates the S2B milestone,
+  cleans up template/bake sandboxes on failure, and the blog renderer no
+  longer unpickles namespace blobs from state files.
+
+**Bench review hardening, round 2 (cross-module contract fixes)**
+
+- Unified the frozen Tier-0.5 config schema across producers and consumers:
+  both `tier05.py` and `tier05_merge.py` emit `arm_b_models`, `priority_cells`,
+  `status`/`executable`, and per-model `enters_pilot`/`pilot_skip_reason`;
+  `run_tier1` restricts arm-B cells to `arm_b_models` and refuses
+  non-executable/REFUSED configs; `analyze_tier1` consumes the same fields.
+  A refused merge now atomically replaces stale FROZEN artifacts with a
+  non-executable refusal marker.
+- Tier-0 capacity semantics honored end to end: incomplete soaks publish
+  `valid=false`, abnormal exits invalidate the stale cap/gate inside
+  `tier0.json`, a measured `cap=0` fails the gate, and Tier-0.5 treats a
+  present null/zero cap as a fail-closed blocker (explicit `--node-cap`
+  operator override; measured zero cannot be overridden). Invalid soak
+  markers poison soak-derived reads from both artifacts.
+- Verdict evidence is session-bound: arm results carry `journal_session`,
+  and the exp-2 analyzer binds every result row to its journal digest
+  (merged `--session all` digests rejected for verdicts); the exp-2
+  INCONCLUSIVE path no longer crashes on invalid cells and the final
+  recommendation is derived from the three-state verdict.
+- Bridge ambiguity end to end: any 5xx on a mutating request (and
+  response-side header failures) is `BridgeError(ambiguous=True)`; the arm
+  loops quarantine the node on ambiguous mutations instead of retrying, and
+  a timed-out `/execute` that settles late is committed into trajectory
+  bookkeeping (or the line stops) instead of silently mutating the world.
+  Missing selection probes are unscorable; all-unscorable rounds adopt a
+  branch or end the line partial; ProviderDead propagates from branch
+  rollouts; live-smoke results get per-invocation output paths.
+- `run_tier1` exits nonzero for any non-ok run or pending rerun, merges
+  `--round` selections into existing artifacts instead of replacing them,
+  fingerprints all measurement-defining config for `--cells` recovery,
+  reserves Hybrid's failure-path peak (2K-1), and honors `--parallel-round`
+  with config-loaded Exp-3 blocks.
+- `RunJournal` quarantines a torn tail to a `.torn` sidecar (under flock)
+  before opening a new session, so a crashed writer can no longer corrupt
+  strict session loading; `atomic_write_json`'s serialization fallback is
+  genuinely non-throwing (guarded attribute/repr access, cycles, keys).
+- Exp-1's release barrier fails closed on unverified restored worlds and
+  unreadable ticks; resumes require the full measurement fingerprint
+  (including `waves`); aborted wave attempts are preserved. Exp-3 keeps
+  previously secured S2B snapshots out of the failed-bake sweep, appends
+  bake journal sessions instead of replacing the file, and tears down the
+  template sandbox even when bookkeeping writes fail.
+- `analyze_tier1`'s ledger audit replays `fork_child_ready` (fork children
+  can no longer vanish from the residual claim), rejects empty ledger
+  trees, pools cold-page probe samples, and validates the Tier-0.5 JSON
+  shape. `_t05_gates.sh` authenticates its `/reset` against the secured
+  bridge; `_pilot_codex.sh` launches with its validated interpreter.
+- Solver branching: `restore()` prunes namespace attributes created after
+  the snapshot, so helpers from discarded timelines no longer leak into the
+  restored branch.
 
 ### Fixed
 

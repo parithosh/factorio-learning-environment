@@ -230,7 +230,16 @@ class FactorioGymEnv(gym.Env):
         error_penalty: float = 0.0,
         pause_after_action: bool = True,
         enable_vision: bool = True,
+        bench_mode: bool = False,
     ):
+        """
+        Args:
+            bench_mode: benchmark-harness mode. Skips per-step ``task.verify()`` (which
+                mutates the world by sleeping through repeated 60s throughput windows),
+                never terminates on task/quota success, and skips the per-step
+                ``GameState.from_instance()`` capture. Scoring is done out-of-band by the
+                harness on a disposable fork/restore instead.
+        """
         super().__init__()
 
         self.instance = instance
@@ -239,6 +248,7 @@ class FactorioGymEnv(gym.Env):
         self.instance_speed = instance.get_speed()
         self.pause_after_action = pause_after_action
         self.enable_vision = enable_vision
+        self.bench_mode = bench_mode
 
         # Define action space - a dictionary containing agent index and code
         self.action_space = spaces.Dict(
@@ -449,10 +459,12 @@ class FactorioGymEnv(gym.Env):
         )
         # Check for errors
         error_occurred = "error" in result.lower() or "exception: " in result.lower()
-        # Get task verification if task exists
+        # Get task verification if task exists.
+        # bench_mode skips it: ThroughputTask.verify() sleeps through repeated 60s windows
+        # (mutating the world by an unbounded amount) and flips `terminated` on quota.
         task_response = task_success = None
         terminated = truncated = False
-        if self.task:
+        if self.task and not self.bench_mode:
             # First get the raw verification
             task_success = self.task.verify(
                 initial_score, self.instance, step_statistics={}
@@ -473,7 +485,9 @@ class FactorioGymEnv(gym.Env):
             reward = production_score - initial_score
         reward = float(reward) - self.error_penalty
 
-        output_game_state = GameState.from_instance(self.instance)
+        output_game_state = (
+            None if self.bench_mode else GameState.from_instance(self.instance)
+        )
         # Get post-execution flows and calculate achievements
         current_flows = ProductionFlows.from_dict(namespace._get_production_stats())
         achievements = calculate_achievements(start_production_flows, current_flows)
