@@ -84,3 +84,6 @@ cortex
 CLAUDE.md
 /server/CLAUDE.md
 configs
+# Bench experiment artifacts (code in bench/ is tracked; data is not)
+/bench/journal/
+/bench/results/

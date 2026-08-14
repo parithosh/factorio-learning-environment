@@ -33,6 +33,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Vendored pi's `packages/ai/src` (the reference implementation for the
   Claude Code OAuth flow and request shaping) under `vendor/pi-ai` via
   `git subtree`; see the subtree commit for the update recipe.
+- Bench stack support: `bench/llm.py` gained a `ClaudeClient` (`claude/<model>`)
+  that reuses the same OAuth credentials via `fle.eval.inspect.claude.auth` —
+  Claude Code identity headers + spoofed first system block, explicit
+  `temperature=1.0` (keeps the Exp-3 persona gate on), prompt caching on the
+  shared FLE system prompt with per-call `cache_read/write_tokens` journaled.
+- Bench stack: `bench/llm.py` also gained an `OpenRouterClient`
+  (`openrouter/<vendor>/<model>`, `OPENROUTER_API_KEY`/`OPENROUTER_KEY`) —
+  metered fallback for experiments whose burn exceeds subscription windows.
+  Upstream pinning via `OPENROUTER_PROVIDER` (fallbacks disabled when set, the
+  serving upstream journaled per call), no transforms sent, explicit
+  `temperature=1.0`, hardened retry for pinned single-upstream routes.
+
+**Benchmark harness (`bench/`)**
+
+- New `bench/` package: the experiment harness used for the fork's tier-0/0.5/1
+  and Exp-1/2/3 benchmark studies (arms, runners, analysis, farplane compute
+  glue, LLM clients, fixtures). Experiment data (`bench/journal/`,
+  `bench/results/`) is gitignored.
+- `FactorioGymEnv` gained `bench_mode`: skips per-step `task.verify()` (which
+  sleeps through repeated 60s throughput windows), never terminates on quota,
+  and skips per-step `GameState` capture. Exposed in the sandbox image via
+  `FLE_BENCH_MODE`.
+- The sandbox bridge (`bridge_service.py`) now also serves its API over HTTP
+  (`FLE_BRIDGE_PORT`, default 8730) alongside the existing UDS listener, for
+  use by out-of-sandbox harnesses (`bench/bridge_client.py`).
+- Experimental agent-driven branching in the Inspect solver (`FLE_BRANCHING=true`):
+  injects `snapshot()`/`restore()` into the agent namespace, backed by
+  `GameState` capture/restore.
+- `basisu -unpack` is now invoked with a resolved absolute path so sprite
+  extraction works regardless of the caller's working directory.
 
 ### Fixed
 

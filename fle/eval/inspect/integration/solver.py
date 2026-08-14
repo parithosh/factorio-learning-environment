@@ -239,6 +239,71 @@ def factorio_controlled_solver():
             # Create gym environment
             gym_env: FactorioGymEnv = gym.make(env_id, run_idx=run_idx)
             gym_env.reset()
+            # --- Experiment B: agent-driven branching (snapshot/restore) ---
+            # Enabled via FLE_BRANCHING=true. Injects two callables into the
+            # agent's execution namespace backed by GameState capture/restore
+            # (same primitive the MCP version-control layer uses).
+            branching_enabled = os.environ.get("FLE_BRANCHING", "").lower() == "true"
+            branching_stats = {"snapshots": 0, "restores": 0}
+            if branching_enabled:
+                from fle.commons.models.game_state import (
+                    GameState as _BranchGameState,
+                )
+
+                _instance = gym_env.unwrapped.instance
+                _snapshots = {}
+                _snap_counter = [0]
+
+                def _strip_branching():
+                    # Keep closures out of persistent_vars during state
+                    # capture so namespace serialization never sees them.
+                    for _ns in _instance.namespaces:
+                        _ns.persistent_vars.pop("snapshot", None)
+                        _ns.persistent_vars.pop("restore", None)
+
+                def _inject_branching():
+                    for _ns in _instance.namespaces:
+                        setattr(_ns, "snapshot", _snapshot)
+                        setattr(_ns, "restore", _restore)
+                        _ns.persistent_vars["snapshot"] = _snapshot
+                        _ns.persistent_vars["restore"] = _restore
+
+                def _snapshot() -> str:
+                    if len(_snapshots) >= 3:
+                        raise ValueError(
+                            "Snapshot limit (3 live snapshots) reached. "
+                            "Reuse an existing id with restore(); available: "
+                            f"{sorted(_snapshots)}"
+                        )
+                    _strip_branching()
+                    try:
+                        state_copy = _BranchGameState.from_instance(_instance)
+                    finally:
+                        _inject_branching()
+                    _snap_counter[0] += 1
+                    sid = f"snap_{_snap_counter[0]}"
+                    _snapshots[sid] = (state_copy, _instance.initial_score)
+                    branching_stats["snapshots"] += 1
+                    return sid
+
+                def _restore(snapshot_id: str) -> str:
+                    if snapshot_id not in _snapshots:
+                        raise ValueError(
+                            f"Unknown snapshot id {snapshot_id!r}; "
+                            f"available: {sorted(_snapshots)}"
+                        )
+                    saved_state, saved_initial_score = _snapshots[snapshot_id]
+                    _instance.reset(saved_state)
+                    # instance.reset() recomputes initial_score from the
+                    # restored world; pin it back so the production-score
+                    # baseline matches the snapshot's timeline.
+                    _instance.initial_score = saved_initial_score
+                    _inject_branching()
+                    branching_stats["restores"] += 1
+                    return f"Restored world to {snapshot_id}"
+
+                _inject_branching()
+                logger.info("🌿 Branching tools (snapshot/restore) enabled")
 
             logger.info("🎮 Connected to Factorio server")
 
@@ -281,6 +346,15 @@ def factorio_controlled_solver():
                 )
                 quota = 16
                 task_instructions = f"## TASK OBJECTIVE\n{goal_description}"
+
+            if branching_enabled:
+                task_instructions += """
+## BRANCHING TOOLS (EXPERIMENTAL)
+You have two extra functions for exploring alternatives before committing:
+- `snapshot() -> str` — saves the full game state, returns a snapshot id (max 3 live snapshots).
+- `restore(snapshot_id: str) -> str` — rolls the world back to that snapshot. Non-destructive: you can restore the same snapshot repeatedly.
+Recommended pattern at key layout decisions: `sid = snapshot()`, build alternative A, run `sleep(30)` and inspect throughput; `restore(sid)`, build alternative B, compare; then restore and commit the better design. NOTE: probe programs consume trajectory steps from your budget like any other step — probe only at genuinely uncertain, expensive decisions, and commit quickly once one alternative is clearly better.
+"""
 
             # Combine base instructions with task-specific instructions
             full_system_prompt = f"""{base_system_prompt}
@@ -424,6 +498,8 @@ Analyze the current state and write a Python program using the FLE API to progre
                     )
 
                     # Execute action in Factorio and capture results
+                    if branching_enabled:
+                        _inject_branching()
                     action = Action(agent_idx=0, code=program.code)
                     try:
                         obs, reward, terminated, truncated, info = gym_env.step(action)
@@ -645,6 +721,15 @@ Continue to step {step + 2}."""
 
             # Final results
             final_score = production_scores[-1] if production_scores else 0.0
+            if branching_enabled:
+                logger.info(
+                    f"🌿 Branching usage: {branching_stats['snapshots']} snapshots, "
+                    f"{branching_stats['restores']} restores"
+                )
+                transcript().info(
+                    f"Branching usage: snapshots={branching_stats['snapshots']}, "
+                    f"restores={branching_stats['restores']}"
+                )
             final_automated_score = (
                 automated_production_scores[-1] if automated_production_scores else 0.0
             )
