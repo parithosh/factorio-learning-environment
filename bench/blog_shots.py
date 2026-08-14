@@ -1,12 +1,12 @@
-"""Render blog-quality PNGs from ``/state-save`` blobs, fully offline.
+"""Post-hoc local-cluster rendering of ``/state-save`` blobs into blog PNGs.
 
-Zero-contamination pipeline: benchmark runs persist state blobs when
+Not offline: the renderer needs a running LOCAL Factorio container to restore
+into (``fle cluster start``).  What it does guarantee is no benchmark
+contamination -- the measured run is never touched, because its blobs are
+re-rendered afterwards on a different cluster.  Benchmark runs persist them when
 ``FLE_BENCH_STATE_DUMPS=1`` (see :meth:`ArmRun._dump_state` in
 ``bench/arms.py``) -- arm C rounds land as ``rN.state.json`` for free, and
 every arm saves ``final-<seat>.state.json`` per node after ``timings.stop()``.
-This script restores each blob into an idle LOCAL cluster container
-(``fle cluster start``) and renders with the repo renderer, so the measured
-run is never touched.
 
 Prerequisites (one-time):
   - ``fle cluster start``            -- local Factorio containers
@@ -63,11 +63,33 @@ def make_instance(address: str | None, tcp_port: int | None):
     )
 
 
+def strip_namespaces(state: object) -> int:
+    """Blank the pickled agent namespaces on a parsed state; return how many.
+
+    ``instance.reset(game_state)`` hands ``game_state.namespaces[i]`` straight to
+    ``FactorioNamespace.load`` -> ``pickle.loads``, so restoring a dump executes
+    whatever wrote it. These PNGs need only entities, inventories and research;
+    the agent namespace (persistent vars and pickled helper functions) is never
+    read by the renderer. So the blobs are replaced with empty bytes before the
+    restore -- ``load`` swallows the resulting unpickling error -- and a dump off
+    a shared node, a colleague's run or an archive is rendered, not executed.
+    """
+    blobs = list(getattr(state, "namespaces", []) or [])
+    state.namespaces = [b"" for _ in blobs]  # type: ignore[attr-defined]
+    return sum(1 for ns in blobs if ns)
+
+
 def render_one(instance, state: str, out_stem: Path, *, close: bool) -> list[Path]:
     from fle.commons.models.game_state import GameState
     from fle.env.entities import Position
 
-    instance.reset(GameState.parse_raw(state))
+    game_state = GameState.parse_raw(state)
+    dropped = strip_namespaces(game_state)
+    if dropped:
+        print(f"{out_stem.name}: dropped {dropped} pickled namespace blob(s) "
+              "before restore (rendering needs entities/inventories only)",
+              file=sys.stderr)
+    instance.reset(game_state)
     ns = instance.namespaces[0]
 
     entities = ns.get_entities(radius=1000)
@@ -92,13 +114,47 @@ def render_one(instance, state: str, out_stem: Path, *, close: bool) -> list[Pat
     return written
 
 
-def _render_shard(address: str, tcp_port: int, states: list[Path],
-                  out_dir: Path, close: bool) -> list[str]:
+def output_stem(state_path: Path, out_dir: Path) -> Path:
+    """Where one dump's PNGs go: ``<out_dir>/<run>_<dump>``.
+
+    Dump basenames are NOT unique -- every arm writes ``final-<seat>.state.json``
+    and arm C writes ``rN.state.json`` per round -- so a basename-only stem lets
+    the second run silently overwrite the first run's PNGs. The immediate parent
+    (``<run>.states/``) is the run component.
+    """
+    name = state_path.name.removesuffix(".state.json")
+    run = state_path.parent.name.removesuffix(".states")
+    run = "".join(c if (c.isalnum() or c in "-.") else "_" for c in run).strip("_.")
+    return out_dir / (f"{run}_{name}" if run else name)
+
+
+def plan_outputs(states: list[Path], out_dir: Path) -> list[tuple[Path, Path]]:
+    """Pair every input with its output stem, or refuse the whole batch.
+
+    Two dumps that compute the same stem would have the later render overwrite
+    the earlier one, which is worse than useless in a figure: the caption would
+    name a run the image does not show. A collision is a hard error naming both
+    inputs, checked in the parent before any container is touched.
+    """
+    plan: list[tuple[Path, Path]] = []
+    owner: dict[Path, Path] = {}
+    for state_path in states:
+        stem = output_stem(state_path, out_dir)
+        clash = owner.get(stem)
+        if clash is not None:
+            sys.exit(f"output collision: {clash} and {state_path} both render to "
+                     f"{stem}_wide.png -- render them into separate --out dirs")
+        owner[stem] = state_path
+        plan.append((state_path, stem))
+    return plan
+
+
+def _render_shard(address: str, tcp_port: int, jobs: list[tuple[Path, Path]],
+                  close: bool) -> list[str]:
     """One worker process: a dedicated container, a serial slice of blobs."""
     instance = make_instance(address, tcp_port)
     written: list[str] = []
-    for state_path in states:
-        stem = out_dir / state_path.name.removesuffix(".state.json")
+    for state_path, stem in jobs:
         written += [str(p) for p in
                     render_one(instance, load_state(state_path), stem,
                                close=close)]
@@ -126,10 +182,10 @@ def main(argv: list[str] | None = None) -> int:
                  "(entity art needs the basisu CLI on PATH)")
 
     args.out.mkdir(parents=True, exist_ok=True)
+    plan = plan_outputs(args.states, args.out)
 
-    if args.workers <= 1 or len(args.states) <= 1 or args.address:
-        for out in _render_shard(args.address, args.tcp_port, args.states,
-                                 args.out, args.close):
+    if args.workers <= 1 or len(plan) <= 1 or args.address:
+        for out in _render_shard(args.address, args.tcp_port, plan, args.close):
             print(out)
         return 0
 
@@ -140,12 +196,12 @@ def main(argv: list[str] | None = None) -> int:
     containers = list(zip(ips, tcp_ports))[-args.workers:]
     # Round-robin shard: each worker owns ONE container for its whole slice
     # (an RCON connection per process; containers are never shared).
-    shards = [args.states[i::len(containers)] for i in range(len(containers))]
+    shards = [plan[i::len(containers)] for i in range(len(containers))]
 
     from concurrent.futures import ProcessPoolExecutor
     with ProcessPoolExecutor(max_workers=len(containers)) as pool:
         futures = [
-            pool.submit(_render_shard, ip, port, shard, args.out, args.close)
+            pool.submit(_render_shard, ip, port, shard, args.close)
             for (ip, port), shard in zip(containers, shards) if shard
         ]
         for fut in futures:

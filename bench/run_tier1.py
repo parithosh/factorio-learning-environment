@@ -15,6 +15,11 @@ Responsibilities that belong here and nowhere else:
   greenfield matrix, ``--from-snap`` (the very same option) when the cells must
   start from a baked checkpoint. A×K-from-S is A×K with
   ``template_snap=<checkpoint>`` and no other difference.
+* Exit codes -- the block's contract with any wrapper script: 0 ONLY for a
+  complete matrix, 2 when a provider died mid-block (partial results written,
+  every affected cell on ``needs_rerun``), 1 for anything else incomplete --
+  failed cells, cells the graceful stop never admitted, an interrupt, or an
+  exception no cell accounted for.
 
 It never invents its own endpoint: the number per run is the terminal fixed
 60s-window probe produced by :mod:`bench.arms`.
@@ -49,7 +54,7 @@ from bench.arms import (
     fake_substrate,
     run_one,
 )
-from bench.common import RunJournal
+from bench.common import RunJournal, atomic_write_json
 from bench.llm import (
     PROVIDER_DEAD_CONSECUTIVE,
     PROVIDER_DEAD_WINDOW_S,
@@ -342,22 +347,41 @@ def expand_cells(cfg: Tier1Config) -> list[Cell]:
     elif cfg.exp3_block:
         cells = exp3_block_cells(cfg)
     else:
-        for task in cfg.tasks:
+        # Dimensions are DEDUPED in the order given: a repeated --arms/--models/
+        # --tasks entry would otherwise expand to two cells with the SAME key,
+        # and that key is the identity every journal record, merge base and
+        # rerun selector is written against.
+        tasks = tuple(dict.fromkeys(cfg.tasks))
+        models = tuple(dict.fromkeys(cfg.models))
+        arms = tuple(dict.fromkeys(cfg.arms))
+        for task in tasks:
             for replicate in range(1, cfg.replicates + 1):
-                for model in cfg.models:
-                    for arm in cfg.arms:
+                for model in models:
+                    for arm in arms:
                         if arm == "C":
                             continue
                         cells.append(
                             Cell(arm=arm, model=model, task=task, replicate=replicate)
                         )
-                if "C" in cfg.arms:
-                    c_model = cfg.c_model or (cfg.models[0] if cfg.models else "")
+                if "C" in arms:
+                    c_model = cfg.c_model or (models[0] if models else "")
                     if c_model:
                         cells.append(
                             Cell(arm="C", model=c_model, task=task,
                                  replicate=replicate)
                         )
+    # Belt and braces: a duplicate key would overwrite a live task in
+    # ``cell_tasks`` and merge two endpoints into one row. Neither manifest nor
+    # the deduped product can produce one, so this is a bug, not a matrix.
+    seen: set[str] = set()
+    for cell in cells:
+        if cell.key in seen:
+            raise ValueError(
+                f"duplicate cell {cell.key!r} in the expanded matrix: the cell "
+                "key is the identity cell_tasks, --cells and every journal "
+                "record use"
+            )
+        seen.add(cell.key)
     if cfg.round:
         cells = [c for c in cells if c.replicate == cfg.round]
     if cfg.cells:
@@ -370,10 +394,25 @@ def expand_cells(cfg: Tier1Config) -> list[Cell]:
 
 
 def config_from_tier05(path: str) -> Tier1Config:
-    """Build the Tier-1 config from Tier 0.5's frozen pilot config."""
+    """Build the Tier-1 config from Tier 0.5's frozen pilot config.
+
+    Tier 0.5 may REFUSE to freeze a config (missing or errored calibration
+    evidence, no ladder point that fits the budget); its payload then carries
+    ``executable: false`` and the reasons. That is not a config with defaults --
+    it is the absence of one, so it is an error here rather than a silent
+    fallback to DEFAULT_ARMS with no models.
+    """
     with open(path, encoding="utf-8") as fh:
         payload = json.load(fh)
     frozen = payload["frozen_pilot_config"]
+    if frozen.get("executable") is False or frozen.get("status") == "REFUSED":
+        reasons = frozen.get("reasons") or []
+        raise ValueError(
+            f"{path}: Tier 0.5 REFUSED to freeze a pilot config "
+            f"({frozen.get('error') or 'no error given'})"
+            + (f"; reasons: {'; '.join(str(r) for r in reasons)}" if reasons else "")
+            + " -- re-run Tier 0.5 instead of launching on defaults"
+        )
     return Tier1Config(
         models=tuple(frozen.get("models") or ()),
         arms=tuple(frozen.get("arms") or DEFAULT_ARMS),
@@ -386,6 +425,33 @@ def config_from_tier05(path: str) -> Tier1Config:
         run_cap=int(frozen.get("run_cap", 0) or 0),
         max_sandboxes=int(frozen.get("max_sandboxes", 0) or 0),
     )
+
+
+#: Config fields that DEFINE the measurement. ``--cells`` recovery rewrites the
+#: same results file, so the cells it preserves must have measured the same
+#: thing: a cell re-run at another T/K/m, from another checkpoint or under
+#: another template is not the same cell, and silently mixing the two would put
+#: two experiments in one paired contrast. Scheduling knobs (caps, staggers,
+#: prefixes, keep list, out paths) are deliberately absent -- they change how a
+#: cell is admitted, never what it measures.
+MERGE_FINGERPRINT_FIELDS = (
+    "exp2_block", "exp3_block", "models", "tasks", "T_s", "leg_s", "K", "m",
+    "template_snap", "template_snap_id",
+)
+
+
+def merge_fingerprint(config: dict[str, Any]) -> dict[str, Any]:
+    """The measurement-defining slice of a config, JSON-normalised.
+
+    Tuples come back from ``json.load`` as lists, so both sides are compared as
+    lists; a field the prior file never carried reads as ``None`` and therefore
+    as drift -- an artifact that cannot prove compatibility is not compatible.
+    """
+    out: dict[str, Any] = {}
+    for field in MERGE_FINGERPRINT_FIELDS:
+        value = config.get(field)
+        out[field] = list(value) if isinstance(value, (tuple, list)) else value
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -402,9 +468,25 @@ class SlotPool:
         self.peak_used = 0
         self._cond = asyncio.Condition()
 
+    def acquire(self, n: int):
+        """Reserve ``n`` slots for one run (an async context manager).
+
+        Validated EAGERLY and never clamped: a cell whose peak exceeds the pool
+        cannot be admitted at all. Clamping (the old ``min(n, total)``) let an
+        8-seat arm run under a 4-slot cap -- the pool then guarantees nothing,
+        which is the one thing it exists to do.
+        """
+        need = max(1, int(n))
+        if need > self.total:
+            raise ValueError(
+                f"a run needs {need} concurrent sandbox(es) but the pool holds "
+                f"{self.total}: raise --max-sandboxes (or the Tier-0 cap) or "
+                "lower K -- admitting it would break the cap it enforces"
+            )
+        return self._hold(need)
+
     @contextlib.asynccontextmanager
-    async def acquire(self, n: int):
-        need = max(1, min(n, self.total))
+    async def _hold(self, need: int):
         async with self._cond:
             while self.free < need:
                 await self._cond.wait()
@@ -508,8 +590,11 @@ class Tier1Runner:
             )
         )
         self.caps = caps
-        self.run_cap = cfg.run_cap or int(caps.get("run_cap", 6))
-        self.max_sandboxes = cfg.max_sandboxes or int(caps.get("max_sandboxes", 24))
+        self.run_cap = self.resolve_cap("run_cap", cfg.run_cap, caps,
+                                        flag="--node-cap", fallback=6)
+        self.max_sandboxes = self.resolve_cap("max_sandboxes", cfg.max_sandboxes,
+                                              caps, flag="--max-sandboxes",
+                                              fallback=24)
         self.slots = SlotPool(self.max_sandboxes)
         self.run_sem = asyncio.Semaphore(self.run_cap)
         self.provider_sems: dict[str, Gate] = {}
@@ -519,8 +604,13 @@ class Tier1Runner:
         #: Live cell tasks by key, so a dead provider takes down exactly the
         #: cells that share its quota and nothing else.
         self.cell_tasks: dict[str, asyncio.Task] = {}
-        #: Set once the tripwire fires; the block then exits nonzero with it.
+        #: FIRST dead provider (the trigger that stopped admission); the block
+        #: exits nonzero with it. See ``dead_providers`` for the full set -- a
+        #: second, DIFFERENT provider dying is its own abort, not a duplicate.
         self.provider_dead: ProviderDead | None = None
+        #: ``{provider: ProviderDead}``: one abort per provider, and the
+        #: authority for attributing a cancelled cell to the quota that died.
+        self.dead_providers: dict[str, ProviderDead] = {}
         #: The provider each cell's CLIENT reports -- the authority for "who
         #: shares this quota", since a substrate stand-in may not be the model the
         #: cell names.
@@ -528,6 +618,15 @@ class Tier1Runner:
         self.results: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
         self.skipped: list[str] = []
+        #: Cells whose outcome is already recorded (result / failure /
+        #: invalid_provider / skipped). Every exit path of :meth:`run_cell`
+        #: claims this slot exactly once, so a cancellation in an admission wait
+        #: can never leave a cell in no list at all -- and can never double-count
+        #: one that already finished.
+        self.accounted: set[str] = set()
+        #: Exceptions ``asyncio.gather`` returned that no cell accounted for.
+        #: Always empty in a healthy run; non-empty is a bug and exits nonzero.
+        self.unaccounted: list[dict[str, Any]] = []
         self.stop = asyncio.Event()
         self.started_at = time.time()
         self.master = RunJournal(
@@ -540,6 +639,44 @@ class Tier1Runner:
         self.needs_rerun: list[dict[str, Any]] = []
         self.merged_from: dict[str, Any] | None = None
         self.load_merge_base()
+
+    # -- capacity ----------------------------------------------------------
+    def resolve_cap(self, field: str, explicit: int, caps: dict[str, Any], *,
+                    flag: str, fallback: int) -> int:
+        """One capacity cap: explicit value > MEASURED Tier-0 evidence > refusal.
+
+        Tier 0 now reports what it measured AND what it did not
+        (``caps["evidence"]`` / ``caps["warnings"]``): a cap that was never
+        measured is a DEFAULT, and a real block scheduled against a fabricated
+        ceiling is exactly how a node gets over-admitted (null there means "never
+        measured", 0 means "measured, and it cannot afford one run"). So a real
+        run demands either the operator's flag or Tier-0 evidence. A dry run has
+        no sandboxes to cap, so it keeps the default -- the gap is already
+        journaled with ``caps`` in the master meta.
+        """
+        if explicit:
+            if explicit < 1:
+                raise ValueError(
+                    f"{flag}={explicit} is not a usable {field}: a cap is at "
+                    "least 1 run/sandbox"
+                )
+            return int(explicit)
+        value = caps.get(field)
+        measured = (
+            field in (caps.get("evidence") or {})
+            and isinstance(value, int) and not isinstance(value, bool)
+            and value >= 1
+        )
+        if measured:
+            return int(value)
+        if self.cfg.dry:
+            return fallback
+        raise ValueError(
+            f"Tier 0 never measured a usable {field} "
+            f"(value={value!r}; {'; '.join(caps.get('warnings') or ['no evidence'])})"
+            f" -- refusing to schedule a real block against a fabricated cap: "
+            f"pass {flag} N explicitly or run Tier 0's soak first"
+        )
 
     # -- dose floor --------------------------------------------------------
     def score_dose(self, cell: Cell, payload: dict[str, Any]) -> None:
@@ -629,6 +766,31 @@ class Tier1Runner:
                              cell=cell.key, k_effective=k_effective,
                              selector=entry["selector"])
 
+    # -- accounting --------------------------------------------------------
+    def account(self, cell: Cell) -> bool:
+        """Claim ``cell``'s ONE accounting slot; ``False`` if already recorded.
+
+        Every terminal path of :meth:`run_cell` -- endpoint, failure,
+        invalid_provider, skipped, cancelled -- goes through here, so a cell can
+        neither vanish from every list (a cancellation in an admission wait used
+        to) nor appear in two of them (an abort landing on a cell that had
+        already finished scoring).
+        """
+        if cell.key in self.accounted:
+            return False
+        self.accounted.add(cell.key)
+        return True
+
+    def dead_provider_for(self, cell: Cell) -> ProviderDead | None:
+        """The dead quota THIS cell was running on, if any.
+
+        Keyed on the provider its own client reported (a substrate stand-in may
+        not be the model the cell names), falling back to the model's provider
+        for a cell cancelled before it ever built a client.
+        """
+        provider = self.cell_providers.get(cell.key, provider_of(cell.model))
+        return self.dead_providers.get(provider)
+
     # -- provider death (online tripwire) ----------------------------------
     def score_provider(self, cell: Cell, run_id: str, dead: ProviderDead, *,
                        reason: str) -> None:
@@ -639,6 +801,11 @@ class Tier1Runner:
         with the same ``--cells``/``--round`` selectors an invalid dose or width
         uses, and it stays out of every aggregate.
         """
+        if not self.account(cell):
+            self.master.event("provider_dead_observed", provider=dead.provider,
+                              trigger=dead.trigger, cell=cell.key,
+                              already_accounted=True, detail=reason)
+            return
         entry = {
             "cell": cell.key,
             "arm": cell.arm,
@@ -667,15 +834,20 @@ class Tier1Runner:
         block-level reaper sweeps whatever is left. Cells on a DIFFERENT provider
         are untouched -- the quota that died is not theirs.
         """
-        if self.provider_dead is not None:
-            # Concurrent cells can each hit the wire before the cancel lands. The
-            # ABORT happens once -- one trigger record, one cancel sweep -- and
-            # the extra sightings are journaled as corroboration.
+        prior = self.dead_providers.get(dead.provider)
+        if prior is not None:
+            # Concurrent cells on the SAME provider can each hit the wire before
+            # the cancel lands. That provider's ABORT happens once -- one trigger
+            # record, one cancel sweep -- and the extra sightings are journaled as
+            # corroboration. A DIFFERENT provider dying is not a duplicate: it
+            # owns its own victims, so it falls through to its own abort.
             self.master.event("provider_dead_observed", provider=dead.provider,
                               trigger=dead.trigger, cell=origin.key,
                               already_aborting=True)
             return
-        self.provider_dead = dead
+        self.dead_providers[dead.provider] = dead
+        if self.provider_dead is None:
+            self.provider_dead = dead
         self.stop.set()
         victims = [
             key for key, task in self.cell_tasks.items()
@@ -718,12 +890,38 @@ class Tier1Runner:
         Every later :meth:`write_partial` then rewrites the SAME file with the
         preserved cells plus the fresh ones, so re-running one lost pair from S2
         costs one pair, not the block.
+
+        The prior file is only a merge base if it measured the SAME thing: its
+        stored config is fingerprinted (:data:`MERGE_FINGERPRINT_FIELDS`) against
+        this one and any drift is a hard refusal. A file that carries no config at
+        all cannot prove compatibility, so it is refused too -- silently blending
+        a 4200s endpoint with a 1800s one is the worst outcome available here.
         """
         path = self.cfg.out
         if not self.cfg.cells or not os.path.exists(path):
             return
         with open(path, encoding="utf-8") as fh:
             prior = json.load(fh)
+        prior_config = prior.get("config")
+        if not isinstance(prior_config, dict):
+            raise ValueError(
+                f"{path} carries no config block, so --cells cannot verify that "
+                "its preserved cells measured what this pass measures; point "
+                "--out at a fresh file or re-run the whole block"
+            )
+        mine = merge_fingerprint(self.cfg.to_dict())
+        theirs = merge_fingerprint(prior_config)
+        drift = {k: (theirs[k], mine[k]) for k in mine if theirs[k] != mine[k]}
+        if drift:
+            raise ValueError(
+                f"refusing to merge into {path}: it was written under a "
+                "different measurement config ("
+                + "; ".join(f"{k} {was!r} -> {now!r}"
+                            for k, (was, now) in sorted(drift.items()))
+                + ") -- a cell re-run at a different T/K/m, from a different "
+                "checkpoint or under a different template is not the same cell; "
+                "use a fresh --out"
+            )
         rerun = {c.key for c in expand_cells(self.cfg)}
         self.results = [r for r in prior.get("runs", []) if r.get("cell") not in rerun]
         self.failures = [
@@ -740,6 +938,7 @@ class Tier1Runner:
             "path": path,
             "preserved_runs": [r.get("cell") for r in self.results],
             "rerun_cells": sorted(rerun),
+            "fingerprint": mine,
         }
         self.master.event("merge_base_loaded", **self.merged_from)
 
@@ -810,20 +1009,122 @@ class Tier1Runner:
         return make_client(cell.model, journal=journal, semaphore=gate)
 
     # -- one cell ----------------------------------------------------------
-    async def run_cell(self, cell: Cell, index: int) -> None:
-        cfg = self.cfg
-        if self.stop.is_set():
-            self.skipped.append(cell.key)
-            return
-        run_id = (
+    def run_id_of(self, cell: Cell) -> str:
+        """The id this cell's journal, resources and records are named with."""
+        return (
             f"{cell.arm}-{cell.model.replace('/', '-')}-{cell.task}-r{cell.replicate}"
         )
+
+    def record_skipped(self, cell: Cell, *, reason: str) -> None:
+        """A cell the graceful stop never admitted -- and the point it stopped at.
+
+        The record names WHY the block stopped admitting, because "skipped" alone
+        cannot distinguish an operator's interrupt from an aborted quota, and a
+        cell that never started still has to be re-run.
+        """
+        if not self.account(cell):
+            return
+        self.skipped.append(cell.key)
+        dead = self.dead_provider_for(cell) or self.provider_dead
+        self.master.event("run_skipped", cell=cell.key, reason=reason,
+                          provider_dead=None if dead is None else dead.provider)
+
+    def record_cancelled(self, cell: Cell, run_id: str) -> None:
+        """A cell cancelled ANYWHERE in its lifecycle, admission waits included.
+
+        The old handler wrapped ``run_one`` only, so an abort that landed while a
+        cell sat in the run-slot queue or slept out a 120-240s provisioning
+        stagger left it in no list at all: ``gather(return_exceptions=True)``
+        swallowed the ``CancelledError`` and the block reported a complete matrix
+        minus a cell. Attribution is per PROVIDER -- cancelled with a dead quota
+        is ``invalid_provider`` with a rerun selector, cancelled by an operator's
+        second interrupt is a plain failure.
+        """
+        dead = self.dead_provider_for(cell)
+        if dead is not None:
+            self.score_provider(cell, run_id, dead,
+                                reason="aborted with the provider")
+        elif self.account(cell):
+            self.failures.append({"cell": cell.key, "run_id": run_id,
+                                  "error": "cancelled"})
+        self.master.event("run_cancelled", cell=cell.key, run_id=run_id,
+                          provider_dead=dead is not None,
+                          provider=None if dead is None else dead.provider)
+
+    def record_failure(self, cell: Cell, run_id: str, exc: BaseException, *,
+                       kind: str = "run_failed") -> None:
+        """One failing cell is a datum; losing the record of it is not."""
+        if not self.account(cell):
+            return
+        self.failures.append(
+            {"cell": cell.key, "run_id": run_id,
+             "error": f"{type(exc).__name__}: {exc}"[:2000]}
+        )
+        self.master.incident(kind=kind, detail=str(exc)[:2000],
+                             cell=cell.key, run_id=run_id)
+
+    async def close_llm(self, cell: Cell, llm: Any) -> None:
+        """Release one cell's client. A fake without ``aclose`` is a no-op.
+
+        ``run_one`` only closes clients it created itself, so a client the
+        orchestrator passes in is the orchestrator's to close -- on EVERY exit
+        path, or a long block leaks one connection pool per cell.
+        """
+        aclose = getattr(llm, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            await aclose()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - a client that will not shut
+            # down must never mask the cell's own outcome.
+            self.master.incident(kind="llm_close_failed", detail=str(exc)[:2000],
+                                 cell=cell.key)
+
+    async def run_cell(self, cell: Cell, index: int) -> None:
+        """Admit, run and ACCOUNT FOR one cell. Nothing leaves here unrecorded.
+
+        The recording scope wraps the whole admitted-cell setup -- cell journal,
+        substrate, client and the ArmConfig lease guard included. A refusal in any
+        of them used to escape into ``gather(return_exceptions=True)``, which
+        discarded it: no failure row, no rerun selector, and a leaked open journal.
+        """
+        run_id = self.run_id_of(cell)
+        try:
+            await self._admit_cell(cell, index, run_id)
+        except asyncio.CancelledError:
+            self.record_cancelled(cell, run_id)
+            self.write_partial()
+            raise
+        except BaseException as exc:  # noqa: BLE001 - admission and setup are as
+            # fallible as the run itself (slot pool, lease guard, substrate,
+            # client); each is a failed cell, never a lost one.
+            self.record_failure(cell, run_id, exc, kind="cell_setup_failed")
+            self.write_partial()
+
+    async def _admit_cell(self, cell: Cell, index: int, run_id: str) -> None:
+        """Hold the run slot and this cell's sandbox slots, then run it.
+
+        The graceful stop is re-checked after EVERY wait that can last minutes --
+        run-slot queue, slot-pool queue, probe-cadence stagger, provisioning
+        stagger -- because the check that matters is the one immediately before
+        provisioning starts spending.
+        """
+        cfg = self.cfg
+        if self.stop.is_set():
+            self.record_skipped(cell, reason="graceful stop before admission")
+            return
         peak = peak_sandboxes(cell.arm, cfg.K)
         async with self.run_sem:
             if self.stop.is_set():
-                self.skipped.append(cell.key)
+                self.record_skipped(cell, reason="graceful stop in the run-slot queue")
                 return
             async with self.slots.acquire(peak):
+                if self.stop.is_set():
+                    self.record_skipped(cell,
+                                        reason="graceful stop in the slot-pool queue")
+                    return
                 if cfg.stagger_s:
                     # Phase-shift probe cadence between runs (v2.4.1) so their
                     # fork waves do not collide on the same warm slots.
@@ -845,108 +1146,121 @@ class Tier1Runner:
                                       ladder=list(EXP3_LADDER))
                     if delay_s:
                         await asyncio.sleep(delay_s)
-                journal = RunJournal(
-                    os.path.join(cfg.journal_dir, f"{run_id}.jsonl"),
-                    run_id=run_id,
-                    meta={"cell": cell.key, "label": cfg.label},
-                )
-                fp, bridge_factory, template = self.make_substrate(run_id)
-                llm = self.make_llm(cell, journal)
-                self.cell_providers[cell.key] = getattr(
-                    llm, "provider", provider_of(cell.model)
-                )
-                # B/B-once refuse any round the remaining budget cannot cover,
-                # using the MEASURED constants (snapshot 10.1s + 7 x 151.6s fork
-                # p95 + m x 19.9s + K x 1s cleanup). A dry T is seconds, so
-                # those constants would refuse every round and the dry block
-                # would never exercise the fork path -- scale the whole cost
-                # model to the fakes, keeping its SHAPE.
-                dry_costs = (
-                    dict(snapshot_cost_estimate_s=0.05, fork_cost_estimate_s=0.05,
-                         step_cost_estimate_s=0.05, probe_cost_estimate_s=0.05,
-                         delete_cost_estimate_s=0.005)
-                    if cfg.dry else {}
-                )
-                arm_cfg = ArmConfig(
-                    arm=cell.arm, model=cell.model, task_key=cell.task,
-                    replicate=cell.replicate, T_s=cfg.T_s, K=cfg.K, m=cfg.m,
-                    template_snap=template, ttl_s=cfg.ttl_s, prefix=cfg.prefix,
-                    results_dir=cfg.results_dir, journal_dir=cfg.journal_dir,
-                    run_id=run_id, dry=cfg.dry, leg_s=cfg.leg_s,
-                    create_deadline_s=cfg.create_deadline_s,
-                    provision_stagger_s=cfg.provision_stagger_s, **dry_costs,
-                )
-                self.master.event("run_start", cell=cell.key, run_id=run_id,
-                                  peak_sandboxes=peak, slots_free=self.slots.free,
-                                  ttl_s=arm_cfg.ttl_s, T_s=arm_cfg.T_s,
-                                  create_deadline_s=arm_cfg.create_deadline_s)
-                t0 = time.monotonic()
-                try:
-                    result = await run_one(
-                        arm_cfg, farplane=fp, bridge_factory=bridge_factory,
-                        llm=llm, journal=journal,
+                if self.stop.is_set():
+                    # The last gate before anything is provisioned. A stagger is
+                    # minutes long and a slot queue can be hours: an interrupt
+                    # that lands inside one means "no new runs", not "one more".
+                    self.record_skipped(
+                        cell, reason="graceful stop before provisioning"
                     )
-                    payload = result.to_dict()
-                    payload["cell"] = cell.key
-                    # The cap is only real if it held: per-cell in-flight
-                    # high-water travels with the endpoint, so the analysis can
-                    # verify the parallel round's throttling instead of trusting
-                    # the config that asked for it.
-                    gate = self.cell_gates.get(cell.key)
-                    payload["provider_gate"] = gate.to_dict() if gate else {}
-                    self.score_dose(cell, payload)
-                    self.score_width(cell, payload)
-                    self.results.append(payload)
-                    self.master.event(
-                        "run_done", cell=cell.key, run_id=run_id,
-                        status=result.status, endpoint=result.endpoint_throughput,
-                        wall_s=round(time.monotonic() - t0, 2),
-                        slots_free=self.slots.free,
-                        peak_sandboxes_used=self.slots.peak_used,
-                        **{f"provider_{k}": v
-                           for k, v in (gate.to_dict() if gate else {}).items()},
-                    )
-                except asyncio.CancelledError:
-                    # A sibling cell's provider died and took this one with it:
-                    # that is not a datum either, it is a cell that never got to
-                    # finish. Mark it the same way so the rerun selector is
-                    # complete.
-                    if self.provider_dead is not None:
-                        self.score_provider(cell, run_id, self.provider_dead,
-                                            reason="aborted with the provider")
-                    else:
-                        self.failures.append({"cell": cell.key, "run_id": run_id,
-                                              "error": "cancelled"})
-                    self.master.event("run_cancelled", cell=cell.key, run_id=run_id,
-                                      provider_dead=self.provider_dead is not None)
-                    raise
-                except ProviderDead as exc:
-                    # The tripwire fired inside this cell. Mark it, journal the
-                    # trigger stats, then take down every other cell on the same
-                    # provider -- the SIGINT path, minus the human.
-                    self.score_provider(cell, run_id, exc,
-                                        reason="tripwire fired in this cell")
-                    self.abort_provider(exc, origin=cell)
-                    await self.reap_cell(cell, run_id, fp)
-                except BaseException as exc:  # noqa: BLE001 - one failing cell must
-                    # not take the pilot down; the failure itself is a datum.
-                    self.failures.append(
-                        {"cell": cell.key, "run_id": run_id,
-                         "error": f"{type(exc).__name__}: {exc}"}
-                    )
-                    self.master.incident(kind="run_failed", detail=str(exc)[:2000],
-                                         cell=cell.key, run_id=run_id)
-                    # Failure hygiene: the arm's own teardown only knows the
-                    # seats it attached, so a sandbox that came up and then
-                    # failed its health poll survives as an orphan. Reap it HERE
-                    # -- still holding the run slot -- so the next cell's fork
-                    # wave meets an empty node instead of the last cell's
-                    # corpses. Only meaningful at run cap 1, where no sibling
-                    # cell's resources can be in the sweep's path.
-                    await self.reap_cell(cell, run_id, fp)
-                finally:
-                    journal.close()
-                    self.write_partial()
+                    return
+                await self._run_admitted(cell, run_id, peak)
+
+    async def _run_admitted(self, cell: Cell, run_id: str, peak: int) -> None:
+        """Provision, run, score and finalise ONE admitted cell."""
+        cfg = self.cfg
+        journal = RunJournal(
+            os.path.join(cfg.journal_dir, f"{run_id}.jsonl"),
+            run_id=run_id,
+            meta={"cell": cell.key, "label": cfg.label},
+        )
+        fp: Any = None
+        llm: Any = None
+        try:
+            fp, bridge_factory, template = self.make_substrate(run_id)
+            llm = self.make_llm(cell, journal)
+            self.cell_providers[cell.key] = getattr(
+                llm, "provider", provider_of(cell.model)
+            )
+            # B/B-once refuse any round the remaining budget cannot cover,
+            # using the MEASURED constants (snapshot 10.1s + 7 x 151.6s fork
+            # p95 + m x 19.9s + K x 1s cleanup). A dry T is seconds, so
+            # those constants would refuse every round and the dry block
+            # would never exercise the fork path -- scale the whole cost
+            # model to the fakes, keeping its SHAPE.
+            dry_costs = (
+                dict(snapshot_cost_estimate_s=0.05, fork_cost_estimate_s=0.05,
+                     step_cost_estimate_s=0.05, probe_cost_estimate_s=0.05,
+                     delete_cost_estimate_s=0.005)
+                if cfg.dry else {}
+            )
+            arm_cfg = ArmConfig(
+                arm=cell.arm, model=cell.model, task_key=cell.task,
+                replicate=cell.replicate, T_s=cfg.T_s, K=cfg.K, m=cfg.m,
+                template_snap=template, ttl_s=cfg.ttl_s, prefix=cfg.prefix,
+                results_dir=cfg.results_dir, journal_dir=cfg.journal_dir,
+                run_id=run_id, dry=cfg.dry, leg_s=cfg.leg_s,
+                create_deadline_s=cfg.create_deadline_s,
+                provision_stagger_s=cfg.provision_stagger_s, **dry_costs,
+            )
+            self.master.event("run_start", cell=cell.key, run_id=run_id,
+                              peak_sandboxes=peak, slots_free=self.slots.free,
+                              ttl_s=arm_cfg.ttl_s, T_s=arm_cfg.T_s,
+                              create_deadline_s=arm_cfg.create_deadline_s)
+            t0 = time.monotonic()
+            result = await run_one(
+                arm_cfg, farplane=fp, bridge_factory=bridge_factory,
+                llm=llm, journal=journal,
+            )
+            payload = result.to_dict()
+            payload["cell"] = cell.key
+            # The cap is only real if it held: per-cell in-flight
+            # high-water travels with the endpoint, so the analysis can
+            # verify the parallel round's throttling instead of trusting
+            # the config that asked for it.
+            gate = self.cell_gates.get(cell.key)
+            payload["provider_gate"] = gate.to_dict() if gate else {}
+            self.score_dose(cell, payload)
+            self.score_width(cell, payload)
+            if self.account(cell):
+                self.results.append(payload)
+            # The journal carries the status the RESULTS file carries: the
+            # validity floors run above, so a run_done that echoed the arm's
+            # pre-scoring status would call an invalid_dose endpoint "ok" in
+            # the one record the analysis reads first.
+            self.master.event(
+                "run_done", cell=cell.key, run_id=run_id,
+                status=payload.get("status", result.status),
+                arm_status=result.status,
+                error=payload.get("error") or None,
+                endpoint=result.endpoint_throughput,
+                wall_s=round(time.monotonic() - t0, 2),
+                slots_free=self.slots.free,
+                peak_sandboxes_used=self.slots.peak_used,
+                **{f"provider_{k}": v
+                   for k, v in (gate.to_dict() if gate else {}).items()},
+            )
+        except asyncio.CancelledError:
+            # Accounted by :meth:`run_cell`, which covers the whole lifecycle --
+            # including the admission waits this scope never saw.
+            raise
+        except ProviderDead as exc:
+            # The tripwire fired inside this cell. Mark it, journal the
+            # trigger stats, then take down every other cell on the same
+            # provider -- the SIGINT path, minus the human.
+            self.score_provider(cell, run_id, exc,
+                                reason="tripwire fired in this cell")
+            self.abort_provider(exc, origin=cell)
+            if fp is not None:
+                await self.reap_cell(cell, run_id, fp)
+        except BaseException as exc:  # noqa: BLE001 - one failing cell must
+            # not take the pilot down; the failure itself is a datum.
+            self.record_failure(cell, run_id, exc)
+            # Failure hygiene: the arm's own teardown only knows the
+            # seats it attached, so a sandbox that came up and then
+            # failed its health poll survives as an orphan. Reap it HERE
+            # -- still holding the run slot -- so the next cell's fork
+            # wave meets an empty node instead of the last cell's
+            # corpses. Only meaningful at run cap 1, where no sibling
+            # cell's resources can be in the sweep's path.
+            if fp is not None:
+                await self.reap_cell(cell, run_id, fp)
+        finally:
+            try:
+                await self.close_llm(cell, llm)
+            finally:
+                journal.close()
+                self.write_partial()
 
     # -- output ------------------------------------------------------------
     def payload(self, *, interrupted: bool) -> dict[str, Any]:
@@ -991,6 +1305,16 @@ class Tier1Runner:
                     "stats": self.provider_dead.stats,
                 }
             ),
+            #: Every provider that died, not just the first: a second one is its
+            #: own abort with its own victims, never a duplicate of the first.
+            "provider_dead_all": [
+                {"provider": d.provider, "trigger": d.trigger,
+                 "detail": str(d), "stats": d.stats}
+                for d in self.dead_providers.values()
+            ],
+            #: Exceptions the gather returned that no cell accounted for. Empty
+            #: in a healthy run; anything here is a bug AND a nonzero exit.
+            "unaccounted": self.unaccounted,
             "summary": summarize(self.results),
             "paired": paired_differences(self.results),
             "reaper": self.reaper_report,
@@ -1000,12 +1324,7 @@ class Tier1Runner:
 
     def write_partial(self, *, interrupted: bool = False) -> None:
         """Atomic rewrite after every completion: partial results are usable."""
-        out = self.cfg.out
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        tmp = f"{out}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.payload(interrupted=interrupted), fh, indent=2, default=str)
-        os.replace(tmp, out)
+        atomic_write_json(self.cfg.out, self.payload(interrupted=interrupted))
 
     # -- reaper ------------------------------------------------------------
     async def reap_cell(self, cell: Cell, run_id: str, fp: Any) -> None:
@@ -1066,9 +1385,60 @@ class Tier1Runner:
             )
             self.master.incident(kind="reaper_failed", detail=str(exc)[:2000])
 
+    # -- accounting nets ---------------------------------------------------
+    def preflight_capacity(self, cells: Sequence[Cell]) -> None:
+        """Refuse the whole matrix if a cell cannot fit the slot pool.
+
+        :class:`SlotPool` no longer clamps an over-wide request, so an 8-seat arm
+        under a 4-slot cap would otherwise raise once per cell, mid-flight, after
+        the block had already started spending. One error instead, before anything
+        is provisioned, naming every offending arm.
+        """
+        pool = self.slots.total
+        over = {
+            cell.arm: peak_sandboxes(cell.arm, self.cfg.K)
+            for cell in cells
+            if peak_sandboxes(cell.arm, self.cfg.K) > pool
+        }
+        if not over:
+            return
+        detail = ", ".join(f"{arm} needs {n}" for arm, n in sorted(over.items()))
+        raise ValueError(
+            f"the {pool}-slot sandbox pool cannot hold every cell of this matrix "
+            f"at K={self.cfg.K} ({detail} concurrent sandbox(es)): raise "
+            "--max-sandboxes (or the Tier-0 cap) or lower K -- admitting them "
+            "would break the cap the pool exists to enforce"
+        )
+
+    def account_gathered(self, cells: Sequence[Cell],
+                         outcomes: Sequence[Any]) -> None:
+        """Close the accounting net over whatever the gather returned.
+
+        ``return_exceptions=True`` turns every escape into a value, so this is the
+        last place a cell can still be lost. A task cancelled BEFORE its coroutine
+        ever ran (an abort landing between ``create_task`` and the first step)
+        never reached :meth:`run_cell`; anything else here is a bug in the
+        recording scope. Both are recorded, and both exit nonzero.
+        """
+        for cell, outcome in zip(cells, outcomes):
+            if not isinstance(outcome, BaseException):
+                continue
+            if cell.key in self.accounted:
+                continue
+            if isinstance(outcome, asyncio.CancelledError):
+                self.record_cancelled(cell, self.run_id_of(cell))
+                continue
+            self.unaccounted.append(
+                {"cell": cell.key,
+                 "error": f"{type(outcome).__name__}: {outcome}"[:2000]}
+            )
+            self.record_failure(cell, self.run_id_of(cell), outcome,
+                                kind="unaccounted_exception")
+
     # -- main --------------------------------------------------------------
     async def run(self) -> dict[str, Any]:
         cells = expand_cells(self.cfg)
+        self.preflight_capacity(cells)
         self.master.event("pilot_start", n_cells=len(cells),
                           cells=[c.key for c in cells])
         loop = asyncio.get_running_loop()
@@ -1100,7 +1470,8 @@ class Tier1Runner:
             with contextlib.suppress(NotImplementedError, ValueError):
                 loop.add_signal_handler(sig, on_signal)
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            self.account_gathered(cells, outcomes)
         finally:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 with contextlib.suppress(NotImplementedError, ValueError):
@@ -1279,11 +1650,14 @@ def _cli() -> argparse.ArgumentParser:
     ap.add_argument("--prefix", default="")
     ap.add_argument("--keep", default="",
                     help="comma-separated resource ids the reaper must never "
-                         "delete (the bake sandbox); TEMPLATE_SNAP and the "
-                         "--from-snap seed are ALWAYS kept on top of this")
-    ap.add_argument("--template-snap-id", default=TEMPLATE_SNAP,
+                         "delete (the bake sandbox); ADDED to whatever the "
+                         "config or block preset already protects -- the keep "
+                         "set only ever grows -- and TEMPLATE_SNAP plus the "
+                         "--from-snap seed are ALWAYS kept on top of that")
+    ap.add_argument("--template-snap-id", default=None,
                     help="the greenfield template id, kept separately from the "
-                         "run seed so both survive every sweep")
+                         "run seed so both survive every sweep (default: the "
+                         f"config's value, else {TEMPLATE_SNAP})")
     ap.add_argument("--exp2-block", action="store_true",
                     help="run Exp 2's pre-registered 8-cell manifest (3x "
                          "B-iterated + 3x AxK-from-S as pairs, then B-once, "
@@ -1430,8 +1804,16 @@ def build_config(args: argparse.Namespace) -> Tier1Config:
     if args.template_snap:
         cfg.template_snap = args.template_snap
     if args.keep:
-        cfg.keep = tuple(k for k in args.keep.split(",") if k)
-    if args.template_snap_id:
+        # ADDITIVE by contract: operator flags may only ever grow the keep set
+        # (the pilot's between-block sweep ate the bake sandbox once because a
+        # flag replaced the substrate the block was built on). Order is preserved
+        # and duplicates collapse.
+        cfg.keep = tuple(dict.fromkeys(
+            cfg.keep + tuple(k.strip() for k in args.keep.split(",") if k.strip())
+        ))
+    if args.template_snap_id is not None:
+        # Only when SUPPLIED: a non-empty argparse default used to overwrite the
+        # template a --config file (or a block preset) had already chosen.
         cfg.template_snap_id = args.template_snap_id
     if args.cells:
         cfg.cells = tuple(c for c in args.cells.split(",") if c.strip())
@@ -1449,6 +1831,20 @@ def build_config(args: argparse.Namespace) -> Tier1Config:
         cfg.out = args.out
     if args.dry:
         cfg.dry = True
+    if args.T and cfg.exp3_block:
+        # Exp 3's leg and lease are DERIVED from T (P = T/2, lease = T + margin)
+        # and the preset derived them from the pinned horizon, before this
+        # override landed. Re-derive them or the block runs a leg of the old
+        # half-T and a lease that expires mid-round -- exactly the round-1
+        # failure the derivation exists to prevent.
+        cfg.leg_s = 0.5 * cfg.T_s
+        cfg.ttl_s = exp3_ttl_s(cfg.T_s)
+        print(
+            f"[tier1] --T {cfg.T_s:.0f}s overrides the Exp-3 horizon: "
+            f"P={cfg.leg_s:.0f}s, lease={cfg.ttl_s}s re-derived. This is NOT the "
+            f"pre-registered T={EXP3_T_S:.0f}s -- the results carry the override.",
+            flush=True,
+        )
     return cfg
 
 
@@ -2351,8 +2747,20 @@ def assert_exp3_dry_block(payload: dict[str, Any], *, round_only: int = 0) -> st
     returns the one-line summary printed as the dry tail.
     """
     runs = {r["cell"]: r for r in payload["runs"]}
+    # The model and task come from the payload's OWN config: --models k3 is a
+    # documented relaunch of this block (the codex quota died mid-round), and a
+    # hard-coded codex key would fail the gate on a run that was entirely
+    # correct. Absent config = no contract to assert against, so it fails closed.
+    config = payload.get("config")
+    assert isinstance(config, dict), "the payload carries no config to assert against"
+    models = list(config.get("models") or ())
+    tasks = list(config.get("tasks") or ())
+    assert models and tasks, (
+        f"the payload's config names no model/task (models={models}, tasks={tasks})"
+    )
+    model, task = models[0], tasks[0]
     expected = [
-        f"{arm}|codex/gpt-5.6-sol|iron_plate_throughput|r{rep}"
+        f"{arm}|{model}|{task}|r{rep}"
         for arm, rep in EXP3_BLOCK
         if not round_only or rep == round_only
     ]
@@ -2715,6 +3123,14 @@ def _cell_spans(payload: dict[str, Any]) -> dict[str, tuple[float, float]]:
     return {c: (starts[c], ends[c]) for c in starts if c in ends}
 
 
+def _expand_or_exit(cfg: Tier1Config) -> list[Cell]:
+    """Expand a config's matrix, turning a matrix error into a clean refusal."""
+    try:
+        return expand_cells(cfg)
+    except ValueError as exc:
+        raise SystemExit(f"refusing to run: {exc}") from exc
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _cli().parse_args(argv)
     if args.dry_validate:
@@ -2817,21 +3233,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             parse_cell_selector(cfg.cells)
         except ValueError as exc:
             raise SystemExit(f"refusing to run: {exc}") from exc
-        if not expand_cells(cfg):
-            whole = [c.key for c in expand_cells(replace(cfg, cells=()))]
+        if not _expand_or_exit(cfg):
+            whole = [c.key for c in _expand_or_exit(replace(cfg, cells=()))]
             raise SystemExit(
                 f"refusing to run: --cells {','.join(cfg.cells)} selected no "
                 f"cell of this block ({whole})"
             )
-    if cfg.round and not expand_cells(cfg):
-        whole = [c.key for c in expand_cells(replace(cfg, round=0))]
+    if cfg.round and not _expand_or_exit(cfg):
+        whole = [c.key for c in _expand_or_exit(replace(cfg, round=0))]
         raise SystemExit(
             f"refusing to run: --round {cfg.round} selected no cell of this "
             f"block ({whole})"
         )
 
     if args.print_cells:
-        cells = expand_cells(cfg)
+        cells = _expand_or_exit(cfg)
         print(json.dumps(
             {"n_cells": len(cells), "cells": [c.key for c in cells],
              "round": cfg.round or None, "T_s": cfg.T_s, "leg_s": cfg.leg_s,
@@ -2840,8 +3256,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         ))
         return 0
 
-    runner = Tier1Runner(cfg)
-    payload = asyncio.run(runner.run())
+    try:
+        # Both the merge-base fingerprint and the capacity pre-flight refuse here,
+        # before a single sandbox exists: a refusal is an exit code, never a
+        # traceback over a half-provisioned block.
+        runner = Tier1Runner(cfg)
+        payload = asyncio.run(runner.run())
+    except ValueError as exc:
+        raise SystemExit(f"refusing to run: {exc}") from exc
     print(json.dumps(
         {
             "label": payload["label"],
@@ -2877,6 +3299,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if cfg.exp3_block and cfg.dry:
         print(assert_exp3_dry_block(payload, round_only=cfg.round))
+    # Exit codes (C7): 0 means a COMPLETE matrix. A wrapper that reads 0 as "the
+    # block ran" must never see it for a block that lost a cell -- failed cells,
+    # cells the graceful stop never admitted, an interrupt, or an exception no
+    # cell accounted for are each incomplete, and each exits 1.
+    problems: list[str] = []
+    if payload["failures"]:
+        problems.append(f"{len(payload['failures'])} failed cell(s)")
+    if payload["skipped"]:
+        problems.append(f"{len(payload['skipped'])} skipped cell(s): "
+                        f"{', '.join(payload['skipped'])}")
+    if payload["interrupted"]:
+        problems.append("interrupted before the matrix finished")
+    if payload.get("unaccounted"):
+        problems.append(
+            f"{len(payload['unaccounted'])} unaccounted exception(s) -- a bug in "
+            "the per-cell recording scope"
+        )
+    if problems:
+        print(f"\nINCOMPLETE: {'; '.join(problems)}; results in {cfg.out}",
+              flush=True)
+        return 1
     return 0
 
 

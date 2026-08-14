@@ -1,32 +1,72 @@
-"""Tier-1 PILOT analysis: turn ``tier1_pilot.json`` + run journals into a report.
+"""Tier-1 PILOT analysis: turn orchestrator results + run journals into a report.
 
-Everything here is derived from two artifacts and nothing else:
+Every number below is derived from the inputs named here and nothing else. Each
+input is validated, hashed and listed in the report's provenance section
+(``payload["provenance"]``, rendered under Traceability):
 
-* ``bench/results/tier1_pilot.json`` -- the orchestrator's atomic partial, one
-  ``RunResult`` per completed cell plus failures/skips;
-* ``bench/journal/tier1/<run_id>.jsonl`` -- the per-run append-only evidence
-  (``infra_op``, ``probe``, ``llm_call``, ``step``, ``branch_selection``,
-  ``branch_archive``, ``incident``).
+* ``--results`` -- one or more orchestrator output JSONs. The pilot runs in
+  blocks (the k3 priority block, then the secondary models) and each block
+  writes its own atomic partial; a requested block that is absent is an error,
+  never a quietly smaller pilot.
+* ``--journal-dir`` -- ``bench/journal/tier1/<run_id>.jsonl``, the per-run
+  append-only evidence (``infra_op``, ``probe``, ``llm_call``, ``step``,
+  ``branch_selection``, ``branch_archive``, ``incident``), read through
+  ``bench.common.load_journal_records`` (latest session per run).
+* ``--tier05`` -- the frozen Tier-0.5 gate: planned priority cells, admission
+  verdicts and the calibration the deviation/not-run tables are read against.
+* ``--ledger-root`` -- farplane journal tree(s) replayed for the independent
+  create/delete ledger behind the residual claim (default ``bench/journal``).
+* ``--bake`` / ``--keep`` -- declared substrate ids that are allowed to outlive
+  the sweep (the bake sandbox, TEMPLATE_SNAP). Anything else left outstanding
+  in the ledger blocks the zero-residual claim.
 
-Every table below names the journal it came from so a reader can re-derive it.
+Analysis fails closed. A missing required input, an unreadable results block or
+a journal corrupted before its final line raises :class:`AnalysisError` and
+exits 2 *before* any output is written. A run whose own journal cannot be read
+is named as an unusable cell and dropped from every journal-derived table
+instead of being scored as zero (exit 1, report still written). Result
+artifacts are written atomically.
+
 The pre-registered reads implemented here are v2.3 (endpoint = quota-normalised
-terminal probe), v2.6 (direct probes, K=2, cold-page tax reported) and v2.6.1
-(dual wall-clock/matched-step read of B vs A×K; K=2 interpretive ceiling from
-per-branch-point probe variance).
+terminal probe), v2.6 (direct probes, K=2, cold-page tax reported against the
+declared materiality threshold below) and v2.6.1 (dual wall-clock/matched-step
+read of B vs A×K; K=2 interpretive ceiling from per-branch-point probe
+variance).
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import statistics
+import sys
+from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from bench.common import (  # noqa: E402
+    JournalParseError,
+    atomic_write_json,
+    load_journal_records,
+)
 
 INFRA_BUCKETS = (
     "infra_snapshot", "infra_fork", "infra_expose", "infra_delete", "infra_poll",
 )
+
+DEFAULT_RESULTS = "bench/results/tier1_pilot.json"
+DEFAULT_LEDGER_ROOTS = ("bench/journal",)
+
+# v2.6 cold-page read: the probe window is 3600 ticks at game speed 10, and a
+# cold-vs-warm gap counts as material at 5% of that window. Declared here so
+# the report states a threshold instead of asserting a verdict.
+NOMINAL_PROBE_WINDOW_S = 6.0
+COLD_PAGE_MATERIAL_S = 0.3
+COLD_PAGE_MIN_PROBES = 3
 
 
 # ---------------------------------------------------------------------------
@@ -34,17 +74,130 @@ INFRA_BUCKETS = (
 # ---------------------------------------------------------------------------
 
 
-def load_journal(path: str) -> list[dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    out: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return out
+class AnalysisError(RuntimeError):
+    """A required input is missing, unreadable, or ambiguous.
+
+    Analysis fails closed: a report that cannot name the evidence behind a
+    number does not print the number.
+    """
+
+
+def load_journal(path: str, *, session: str = "latest") -> list[dict[str, Any]]:
+    """Records of one journal session, through the shared C1 reader.
+
+    Read errors are never swallowed: a missing file raises ``FileNotFoundError``
+    and corruption before the final line raises ``JournalParseError``. An
+    unreadable journal is not an empty one, and every table derived from it
+    would otherwise publish zeros as if they were measurements.
+    """
+    return load_journal_records(path, session=session)
+
+
+def journal_evidence(path: str) -> tuple[list[dict[str, Any]] | None, str, str]:
+    """``(records, status, error)`` for one run journal; never raises.
+
+    Callers turn a ``None`` record list into an explicitly unusable cell, so a
+    truncated journal costs exactly that run's tables and nothing else.
+    """
+    try:
+        return load_journal(path), "ok", ""
+    except FileNotFoundError:
+        return None, "missing", f"no journal file at `{path}`"
+    except JournalParseError as exc:
+        detail = "; ".join(f"line {ln}: {msg}" for ln, msg in exc.errors[:4])
+        return None, "corrupt", f"journal `{path}` is malformed ({detail})"
+    except OSError as exc:
+        return None, "unreadable", f"journal `{path}` cannot be read ({exc})"
+
+
+def unusable_cell(run: dict[str, Any], path: str, status: str,
+                  error: str) -> dict[str, Any]:
+    """A run whose journal cannot be read: named in full, scored nowhere."""
+    return {
+        "cell": run.get("cell", ""),
+        "run_id": run.get("run_id", ""),
+        "journal": path,
+        "journal_status": status,
+        "journal_error": error,
+        "journal_records": None,
+        "arm": run.get("arm"),
+        "model": run.get("model"),
+        "task": run.get("task_key"),
+        "replicate": run.get("replicate"),
+        "status": run.get("status"),
+        "error": run.get("error"),
+        "endpoint_throughput": run.get("endpoint_throughput"),
+        "steps": run.get("steps"),
+    }
+
+
+def read_json(path: str, *, role: str) -> Any:
+    """Load a declared JSON input, or fail naming the role that needed it."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError as exc:
+        raise AnalysisError(f"required {role} input is missing: {path}") from exc
+    except OSError as exc:
+        raise AnalysisError(f"{role} input {path} cannot be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise AnalysisError(f"{role} input {path} is not valid JSON: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Provenance: every input this report consumes, with its content hash
+# ---------------------------------------------------------------------------
+
+
+def validate_resource_id(flag: str, value: str) -> str:
+    """A declared substrate id: a bare token, never a path or a sentence."""
+    ident = (value or "").strip()
+    if ident and (len(ident.split()) > 1 or "/" in ident):
+        raise AnalysisError(f"{flag} must be a bare resource id, got {value!r}")
+    return ident
+
+
+def _sha256_file(path: str) -> tuple[str, int]:
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def input_record(role: str, path: str, *, required: bool) -> dict[str, Any]:
+    """One consumed file with its content hash, for the provenance section."""
+    if not os.path.isfile(path):
+        if required:
+            raise AnalysisError(f"required {role} input is missing: {path}")
+        return {"role": role, "kind": "file", "path": path, "present": False}
+    try:
+        digest, size = _sha256_file(path)
+    except OSError as exc:
+        raise AnalysisError(f"{role} input {path} cannot be read: {exc}") from exc
+    return {"role": role, "kind": "file", "path": path, "present": True,
+            "sha256": digest, "bytes": size,
+            "mtime": round(os.path.getmtime(path), 3)}
+
+
+def tree_record(role: str, root: str, *, required: bool,
+                pattern: str = "**/*.jsonl") -> dict[str, Any]:
+    """Every journal under ``root``, each hashed, plus one digest over all."""
+    if not os.path.isdir(root):
+        if required:
+            raise AnalysisError(f"required {role} directory is missing: {root}")
+        return {"role": role, "kind": "tree", "path": root, "present": False}
+    files = [input_record(role, p, required=True) for p in
+             sorted(glob.glob(os.path.join(root, pattern), recursive=True))]
+    roll = hashlib.sha256()
+    for rec in files:
+        rel = os.path.relpath(rec["path"], root)
+        roll.update(f"{rel}\0{rec['sha256']}\n".encode())
+    return {"role": role, "kind": "tree", "path": root, "present": True,
+            "n_files": len(files), "bytes": sum(r["bytes"] for r in files),
+            "sha256_tree": roll.hexdigest(), "files": files}
 
 
 def of_kind(recs: Iterable[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
@@ -189,6 +342,12 @@ def fork_stats(recs: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def llm_stats(recs: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Provider reliability from the attempt-level ``llm_call`` records.
+
+    ``retry_rate`` is retried attempts over all attempts; what *failed* is the
+    separate ``failed_attempt_rate``. Neither rate is defined without calls, so
+    both are ``None`` rather than 0.0 when the journal recorded none.
+    """
     calls = of_kind(recs, "llm_call")
     ok = [c for c in calls if c.get("outcome") == "ok"]
     errors = [c for c in calls if c.get("outcome") != "ok"]
@@ -203,7 +362,10 @@ def llm_stats(recs: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "empty_completions": len(empty),
         "timeouts": len(timeouts),
         "retried_attempts": len(retries),
-        "retry_rate": round(len(errors) / len(calls), 4) if calls else 0.0,
+        "retry_rate": round(len(retries) / len(calls), 4) if calls else None,
+        "failed_attempt_rate": (
+            round(len(errors) / len(calls), 4) if calls else None
+        ),
         "median_latency_s": round(statistics.median(lat), 2) if lat else None,
         "max_latency_s": round(max(lat), 2) if lat else None,
         "unparseable": len([r for r in of_kind(recs, "incident")
@@ -297,7 +459,9 @@ def decomposition(run: dict[str, Any]) -> dict[str, Any]:
 def enrich(run: dict[str, Any], journal_dir: str) -> dict[str, Any]:
     run_id = run.get("run_id", "")
     path = os.path.join(journal_dir, f"{run_id}.jsonl")
-    recs = load_journal(path)
+    recs, journal_status, journal_error = journal_evidence(path)
+    if recs is None:
+        return unusable_cell(run, path, journal_status, journal_error)
     dec = decomposition(run)
     e2e = dec["end_to_end_s"]
     if e2e:
@@ -316,6 +480,8 @@ def enrich(run: dict[str, Any], journal_dir: str) -> dict[str, Any]:
         "cell": run.get("cell", ""),
         "run_id": run_id,
         "journal": path,
+        "journal_status": journal_status,
+        "journal_error": journal_error,
         "journal_records": len(recs),
         "arm": run.get("arm"),
         "model": run.get("model"),
@@ -750,19 +916,50 @@ def render(payload: dict[str, Any]) -> str:
              if c["probe"]["cold"].get("n")]
     warms = [c["probe"]["warm"].get("median") for c in cells
              if c["probe"]["warm"].get("n")]
+    cold_n = sum(c["probe"]["cold"].get("n", 0) for c in cells)
+    warm_n = sum(c["probe"]["warm"].get("n", 0) for c in cells)
     if colds and warms:
         cold_med = statistics.median(colds)
         warm_med = statistics.median(warms)
+        delta_ms = (cold_med - warm_med) * 1000.0
+        threshold_pct = COLD_PAGE_MATERIAL_S / NOMINAL_PROBE_WINDOW_S * 100.0
+        measured = (
+            f"Median cold probe {cold_med:.3f}s (n={cold_n}) vs median warm probe "
+            f"{warm_med:.3f}s (n={warm_n}) -- a {delta_ms:+.0f}ms difference "
+            f"against a {NOMINAL_PROBE_WINDOW_S:.3f}s nominal window (3600 ticks "
+            f"at game speed 10)."
+        )
+        if cold_n < COLD_PAGE_MIN_PROBES or warm_n < COLD_PAGE_MIN_PROBES:
+            add(
+                f"**Cold-page tax: NOT DETERMINED.** The verdict needs at least "
+                f"{COLD_PAGE_MIN_PROBES} probes of each temperature; this pilot "
+                f"has cold n={cold_n}, warm n={warm_n}. {measured}"
+            )
+        elif cold_med - warm_med > COLD_PAGE_MATERIAL_S:
+            add(
+                f"**Measured cold-page tax: MATERIAL** against the pre-set "
+                f"{COLD_PAGE_MATERIAL_S:.3f}s threshold ({threshold_pct:.0f}% of "
+                f"the nominal window). {measured} The v2.6 decision to charge the "
+                f"cold tax to T is load-bearing on this workload: the arms that "
+                f"fork or create guests pay this inside T."
+            )
+        else:
+            add(
+                f"**Measured cold-page tax: below the pre-set "
+                f"{COLD_PAGE_MATERIAL_S:.3f}s materiality threshold** "
+                f"({threshold_pct:.0f}% of the nominal window). {measured} Tier 0 "
+                f"measured 22.2s for a probe on a freshly forked 3k-entity "
+                f"factory; the pilot's terminal factories are tens of entities, so "
+                f"there are too few dirty pages for the fault-in cost to show at "
+                f"this scale. The v2.6 decision to charge the cold tax to T "
+                f"stands, but on this workload it charges {delta_ms:+.0f}ms."
+            )
+        add("")
+    else:
         add(
-            f"**Measured cold-page tax: none at this scale.** Median cold probe "
-            f"{cold_med:.3f}s vs median warm probe {warm_med:.3f}s -- a "
-            f"{abs(cold_med - warm_med) * 1000:.0f}ms difference against a "
-            f"6.000s nominal window (3600 ticks at game speed 10). Tier 0 "
-            f"measured 22.2s for a probe on a freshly forked 3k-entity factory; "
-            f"the pilot's terminal factories are tens of entities, so there are "
-            f"too few dirty pages for the fault-in cost to show. The v2.6 "
-            f"decision to charge the cold tax to T stands, but on this workload "
-            f"it charges nothing."
+            f"**Cold-page tax: NOT DETERMINED.** No cell has both a cold and a "
+            f"warm probe median (cold n={cold_n}, warm n={warm_n}), so the v2.6 "
+            f"cold-page read cannot be taken from this pilot."
         )
         add("")
 
@@ -775,7 +972,8 @@ def render(payload: dict[str, Any]) -> str:
         m = c["llm"]
         add(
             f"| `{_label(c)}` | {m['calls']} | {m['ok']} | {m['failed_attempts']} | "
-            f"{m['empty_completions']} | {m['timeouts']} | {m['retry_rate']} | "
+            f"{m['empty_completions']} | {m['timeouts']} | "
+            f"{_num(m['retry_rate'], 4)} | "
             f"{m['median_latency_s']} | {m['unparseable']} |"
         )
     add("")
@@ -926,14 +1124,26 @@ def render(payload: dict[str, Any]) -> str:
     audit = payload["ledger_audit"]
     add(
         f"Independent ledger audit over {audit['journal_files']} farplane journal "
-        f"file(s) (every create/delete the harness ever issued, Tier 0 included): "
+        f"file(s) under {', '.join(audit['journal_roots'])} (every create/delete "
+        f"the harness ever issued, Tier 0 included): "
         f"{audit['snapshots_created']} snapshots created / "
         f"{audit['snapshots_deleted']} deleted, outstanding "
         f"{audit['snapshots_outstanding'] or 'none'}; "
         f"{audit['sandboxes_created']} sandboxes created / "
         f"{audit['sandboxes_deleted']} deleted, outstanding "
-        f"{audit['sandboxes_outstanding'] or 'none'}."
+        f"{audit['sandboxes_outstanding'] or 'none'}. Declared substrate allowed "
+        f"to survive: {', '.join(audit['keep']) or 'none'}; UNDECLARED "
+        f"outstanding: {', '.join(audit['outstanding_undeclared']) or 'none'}."
     )
+    if not audit["complete"]:
+        add("")
+        add(
+            f"**Ledger audit INCOMPLETE:** {len(audit['unreadable_files'])} journal "
+            f"file(s) could not be replayed, so the counts above are a lower bound "
+            f"and no zero-residual claim is made -- "
+            + ", ".join(f"`{f['path']}`" for f in audit["unreadable_files"][:5])
+            + "."
+        )
     add("")
     for note in payload.get("infra_notes", []):
         add(f"- {note}")
@@ -945,11 +1155,42 @@ def render(payload: dict[str, Any]) -> str:
     add("|---|---|---|")
     for c in cells:
         add(f"| `{_label(c)}` | `{c['journal']}` | {c['journal_records']} |")
+    for c in payload.get("unusable_cells", []):
+        add(f"| `{_label(c)}` | `{c['journal']}` | "
+            f"**{c['journal_status'].upper()} -- not scored** |")
     add("")
-    add(f"Orchestrator master journal: `{payload['master_journal']}`. "
-        f"Raw results: `{payload['results_path']}`. "
+    prov = payload.get("provenance") or {}
+    inputs = prov.get("inputs") or []
+    master = next((i for i in inputs if i["role"] == "master_journal"), None)
+    add(f"Orchestrator master journal: `{payload['master_journal']}`"
+        + ("" if master and master.get("present") else " (ABSENT -- not consumed)")
+        + f". Raw results: `{payload['results_path']}`. "
         f"Derived tables: `{payload['analysis_path']}`. "
         f"Reaper sweep: {payload['reaper_summary']}.")
+    add("")
+    add("### Inputs consumed")
+    add("")
+    add("| role | path | sha256 | size |")
+    add("|---|---|---|---|")
+    for rec in inputs:
+        if not rec.get("present"):
+            add(f"| {rec['role']} | `{rec['path']}` | - | **ABSENT** |")
+        elif rec.get("kind") == "tree":
+            add(f"| {rec['role']} | `{rec['path']}` (tree) | "
+                f"`{rec['sha256_tree'][:16]}` | {rec['n_files']} file(s), "
+                f"{rec['bytes']} B |")
+        else:
+            add(f"| {rec['role']} | `{rec['path']}` | `{rec['sha256'][:16]}` | "
+                f"{rec['bytes']} B |")
+    add("")
+    cli = prov.get("cli") or {}
+    add("Hashes are SHA-256 over the exact bytes consumed; a tree row hashes the "
+        "sorted per-file digests and the full per-file list is in the JSON "
+        "payload. Declared CLI inputs: "
+        + "; ".join(f"`{k}`={v}" for k, v in sorted(cli.items())) + ".")
+    for err in payload.get("evidence_errors") or []:
+        add("")
+        add(f"- **EVIDENCE ERROR:** {err}")
     add("")
     return "\n".join(lines)
 
@@ -980,14 +1221,34 @@ def combine(paths: Sequence[str]) -> dict[str, Any]:
     The pilot runs in blocks (the k3 priority block, then the secondary models)
     so that a block can be abandoned without losing the ones before it; each
     block writes its own atomic partial. Analysis reads them as one pilot.
+
+    Every requested source must exist and parse BEFORE anything is merged: the
+    default ``--combined-out`` overwrites one of these very files, and a pilot
+    silently missing a block would publish a smaller matrix as if it were the
+    whole one.
     """
+    if not paths:
+        raise AnalysisError(
+            "no --results source given: analysis needs at least one "
+            "orchestrator output JSON"
+        )
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise AnalysisError(
+            "requested --results source(s) do not exist: "
+            + ", ".join(missing)
+            + " -- refusing to analyse (or overwrite outputs from) a pilot whose "
+            "blocks are not all present"
+        )
     merged: dict[str, Any] = {"runs": [], "failures": [], "skipped": [],
                               "reaper": [], "sources": []}
     for path in paths:
-        if not os.path.exists(path):
-            continue
-        with open(path, encoding="utf-8") as fh:
-            block = json.load(fh)
+        block = read_json(path, role="results_block")
+        if not isinstance(block, dict):
+            raise AnalysisError(
+                f"results source {path} is not a JSON object: "
+                f"got {type(block).__name__}"
+            )
         merged["sources"].append(path)
         merged["runs"].extend(block.get("runs") or [])
         merged["failures"].extend(block.get("failures") or [])
@@ -1002,23 +1263,37 @@ def combine(paths: Sequence[str]) -> dict[str, Any]:
     return merged
 
 
-def ledger_audit(journal_roots: Sequence[str]) -> dict[str, Any]:
+def ledger_audit(journal_roots: Sequence[str],
+                 keep: Iterable[str] = ()) -> dict[str, Any]:
     """Replay every farplane journal and list what was created but never deleted.
 
     This is the independent check behind the "zero residual" claim: the reaper
     reports what IT swept, the ledger reports what the harness ever asked the
-    control plane to create.
+    control plane to create. ``keep`` names the declared substrate ids that are
+    *supposed* to outlive the sweep (TEMPLATE_SNAP, the bake sandbox); anything
+    else still outstanding is undeclared residue.
+
+    A journal that cannot be replayed leaves the audit INCOMPLETE. An audit that
+    could not read all of its evidence never counts as "found nothing".
     """
     created_snap: set[str] = set()
     deleted_snap: set[str] = set()
     created_sb: set[str] = set()
     deleted_sb: set[str] = set()
     files: list[str] = []
+    unreadable: list[dict[str, str]] = []
     for root in journal_roots:
+        if not os.path.isdir(root):
+            raise AnalysisError(f"ledger root does not exist: {root}")
         for path in sorted(glob.glob(os.path.join(root, "**", "*.jsonl"),
                                      recursive=True)):
             files.append(path)
-            for rec in load_journal(path):
+            try:
+                recs = load_journal(path, session="all")
+            except (JournalParseError, OSError) as exc:
+                unreadable.append({"path": path, "error": str(exc)})
+                continue
+            for rec in recs:
                 if rec.get("outcome") != "ok":
                     continue
                 op = rec.get("op")
@@ -1033,15 +1308,59 @@ def ledger_audit(journal_roots: Sequence[str]) -> dict[str, Any]:
                         created_sb.add(res["sandbox_id"])
                 elif op == "delete_sandbox" and args.get("sandbox"):
                     deleted_sb.add(args["sandbox"])
+    keep_ids = {k for k in keep if k}
+    outstanding = (created_snap - deleted_snap) | (created_sb - deleted_sb)
     return {
+        "journal_roots": list(journal_roots),
         "journal_files": len(files),
+        "unreadable_files": unreadable,
+        "complete": not unreadable,
+        "keep": sorted(keep_ids),
         "snapshots_created": len(created_snap),
         "snapshots_deleted": len(created_snap & deleted_snap),
         "snapshots_outstanding": sorted(created_snap - deleted_snap),
         "sandboxes_created": len(created_sb),
         "sandboxes_deleted": len(created_sb & deleted_sb),
         "sandboxes_outstanding": sorted(created_sb - deleted_sb),
+        "outstanding_declared": sorted(outstanding & keep_ids),
+        "outstanding_undeclared": sorted(outstanding - keep_ids),
     }
+
+
+def residual_summary(residual: Sequence[dict[str, Any]],
+                     audit: dict[str, Any]) -> str:
+    """The post-sweep residual claim, gated on the independent ledger audit.
+
+    The reaper only knows about the resources it looked at, so "zero residual"
+    is claimable only when the ledger audit is COMPLETE and shows nothing
+    outstanding beyond the declared substrate ids. Anything else is UNVERIFIED
+    with the reason attached -- never a zero.
+    """
+    if residual:
+        return (
+            f"{len(residual)} resource(s) failed to delete during the sweep"
+        )
+    if not audit["complete"]:
+        return (
+            "UNVERIFIED -- the sweep reported no failures, but the ledger audit "
+            f"could not replay {len(audit['unreadable_files'])} journal file(s) "
+            f"({', '.join(f['path'] for f in audit['unreadable_files'][:3])}), so "
+            "the create/delete ledger cannot back a zero-residual claim"
+        )
+    undeclared = audit["outstanding_undeclared"]
+    if undeclared:
+        return (
+            "UNVERIFIED -- the sweep reported no failures, but the ledger audit "
+            f"shows {len(undeclared)} undeclared resource(s) created and never "
+            f"deleted: {', '.join(undeclared[:6])}"
+        )
+    survivors = ", ".join(f"`{i}`" for i in audit["outstanding_declared"])
+    return (
+        "zero -- every sandbox and snapshot this pilot created was deleted, and "
+        f"the independent ledger audit over {audit['journal_files']} journal "
+        "file(s) agrees; the only surviving flebench resources are the declared "
+        f"substrate {survivors or '(none outstanding at all)'}"
+    )
 
 
 def infra_notes(payload: dict[str, Any]) -> list[str]:
@@ -1070,10 +1389,45 @@ def infra_notes(payload: dict[str, Any]) -> list[str]:
 
 
 def build(results_paths: Sequence[str], journal_dir: str,
-          tier05_path: str, bake: str = "") -> dict[str, Any]:
+          tier05_path: str, bake: str = "",
+          ledger_roots: Sequence[str] = DEFAULT_LEDGER_ROOTS,
+          keep: Sequence[str] = ()) -> dict[str, Any]:
+    """Fold every declared input into one payload, validating it first.
+
+    The inputs are exactly: the orchestrator result blocks, the per-run journals
+    under ``journal_dir``, the frozen Tier-0.5 gate, the farplane journal trees
+    replayed for the residual ledger, and the declared substrate ids (``bake``,
+    ``keep``). Each one is validated and hashed into ``payload["provenance"]``
+    before any table is derived, and a missing required input raises
+    :class:`AnalysisError` rather than yielding a quietly smaller report.
+    """
+    bake = validate_resource_id("--bake", bake)
+    keep_ids = {validate_resource_id("--keep", k) for k in keep if k}
+    if bake:
+        keep_ids.add(bake)
+
     results = combine(results_paths)
     build.last_combined = results  # type: ignore[attr-defined]
-    cells = [enrich(run, journal_dir) for run in results.get("runs", [])]
+    runs = results.get("runs") or []
+
+    inputs = [input_record("results_block", p, required=True)
+              for p in (results.get("sources") or list(results_paths))]
+    inputs.append(input_record("tier05_gate", tier05_path, required=True))
+    inputs.append(tree_record("run_journals", journal_dir, required=bool(runs)))
+    master_journal = os.path.join(journal_dir, "tier1-master.jsonl")
+    inputs.append(input_record("master_journal", master_journal, required=False))
+    for root in ledger_roots:
+        inputs.append(tree_record("farplane_ledger", root, required=True))
+
+    enriched = [enrich(run, journal_dir) for run in runs]
+    cells = [c for c in enriched if c["journal_status"] == "ok"]
+    unusable = [c for c in enriched if c["journal_status"] != "ok"]
+    if runs and not cells:
+        raise AnalysisError(
+            f"not one of the {len(runs)} run journal(s) under {journal_dir} could "
+            "be read, so there is nothing to derive: "
+            + "; ".join(c["journal_error"] for c in unusable[:5])
+        )
     cells.sort(key=lambda c: (c["model"] or "", c["task"] or "",
                               ("A", "AxK", "B", "C").index(c["arm"])
                               if c["arm"] in ("A", "AxK", "B", "C") else 9))
@@ -1084,17 +1438,19 @@ def build(results_paths: Sequence[str], journal_dir: str,
         {"kind": "SKIPPED", "cell": key, "reason":
             "not reached inside the pilot's wall-clock budget"}
         for key in results.get("skipped", [])
+    ] + [
+        {"kind": f"UNUSABLE EVIDENCE ({c['journal_status']} journal)",
+         "cell": c["cell"] or c["run_id"],
+         "reason": f"{c['journal_error']} -- this run is dropped from every "
+                   "journal-derived table instead of being scored as zero"}
+        for c in unusable
     ]
     # Cells the frozen Tier-0.5 config planned for but that were never
     # submitted: they must be named with their measured reason, not silently
     # absent. The reason lives in the Tier-0.5 admission gate.
-    frozen: dict[str, Any] = {}
-    verdicts: dict[str, Any] = {}
-    if os.path.exists(tier05_path):
-        with open(tier05_path, encoding="utf-8") as fh:
-            t05 = json.load(fh)
-        frozen = t05.get("frozen_pilot_config") or {}
-        verdicts = t05.get("verdicts") or {}
+    t05 = read_json(tier05_path, role="tier05_gate")
+    frozen: dict[str, Any] = t05.get("frozen_pilot_config") or {}
+    verdicts: dict[str, Any] = t05.get("verdicts") or {}
     ran = {(c["arm"], c["model"]) for c in cells}
     for model, v in verdicts.items():
         if v.get("enters_pilot") or model in {c["model"] for c in cells}:
@@ -1122,6 +1478,14 @@ def build(results_paths: Sequence[str], journal_dir: str,
     cfg = results.get("config", {})
     reaper = results.get("reaper") or []
     residual = [r for r in reaper if r.get("outcome") not in ("deleted", "ok")]
+    # The ledger audit is the evidence behind the residual claim, so it is
+    # computed BEFORE the claim is worded and the claim reads it.
+    audit = ledger_audit(ledger_roots, keep=keep_ids)
+    evidence_errors = [c["journal_error"] for c in unusable]
+    evidence_errors += [
+        f"ledger journal `{f['path']}` could not be replayed: {f['error']}"
+        for f in audit["unreadable_files"]
+    ]
     preamble = (
         f"Arms {', '.join(cfg.get('arms', []))} at K={cfg.get('K')}, "
         f"m={cfg.get('m')}, T={cfg.get('T_s')}s, run cap "
@@ -1130,7 +1494,8 @@ def build(results_paths: Sequence[str], journal_dir: str,
         f"sandbox at the same cadence in every arm (v2.6): zero measurement "
         f"forks, so the only snapshot/fork traffic in this pilot is arm B's "
         f"branching. Frozen config from `{tier05_path}`; every table below is "
-        f"derived from the per-run journals named in the traceability section."
+        f"derived from the per-run journals named in the traceability section, "
+        f"and every input is listed there with its content hash."
     )
     payload = {
         "label": results.get("label", "TIER-1 PILOT"),
@@ -1138,10 +1503,12 @@ def build(results_paths: Sequence[str], journal_dir: str,
         "config": cfg,
         "caps": results.get("caps"),
         "cells": cells,
+        "unusable_cells": unusable,
+        "evidence_errors": evidence_errors,
         "not_run": not_run,
         "contrasts": contrasts(cells),
         "tier0_scope": TIER0_SCOPE,
-        "master_journal": os.path.join(journal_dir, "tier1-master.jsonl"),
+        "master_journal": master_journal,
         "results_path": ", ".join(results.get("sources") or results_paths),
         "analysis_path": "bench/results/tier1_pilot_analysis.json",
         "reaper": reaper,
@@ -1149,15 +1516,21 @@ def build(results_paths: Sequence[str], journal_dir: str,
             f"{len(reaper)} resource(s) swept, {len(residual)} failed to delete"
             if reaper else "nothing to sweep"
         ),
-        "residual_summary": (
-            f"{len(residual)} resource(s) failed to delete"
-            if residual else
-            "zero -- every sandbox this pilot created was deleted, and the only "
-            "surviving flebench resources are TEMPLATE_SNAP and the bake sandbox"
-        ),
+        "ledger_audit": audit,
+        "residual_summary": residual_summary(residual, audit),
         "interrupted": results.get("interrupted"),
         "bake_sandbox": bake,
-        "ledger_audit": ledger_audit(["bench/journal"]),
+        "provenance": {
+            "inputs": inputs,
+            "cli": {
+                "results": list(results_paths),
+                "journal_dir": journal_dir,
+                "tier05": tier05_path,
+                "ledger_roots": list(ledger_roots),
+                "keep": sorted(keep_ids),
+                "bake": bake,
+            },
+        },
         "deviations": deviations,
         "frozen_pilot_config": frozen,
         "calibration": {
@@ -1179,6 +1552,13 @@ def _cli() -> argparse.ArgumentParser:
     ap.add_argument("--tier05", default="bench/results/tier05.json")
     ap.add_argument("--bake", default="",
                     help="id of the bake sandbox that must survive the sweep")
+    ap.add_argument("--ledger-root", action="append", default=[],
+                    help="farplane journal tree replayed for the residual ledger "
+                         f"audit (default {', '.join(DEFAULT_LEDGER_ROOTS)}); "
+                         "repeat for each root")
+    ap.add_argument("--keep", action="append", default=[],
+                    help="resource id that is declared substrate and is allowed "
+                         "to survive the sweep (e.g. TEMPLATE_SNAP); repeatable")
     ap.add_argument("--combined-out", default="bench/results/tier1_pilot.json",
                     help="where to write the merged raw orchestrator results")
     ap.add_argument("--out", default="bench/results/tier1_pilot_analysis.json")
@@ -1188,22 +1568,31 @@ def _cli() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _cli().parse_args(argv)
-    payload = build(args.results or ["bench/results/tier1_pilot.json"],
-                    args.journal_dir, args.tier05, args.bake)
+    try:
+        payload = build(args.results or [DEFAULT_RESULTS],
+                        args.journal_dir, args.tier05, args.bake,
+                        ledger_roots=args.ledger_root or list(DEFAULT_LEDGER_ROOTS),
+                        keep=args.keep)
+    except AnalysisError as exc:
+        print(f"analysis ERROR: {exc}", file=sys.stderr)
+        return 2
     payload["analysis_path"] = args.out
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     if args.combined_out:
-        combined = getattr(build, "last_combined", {})
-        with open(args.combined_out, "w", encoding="utf-8") as fh:
-            json.dump(combined, fh, indent=2, default=str)
+        atomic_write_json(args.combined_out,
+                          getattr(build, "last_combined", {}))
         payload["results_path"] = args.combined_out
-    with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, default=str)
+    atomic_write_json(args.out, payload)
     text = render(payload)
+    os.makedirs(os.path.dirname(args.md) or ".", exist_ok=True)
     with open(args.md, "w", encoding="utf-8") as fh:
         fh.write(text)
     print(f"cells={len(payload['cells'])} contrasts={len(payload['contrasts'])} "
           f"json={args.out} md={args.md}")
+    errors = payload["evidence_errors"]
+    if errors:
+        print(f"INCOMPLETE evidence ({len(errors)}): " + "; ".join(errors[:5]),
+              file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1,16 +1,53 @@
 # FLE sandbox bridge — P1-P3 fixes + Bridge HTTP API v1 (verification note)
 
 Image: `fle-sandbox:bench` (built from `fle/eval/inspect/sandbox/Dockerfile`).
-Smoke container left running for downstream agents:
+Smoke container: start it, run the verification steps, then **tear it down** — nothing
+downstream depends on a live `flebench-smoke`, and a stray `-p 8730:8730` publisher
+blocks the next run's port.
 
 ```
+# The bridge's TCP listener is authenticated; mint a token for this container.
+TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')
+
 docker run -d --name flebench-smoke --cpus 2 --memory 4g \
   -e FLE_BENCH_MODE=1 -e FLE_ENV_ID=iron_ore_throughput \
+  -e FLE_BRIDGE_TOKEN="$TOKEN" \
   -p 8730:8730 fle-sandbox:bench
+
+# Host side: bench/bridge_client.py reads $FLE_BRIDGE_TOKEN by itself, so exporting
+# the same value is all the harness needs.
+export FLE_BRIDGE_TOKEN="$TOKEN"
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8730/health
+python3 -c 'from bench.bridge_client import Bridge
+b = Bridge("http://127.0.0.1:8730"); print(b.wait_healthy(300), b.meta())'
+
+# Teardown — always, even when a check failed.
+docker rm -f flebench-smoke
 ```
 
+Bridge TCP auth (`FLE_BRIDGE_TOKEN` / `FLE_BRIDGE_ALLOW_INSECURE`, both declared in the
+Dockerfile and forwarded by `supervisord.conf`):
+
+- **Token set** → every TCP request needs `Authorization: Bearer <token>`, **`GET /health`
+  included** — readiness polling must carry the header or it will never see the bridge come
+  up. Anything else gets a generic `401 {"error":"unauthorized"}` (constant-time compare,
+  no hint about what was wrong, `Connection: close`). The UDS listener
+  `/tmp/fle_bridge.sock`, reachable only through `docker exec`, is exempt.
+- **Token unset** → the TCP listener is **not opened**; the service logs one warning and
+  serves UDS only, so `curl :8730` gets connection-refused and `wait_healthy` will run
+  its full deadline. To smoke-test over TCP without a token, opt in explicitly with
+  `-e FLE_BRIDGE_ALLOW_INSECURE=1` (loopback/dev only: the published port is reachable by
+  anything that can route to the host).
+- Client side: `Bridge(url)` defaults its token to `$FLE_BRIDGE_TOKEN`, `Bridge(url,
+  token="…")` overrides it, and `Bridge(url, token="")` forces an anonymous client (useful
+  to assert the 401). A 401/403 is raised as a `BridgeError` (`.status` set, never retried,
+  never mistaken for an ingress hiccup) naming which side is wrong, and
+  `wait_healthy()` aborts on it at once instead of polling out its whole deadline — a bad
+  token is a misconfiguration, not a slow boot.
+
 Readiness: both listeners are created only **after** full environment init, so a
-successful `GET /health` implies a ready environment (connection-refused == not ready).
+successful `GET /health` implies a ready environment (connection-refused == not ready —
+or, per the auth notes above, no TCP listener was ever opened).
 Measured init-to-`/health`-ok: **~5 s** after container start on this host.
 
 Compressed image for transfer: `/tmp/flebench-image.zst` (401 MiB,
@@ -21,7 +58,7 @@ Compressed image for transfer: `/tmp/flebench-image.zst` (401 MiB,
 | # | Fix | Files |
 |---|-----|-------|
 | P1 | Task is constructed **before** the instance, and `FactorioInstance(all_technologies_researched=...)` now takes the task's setting. The post-`task.setup()` `_gym_env.reset()` — which reset the instance to a blank state and discarded `task.starting_game_state` — is gone; only the gym bookkeeping it refreshed (`initial_score`, `last_observation`) is initialised. `/reset` with no body now resets to `task.starting_game_state` instead of a blank instance. | `bridge_service.py` |
-| P2 | The same `BridgeHandler` is served on **TCP 0.0.0.0:8730** (`FLE_BRIDGE_PORT`) in addition to `/tmp/fle_bridge.sock`. Both are `ThreadingHTTPServer`; TCP runs on a daemon thread, UDS on the main thread. | `bridge_service.py`, `Dockerfile` (`EXPOSE 8730`), `supervisord.conf` |
+| P2 | The same `BridgeHandler` is served on **TCP 0.0.0.0:8730** (`FLE_BRIDGE_PORT`) in addition to `/tmp/fle_bridge.sock`. Both are `ThreadingHTTPServer`; TCP runs on a daemon thread, UDS on the main thread. The TCP listener is token-gated (`FLE_BRIDGE_TOKEN`, or an explicit `FLE_BRIDGE_ALLOW_INSECURE=1` opt-in) — see the auth notes at the top. | `bridge_service.py`, `Dockerfile` (`EXPOSE 8730`), `supervisord.conf` |
 | P3 | `FLE_BENCH_MODE=1` → `FactorioGymEnv(bench_mode=True)`: per-step `task.verify()` skipped (it sleeps through repeated 60 s windows, mutating the world, and flips `terminated` on quota), `terminated` never set from task success, per-step `GameState.from_instance()` skipped, and map rendering disabled (`enable_vision=False`; `/screenshot` is unaffected). | `environment.py`, `bridge_service.py` |
 | — | Dependency fix required to rebuild at all: `a2a-sdk` was unpinned and 1.x dropped `a2a.types.TextPart`, which `fle/env/tools/agent/send_message/client.py` imports at tool-load time. Pinned `a2a-sdk<1.0`. | `pyproject.toml` |
 
@@ -31,11 +68,25 @@ Compressed image for transfer: `/tmp/flebench-image.zst` (401 MiB,
 |---|---|
 | `GET /health` | `{"status":"ok"}`. **Only lock-free endpoint** — answerable during a 6 s probe. |
 | `POST /execute {"code"}` | Gym-step semantics. Adds v1 aliases `automated_score` and `error` next to the legacy `automated_production_score` / `error_occurred`. `game_state_raw` is `null` in bench mode. |
-| `POST /probe {"entity"}` | ONE fixed 3600-tick (= 60 in-game s) window; no plateau loop. `{throughput, wall_s, start_tick, end_tick, window_ticks, speed, start_count, end_count, timed_out}`. `entity` defaults to the task's `throughput_entity`. |
+| `POST /probe {"entity"}` | ONE fixed 3600-tick (= 60 in-game s) window; no plateau loop. `{throughput, wall_s, start_tick, end_tick, window_ticks, speed, start_count, end_count, timed_out}`. `entity` defaults to the task's `throughput_entity`; `Bridge.probe()` with no argument omits the key entirely so the server picks that default. |
 | `GET /state-save` | `{"state": GameState.to_raw()}`. |
 | `POST /state-restore {"state"}` | `instance.reset(GameState.parse_raw(state))` → `{"ok":true}`. |
 | `GET /meta` | `{factorio_pid, elapsed_ticks, game_tick, entity_count, speed, paused, bench_mode, task_key, all_technologies_researched}`. |
 | unchanged | `/observe` `/score` `/system-prompt` `/game-state` `/reset` `/screenshot`. |
+
+Error responses (all raised as `BridgeError` with `.status` set, none of them retried).
+The server sends `Connection: close` with 400/401/408/411/413 because the request body was
+left unread; the client's `Session` transparently opens a fresh connection next call.
+
+| Status | Body | Cause |
+|---|---|---|
+| `400` | `{"error": …}` | malformed/negative `Content-Length`, malformed JSON, or a non-object JSON body. |
+| `401` | `{"error":"unauthorized"}` | missing/incorrect bearer token on a TCP request. |
+| `408` | `{"error": …}` | the request body stalled mid-read. |
+| `411` | `{"error": …}` | `Transfer-Encoding: chunked`; send `Content-Length` (`requests` does this for `json=`). |
+| `413` | `{"error": "request body exceeds N bytes"}` | body over the cap: 1 MiB, raised to 64 MiB for `/state-restore` and `/reset`. |
+| `500` | `{"error":"internal server error", "correlation_id": "<12 hex>"}` | bridge bug; the traceback stays in `/tmp/fle_bridge.log`. `BridgeError` surfaces the `correlation_id` verbatim — quote it when reporting. |
+| `502/503/504` | ingress HTML | Farplane ingress, not the bridge. Retried up to 3× for GETs; on a mutating POST it raises `BridgeError(ambiguous=True)` instead (a 504 usually means the bridge is *still running* the request). |
 
 Concurrency model: one RCON connection drives one Factorio process, so every endpoint
 except `/health` serialises behind a single global lock. A `/meta` issued 1 s into a

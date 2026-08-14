@@ -15,23 +15,46 @@ Protocol implemented here, exactly as specified:
    scaffolding once the snapshot exists.
 2. WAVES.  For each wave, K=8 sandboxes are forked from S2 *sequentially* (forks
    of a lineage pin to the source's node and serialise), exposed and health
-   checked; then all 8 branches run CONCURRENTLY, each with ONE divergent
-   strategy hint injected into its first user turn through the existing hints
-   mechanism (:data:`bench.llm.HINT_TEMPLATE`).  Each branch runs 12 steps and
-   is probed EN ROUTE after steps 4, 8 and 12 (nested design), so probe side
-   effects are uniform across branches and the m=12 endpoints are
-   protocol-identical to Exp 2's A*K-from-S arm.  Branch sandboxes are deleted
-   at the end of the wave; the next wave forks fresh children from the SAME S2.
+   checked.  A fork's world keeps RUNNING at game speed while the remaining
+   forks are taken, so the first child would enter its rollout minutes of
+   in-game time ahead of the last one -- and because the strategy hints are
+   POSITIONAL, that skew is a repeatable confound rather than noise.  The wave
+   is therefore released through a BARRIER: the least-advanced child's world is
+   captured with ``/state-save`` and restored onto EVERY child (the capture
+   source included, so the treatment is uniform) with ``/state-restore``
+   immediately before the rollouts start, so all K branches begin from
+   identical world content.  Per-child game ticks are recorded either way; if
+   the bridge's state endpoints are unavailable the wave runs only while the
+   measured tick skew is inside ``Exp1Config.barrier_skew_tolerance_ticks`` and
+   is ABORTED with no draws past it.  Then all 8 branches run CONCURRENTLY,
+   each with ONE divergent strategy hint injected into its first user turn
+   through the existing hints mechanism (:data:`bench.llm.HINT_TEMPLATE`).
+   Each branch runs 12 steps and is probed EN ROUTE after steps 4, 8 and 12
+   (nested design), so probe side effects are uniform across branches and the
+   m=12 endpoints keep Exp 2's probe cadence -- the barrier restore is Exp 1's
+   own addition on top of the A*K-from-S fork path and is reported as such.
+   Branch sandboxes are deleted at the end of the wave; the next wave forks
+   fresh children from the SAME S2.
 3. ANALYSIS.  Per (wave, m): ``spread = (max-min)/median`` and
-   ``gain = (max-median)/median``.  Gate at the best m, which must hold in BOTH
-   waves: PASS if spread >= 0.25 and gain >= 0.15; CONDITIONAL if
-   spread in [0.10, 0.25) and gain >= 0.10; FAIL otherwise.  Edge rules:
-   median == 0 with max > 0 is a PASS-signal (maximal selectability); all eight
-   zero is a FAIL-signal at that m.  Wave disagreement at the best m calls a
-   third wave and takes the majority, flagged borderline; with no budget for a
-   third wave the verdict is ``borderline-undecided``.
-   Double duty on the m=12 endpoints: an empirical best-of-K curve
-   (bootstrap over {1,2,4,8}) and a power check for Exp 2's paired n=3.
+   ``gain = (max-median)/median``.  A wave is read only if it drew its full
+   pre-registered complement at the read point (n == K, or
+   ``Exp1Config.min_draws_per_wave``); a wave short of it leaves the gate
+   ``borderline-undecided`` instead of deciding it on a thinner pool.  Gate at
+   the best m, which must hold in BOTH waves: PASS if spread >= 0.25 and
+   gain >= 0.15; CONDITIONAL if spread in [0.10, 0.25) and gain >= 0.10; FAIL
+   otherwise.  Edge rules: median == 0 with max > 0 is a PASS-signal (maximal
+   selectability); all eight zero is a FAIL-signal at that m.  Wave
+   disagreement at the best m calls a third wave and takes the majority,
+   flagged borderline -- read at the m the FIRST TWO waves selected, persisted
+   when the third wave is called so the extra wave cannot move the read point
+   it was called to settle; with no budget for a third wave the verdict is
+   ``borderline-undecided``.
+   Double duty on the m=12 endpoints: an empirical best-of-K curve and a power
+   check for Exp 2's paired n=3.  The best-of-K bootstrap respects the design
+   instead of pooling every draw: one resample takes one outcome per configured
+   strategy arm, and a K below the number of arms is a WITHOUT-replacement
+   subset of arms -- a fan-out wave runs K DIFFERENT strategies, so drawing the
+   same arm twice is not something the deployment can do.
    Pooling guard: the two waves are pooled only if the location shift is within
    0.10 of the pooled median AND the spread ratio is within 2x; otherwise every
    read is per wave and the power check uses the larger variance.
@@ -54,6 +77,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -62,7 +86,7 @@ import re
 import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from bench.arms import (
     ArmConfig,
@@ -72,7 +96,7 @@ from bench.arms import (
     _tick_of,
     default_bridge_factory,
 )
-from bench.common import RunJournal
+from bench.common import RunJournal, atomic_write_json
 from bench.farplane import Farplane, summarize
 from bench.llm import HINT_TEMPLATE, make_client
 
@@ -167,6 +191,103 @@ T_CRIT_975: dict[int, float] = {
 
 TARGET_POWER = 0.80
 
+#: Experiment identity written into (and demanded of) the results artefact.
+EXPERIMENT_KEY = "exp1-decorrelation-gate"
+
+#: Config keys that define what a recorded draw MEANS. Draws taken under
+#: different values of these are different measurements and are never mixed, so
+#: a resume whose config disagrees on any of them is refused. Everything else
+#: (paths, budgets, bootstrap seed and resamples) is operational: it may change
+#: on a resume and the change is recorded rather than rejected.
+MEASUREMENT_KEYS: tuple[str, ...] = (
+    "template_snap",
+    "model",
+    "task_key",
+    "k",
+    "steps",
+    "probe_every",
+    "bake_steps",
+    "bake_target_multiple",
+    "min_draws_per_wave",
+    "barrier_skew_tolerance_ticks",
+)
+
+
+def measurement_fingerprint(config: Mapping[str, Any]) -> dict[str, Any]:
+    """The measurement-affecting slice of a config, plus a short digest of it."""
+    keys = {k: config.get(k) for k in MEASUREMENT_KEYS}
+    digest = hashlib.blake2b(
+        json.dumps(keys, sort_keys=True, default=str).encode("utf-8"), digest_size=8
+    ).hexdigest()
+    return {"keys": keys, "digest": digest}
+
+
+def config_delta(
+    saved: Mapping[str, Any], current: Mapping[str, Any], keys: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    """``{key: {"saved": ..., "now": ...}}`` for every ``key`` that differs."""
+    return {
+        k: {"saved": saved.get(k), "now": current.get(k)}
+        for k in keys
+        if saved.get(k) != current.get(k)
+    }
+
+
+#: Timing-summary fields that are RATIOS or bookkeeping, not additive seconds.
+_TIMING_DERIVED = ("infra_fraction_attributed", "infra_fraction_raw", "invocations")
+
+
+def merge_counters(
+    prior: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Add ``current``'s counters onto ``prior``'s, recursing into sub-dicts.
+
+    Values that are not numbers (or dicts of them) are labels, not counts, and
+    are taken from ``current``. Merging an all-zero contribution is a no-op, so
+    an invocation that measured nothing cannot dilute the record.
+    """
+    out: dict[str, Any] = dict(prior)
+    for key, value in current.items():
+        have = out.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float, dict)):
+            out[key] = value
+        elif isinstance(value, dict):
+            out[key] = merge_counters(have, value) if isinstance(have, dict) else dict(value)
+        elif isinstance(have, (int, float)) and not isinstance(have, bool):
+            out[key] = have + value
+        else:
+            out[key] = value
+    return out
+
+
+def merge_timings(
+    prior: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Cumulative timing across invocations of one results file.
+
+    Bucket seconds, wall clock and interval counts add up; the infra fractions
+    are RECOMPUTED from the merged totals, because adding two ratios is not a
+    ratio. ``invocations`` says how many runs contributed, so a resumed run's
+    report cannot read as if one invocation produced all of it.
+    """
+    if not prior:
+        return {**dict(current), "invocations": 1}
+    merged = merge_counters(
+        {k: v for k, v in prior.items() if k not in _TIMING_DERIVED},
+        {k: v for k, v in current.items() if k not in _TIMING_DERIVED},
+    )
+    wall = float(merged.get("wall_s") or 0.0)
+    attributed = merged.get("attributed_s") or {}
+    raw = merged.get("raw_s") or {}
+    infra_attributed = sum(v for b, v in attributed.items() if b.startswith("infra_"))
+    infra_raw = sum(v for b, v in raw.items() if b.startswith("infra_"))
+    merged["infra_fraction_attributed"] = (
+        round(infra_attributed / wall, 6) if wall else 0.0
+    )
+    merged["infra_fraction_raw"] = round(infra_raw / wall, 6) if wall else 0.0
+    merged["invocations"] = int(prior.get("invocations") or 1) + 1
+    return merged
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -183,6 +304,15 @@ class Exp1Config:
     steps: int = 12
     probe_every: int = 4
     bake_steps: int = 15
+    #: Draws a wave must hold at the read point for the gate to be decidable.
+    #: ``None`` = the pre-registered default, the full complement K. A wave
+    #: short of it leaves the gate undecided; a missing draw is never resampled.
+    min_draws_per_wave: int | None = None
+    #: Fork-barrier tolerance, in game ticks, used ONLY when the bridge cannot
+    #: equalise the children with /state-save + /state-restore. 3600 ticks = one
+    #: probe window (60 in-game seconds at speed 1) of divergence between the
+    #: first and last child of a wave.
+    barrier_skew_tolerance_ticks: int = 3600
     #: Milestone: a bake probe at or above this multiple of the task quota.
     bake_target_multiple: float = 2.0
     #: Sandbox lease. Never a cleanup mechanism -- only insurance that a slow
@@ -281,6 +411,10 @@ def pick_best_m(waves: Sequence[dict[str, Any]], ms: Sequence[int]) -> dict[str,
     break towards the later m -- the longer horizon carries more signal and is
     the one that is protocol-identical to Exp 2's endpoint.
     """
+    if not waves:
+        raise ValueError("pick_best_m needs at least one wave; there is no m to rank")
+    if not ms:
+        raise ValueError("pick_best_m needs at least one candidate m")
     ranked = []
     for m in ms:
         per = [w["metrics"][str(m)] for w in waves]
@@ -314,16 +448,90 @@ def pick_best_m(waves: Sequence[dict[str, Any]], ms: Sequence[int]) -> dict[str,
     }
 
 
+def _thresholds() -> dict[str, Any]:
+    """The gate's numbers, verbatim from the design (fresh dict per result)."""
+    return {
+        "PASS": {"spread_min": PASS_SPREAD, "gain_min": PASS_GAIN},
+        "CONDITIONAL": {
+            "spread_range": [COND_SPREAD_LO, COND_SPREAD_HI], "gain_min": COND_GAIN
+        },
+    }
+
+
+def _undecidable_gate(reason: str, *, read_point: dict[str, Any]) -> dict[str, Any]:
+    """A gate result that carries no verdict, with every key a reader expects.
+
+    Used for the evidence failures that are NOT outcomes of the criterion: no
+    draws at all, and a pinned read point this run cannot be read at. Neither
+    is a FAIL -- a FAIL is a measured flat outcome space.
+    """
+    return {
+        "best_m": read_point.get("m"),
+        "best_m_rule": "not applicable -- the gate was not read",
+        "ranking": [],
+        "per_wave": [],
+        "thresholds": _thresholds(),
+        "edge_rules_applied": [],
+        "borderline": False,
+        "third_wave_required": False,
+        "read_point": read_point,
+        "verdict": "borderline-undecided",
+        "reason": reason,
+    }
+
+
 def evaluate_gate(
-    waves: Sequence[dict[str, Any]], ms: Sequence[int], *, third_wave_possible: bool
+    waves: Sequence[dict[str, Any]],
+    ms: Sequence[int],
+    *,
+    third_wave_possible: bool,
+    required_n: int | Sequence[int],
+    fixed_m: int | None = None,
 ) -> dict[str, Any]:
-    """PASS / CONDITIONAL / FAIL / borderline-undecided with its exact numbers."""
+    """PASS / CONDITIONAL / FAIL / borderline-undecided with its exact numbers.
+
+    ``required_n`` is the pre-registered draw complement a wave must hold at the
+    read point -- one int for all waves, or one per wave in order. A wave below
+    it does NOT decide the gate: the verdict is ``borderline-undecided``, since
+    a wave that lost draws is a thinner pool whose spread and gain are not the
+    pre-registered statistic (and a missing draw is never resampled).
+
+    ``fixed_m`` pins the read point to the m the FIRST TWO waves selected. A
+    third wave is called to break a tie AT that m, so it must not be allowed to
+    move it; a pin that is not in ``ms`` means the waves were not measured at a
+    common horizon and fails closed.
+    """
+    if not waves:
+        return _undecidable_gate(
+            "no wave produced a draw, so there is no m to read the gate at and no "
+            "verdict exists: this is an INCOMPLETE run, not a FAIL",
+            read_point={"m": None, "pinned": False, "free_best_m": None},
+        )
+    if fixed_m is not None and int(fixed_m) not in [int(x) for x in ms]:
+        return _undecidable_gate(
+            f"the pinned read point m={fixed_m} (selected by the first two waves) "
+            f"is not among this run's probe steps {[int(x) for x in ms]}, so the "
+            "waves were not all measured at a common horizon",
+            read_point={"m": int(fixed_m), "pinned": True, "in_ms": False},
+        )
+    if isinstance(required_n, int):
+        needs = [required_n] * len(waves)
+    else:
+        needs = [int(v) for v in required_n]
+        if len(needs) != len(waves):
+            raise ValueError(
+                f"required_n has {len(needs)} entries for {len(waves)} wave(s)"
+            )
     pick = pick_best_m(waves, ms)
-    m = pick["best_m"]
+    free_m = pick["best_m"]
+    pinned = fixed_m is not None
+    m = int(fixed_m) if pinned else free_m
     per_wave = [
         {
             "wave": w["wave"],
             "n": w["metrics"][str(m)]["n"],
+            "required_n": need,
+            "complete": w["metrics"][str(m)]["n"] >= need,
             "median": w["metrics"][str(m)]["median"],
             "max": w["metrics"][str(m)]["max"],
             "min": w["metrics"][str(m)]["min"],
@@ -331,28 +539,59 @@ def evaluate_gate(
             "gain": w["metrics"][str(m)]["gain"],
             "edge": w["metrics"][str(m)]["edge"],
             "tier": w["metrics"][str(m)]["tier"],
+            "missing": w["metrics"][str(m)].get("missing") or [],
         }
-        for w in waves
+        for w, need in zip(waves, needs)
     ]
     tiers = [p["tier"] for p in per_wave]
     out: dict[str, Any] = {
         "best_m": m,
         "best_m_rule": (
+            "PINNED to the m the first two waves selected (binding tier, then "
+            "binding spread, then binding gain, ties to the later m), so the "
+            "third wave cannot move the read point it was called to settle"
+            if pinned else
             "binding (worst-across-waves) tier, then binding spread, then binding "
             "gain, ties to the later m"
         ),
         "ranking": pick["ranking"],
         "per_wave": per_wave,
-        "thresholds": {
-            "PASS": {"spread_min": PASS_SPREAD, "gain_min": PASS_GAIN},
-            "CONDITIONAL": {
-                "spread_range": [COND_SPREAD_LO, COND_SPREAD_HI], "gain_min": COND_GAIN
-            },
-        },
+        "thresholds": _thresholds(),
         "edge_rules_applied": sorted({p["edge"] for p in per_wave if p["edge"]}),
         "borderline": False,
         "third_wave_required": False,
+        "read_point": {
+            "m": m,
+            "pinned": pinned,
+            "free_best_m": free_m,
+            "moved_by_pin": bool(pinned and free_m != m),
+        },
+        "required_n": needs,
     }
+    underfilled = [
+        {"wave": p["wave"], "n": p["n"], "required_n": p["required_n"],
+         "missing": p["missing"]}
+        for p in per_wave if not p["complete"]
+    ]
+    if underfilled:
+        out.update(
+            verdict="borderline-undecided",
+            underfilled_waves=underfilled,
+            reason=(
+                f"at m={m} "
+                + "; ".join(
+                    f"wave {u['wave']} holds {u['n']} of {u['required_n']} "
+                    f"pre-registered draws"
+                    + (f" (missing {', '.join(u['missing'])})" if u["missing"] else "")
+                    for u in underfilled
+                )
+                + ". The gate is read only on waves that drew their full "
+                "complement, and a missing draw is never resampled, so the "
+                "criterion is formally undecidable on this evidence -- a further "
+                "wave cannot repair a wave that lost a draw"
+            ),
+        )
+        return out
     if len(waves) < 2:
         out.update(
             verdict="borderline-undecided",
@@ -378,6 +617,13 @@ def evaluate_gate(
             reason=(
                 f"waves disagree at m={m} ({', '.join(tiers)}); majority of "
                 f"{len(waves)} waves = {majority[0]}, flagged borderline"
+                + (
+                    f" (read at the pinned two-wave m={m}"
+                    + (f", not the {len(waves)}-wave choice m={free_m}"
+                       if free_m != m else "")
+                    + ")"
+                    if pinned else ""
+                )
             ),
         )
         return out
@@ -434,17 +680,69 @@ def pooling_guard(
 
 
 def best_of_k(
-    draws: Sequence[float], ks: Sequence[int] = (1, 2, 4, 8), *,
+    draws_by_arm: Mapping[str, Sequence[float]], ks: Sequence[int] = (1, 2, 4, 8), *,
+    arms: Sequence[str] | None = None,
     resamples: int = 10000, rng: random.Random | None = None,
 ) -> dict[str, Any]:
-    """Empirical best-of-K curve: bootstrap max of K draws with replacement."""
+    """Empirical best-of-K curve, resampled at the level the design fans out on.
+
+    A wave is ONE outcome per configured strategy arm, and a deployment running
+    best-of-K runs K DIFFERENT arms -- it cannot draw the same strategy twice.
+    So a resample here picks the arm subset WITHOUT replacement whenever K does
+    not exceed the number of observed arms, and then takes one observed outcome
+    for each picked arm (uniformly over the waves that arm was drawn in). The
+    old pooled with-replacement bootstrap ignored both facts and inflated the
+    curve's variance with combinations the design cannot produce.
+
+    ``draws_by_arm`` maps arm label -> that arm's endpoint outcomes across waves;
+    ``arms`` is the configured arm order (labels absent from it are reported as
+    unobserved, never silently dropped).
+    """
     rng = rng or random.Random(0)
-    pool = list(draws)
-    med = statistics.median(pool) if pool else 0.0
+    configured = list(arms) if arms is not None else sorted(draws_by_arm)
+    labels = [a for a in configured if draws_by_arm.get(a)]
+    extra = [a for a in sorted(draws_by_arm) if a not in configured and draws_by_arm[a]]
+    labels += extra
+    pool = [float(v) for a in labels for v in draws_by_arm[a]]
+    design = {
+        "resample_unit": "configured strategy arm (one outcome per arm per resample)",
+        "arms_configured": len(configured),
+        "arms_observed": len(labels),
+        "arms_unobserved": [a for a in configured if not draws_by_arm.get(a)],
+        "arms_off_the_configured_list": extra,
+        "outcomes_per_arm": {a: len(draws_by_arm[a]) for a in labels},
+        "rule": (
+            "K <= observed arms -> arm subset WITHOUT replacement; K > observed "
+            "arms -> with replacement, flagged per K, because there are not that "
+            "many distinct arms to run"
+        ),
+    }
+    if not labels:
+        return {
+            "status": "no_draws",
+            "n_draws": 0,
+            "resamples": resamples,
+            "median_of_draws": None,
+            "curve": {},
+            "design": design,
+            "note": (
+                "no configured arm produced an endpoint draw, so no best-of-K "
+                "curve exists (reported as absent, never as zero)"
+            ),
+        }
+    med = statistics.median(pool)
+    n_arms = len(labels)
     curve: dict[str, Any] = {}
     base: float | None = None
     for k in ks:
-        maxima = [max(rng.choice(pool) for _ in range(k)) for _ in range(resamples)]
+        without = k <= n_arms
+        maxima: list[float] = []
+        for _ in range(resamples):
+            picked = (
+                rng.sample(labels, k) if without
+                else [rng.choice(labels) for _ in range(k)]
+            )
+            maxima.append(max(rng.choice(draws_by_arm[a]) for a in picked))
         maxima.sort()
         mean = statistics.fmean(maxima)
         if k == 1:
@@ -453,16 +751,20 @@ def best_of_k(
             "expected_best": round(mean, 6),
             "median_best": round(statistics.median(maxima), 6),
             "sd_best": round(statistics.stdev(maxima), 6) if len(maxima) > 1 else 0.0,
-            "p10": round(maxima[int(0.10 * (resamples - 1))], 6),
-            "p90": round(maxima[int(0.90 * (resamples - 1))], 6),
+            "p10": round(maxima[int(0.10 * (len(maxima) - 1))], 6),
+            "p90": round(maxima[int(0.90 * (len(maxima) - 1))], 6),
             "vs_median_of_draws": round(mean / med, 6) if med > 0 else None,
             "gain_over_k1": round(mean / base - 1.0, 6) if base else None,
+            "arm_sampling": "without_replacement" if without else "with_replacement",
+            "arms_drawn": min(k, n_arms) if without else k,
         }
     return {
+        "status": "ok",
         "n_draws": len(pool),
         "resamples": resamples,
         "median_of_draws": round(med, 6),
         "curve": curve,
+        "design": design,
     }
 
 
@@ -711,15 +1013,53 @@ def branch_summary(rec: dict[str, Any], ms: Sequence[int]) -> str:
 # ---------------------------------------------------------------------------
 
 
+class BarrierSkewError(RuntimeError):
+    """A wave's children could not be released from a common start.
+
+    Raised after the wave's evidence (barrier record, per-branch reasons) is
+    saved: an unequal start is a repeatable confound under positional hints, so
+    the wave is recorded with no draws instead of being measured.
+    """
+
+
+def _tick_or_none(meta: Mapping[str, Any]) -> int | None:
+    """Real game tick from ``/meta``, or ``None`` when it cannot be read.
+
+    :func:`bench.arms._tick_of` defaults to 0, which is right for a curve label
+    and wrong for a skew check -- 0 would answer a question nothing measured.
+    """
+    for key in ("game_tick", "elapsed_ticks"):
+        value = meta.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+def _skew(ticks: Iterable[int | None]) -> int | None:
+    """Spread of the readable ticks; ``None`` when none of them is readable."""
+    known = [t for t in ticks if t is not None]
+    return max(known) - min(known) if known else None
+
+
 class Exp1Runner:
     def __init__(self, cfg: Exp1Config) -> None:
         self.cfg = cfg
+        # The pre-registered draw complement a wave must hold for the gate to be
+        # readable (see :func:`evaluate_gate`); nonsense here would silently
+        # weaken the gate, so it is refused before any artefact is created.
+        want = cfg.min_draws_per_wave
+        if want is not None and not 1 <= int(want) <= cfg.k:
+            raise ValueError(
+                f"min_draws_per_wave={want!r} is not a usable complement for "
+                f"K={cfg.k}: it must be between 1 and K"
+            )
+        self.required_draws = cfg.k if want is None else int(want)
         os.makedirs(cfg.journal_dir, exist_ok=True)
         os.makedirs(os.path.dirname(cfg.results_path), exist_ok=True)
         self.journal = RunJournal(
             os.path.join(cfg.journal_dir, "exp1.jsonl"),
             run_id=cfg.run_id,
-            meta={"experiment": "exp1-decorrelation-gate", "config": cfg.to_dict()},
+            meta={"experiment": EXPERIMENT_KEY, "config": cfg.to_dict()},
         )
         self.fp = Farplane(prefix=cfg.prefix)
         self.llm = make_client(
@@ -757,34 +1097,103 @@ class Exp1Runner:
             range(cfg.probe_every, cfg.steps + 1, cfg.probe_every)
         )
         self.state = self._load_state()
+        # Evidence carried over from earlier invocations of this results file.
+        # Cumulative counters are merged onto these on every save, so a resumed
+        # wave or an analysis-only pass adds to the record instead of replacing
+        # it with its own (near-empty) slice.
+        self._prior_incidents: list[dict[str, Any]] = list(
+            self.state.get("incidents") or []
+        )
+        self._prior_usage: dict[str, Any] = dict(self.state.get("llm_usage") or {})
+        self._prior_timings: dict[str, Any] = dict(self.state.get("timings") or {})
 
     # -- state -------------------------------------------------------------
     def _load_state(self) -> dict[str, Any]:
-        if os.path.exists(self.cfg.results_path):
-            try:
-                with open(self.cfg.results_path, encoding="utf-8") as fh:
-                    state = json.load(fh)
-                if state.get("experiment") == "exp1-decorrelation-gate":
-                    state["config"] = self.cfg.to_dict()
-                    return state
-            except (OSError, json.JSONDecodeError):
-                pass
-        return {
-            "experiment": "exp1-decorrelation-gate",
-            "design_ref": "fanout-benchmark-design.md :: Experiment 1",
-            "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "config": self.cfg.to_dict(),
-            "model_info": self.llm.model_info(),
-            "task": {},
-            "s2": None,
-            "waves": [],
-            "analysis": None,
-            "incidents": [],
-            "residual": None,
-        }
+        """Resume this results file, or refuse to.
+
+        The file is EVIDENCE: its draws were taken under one measurement config.
+        Resuming it with a different value for any of :data:`MEASUREMENT_KEYS`
+        would mix two measurements under one verdict, and an unreadable file used
+        to be replaced by a fresh state (silently overwriting the run it could
+        not parse). Both are refused. Operational changes -- paths, budget,
+        bootstrap seed and resamples -- are allowed and recorded.
+        """
+        path = self.cfg.results_path
+        current = self.cfg.to_dict()
+        if not os.path.exists(path):
+            return {
+                "experiment": EXPERIMENT_KEY,
+                "design_ref": "fanout-benchmark-design.md :: Experiment 1",
+                "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "config": current,
+                "config_fingerprint": measurement_fingerprint(current),
+                "model_info": self.llm.model_info(),
+                "task": {},
+                "s2": None,
+                "waves": [],
+                "analysis": None,
+                "incidents": [],
+                "residual": None,
+            }
+        try:
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"{path} exists but is not readable as results JSON "
+                f"({type(exc).__name__}: {exc}). It is this experiment's evidence, "
+                "so it is never overwritten: move it aside, or pass a new "
+                "--results path."
+            ) from exc
+        if not isinstance(state, dict) or state.get("experiment") != EXPERIMENT_KEY:
+            raise RuntimeError(
+                f"{path} is not an {EXPERIMENT_KEY} results file (experiment="
+                f"{(state.get('experiment') if isinstance(state, dict) else None)!r}); "
+                "pass a new --results path instead of overwriting it."
+            )
+        saved = state.get("config")
+        if not isinstance(saved, dict) or not saved:
+            raise RuntimeError(
+                f"{path} records no config, so its draws cannot be shown to belong "
+                "to this measurement; pass a new --results path."
+            )
+        recorded = [k for k in MEASUREMENT_KEYS if k in saved]
+        mismatch = config_delta(saved, current, recorded)
+        if mismatch:
+            raise RuntimeError(
+                f"refusing to resume {path}: it holds draws measured under a "
+                "different config ("
+                + "; ".join(
+                    f"{k}: saved {v['saved']!r}, now {v['now']!r}"
+                    for k, v in sorted(mismatch.items())
+                )
+                + "). Draws from two measurement configs are never mixed under one "
+                "verdict: run this config into a NEW --results (and --report) path, "
+                "or restore the recorded config to continue this one."
+            )
+        fingerprint = measurement_fingerprint(current)
+        # Keys this file predates cannot be checked -- they are named in the
+        # artefact rather than waved through silently.
+        legacy = [k for k in MEASUREMENT_KEYS if k not in saved]
+        if legacy:
+            fingerprint["legacy_unrecorded_keys"] = legacy
+        ops = config_delta(
+            saved, current, [k for k in current if k not in MEASUREMENT_KEYS]
+        )
+        if ops:
+            state.setdefault("config_changes", []).append({
+                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "changed": ops,
+            })
+        state["config"] = current
+        state["config_fingerprint"] = fingerprint
+        return state
 
     def save(self) -> None:
         self.state["config"] = self.cfg.to_dict()
+        self.state["config_fingerprint"] = self.state.get(
+            "config_fingerprint"
+        ) or measurement_fingerprint(self.cfg.to_dict())
         self.state["model_info"] = self.llm.model_info()
         self.state["task"] = {
             "key": self.cfg.task_key,
@@ -792,14 +1201,19 @@ class Exp1Runner:
             "quota": self.run.quota,
             "goal": self.run.goal,
         }
-        # An analysis-only invocation must never overwrite the RUN's evidence
-        # (it has made no LLM calls and recorded no intervals of its own).
-        if self.run.incidents or "incidents" not in self.state:
-            self.state["incidents"] = self.run.incidents
-        usage = self.llm.usage()
-        if usage.get("calls") or "llm_usage" not in self.state:
-            self.state["llm_usage"] = usage
-        if self.run.timings.intervals or "timings" not in self.state:
+        # Cumulative across invocations of this results file: a resumed wave or
+        # an analysis-only pass has incidents, usage and intervals of its OWN
+        # only, so replacing these would delete the run's evidence. Merging is
+        # a no-op when this invocation contributed nothing.
+        self.state["incidents"] = self._prior_incidents + list(self.run.incidents)
+        self.state["llm_usage"] = merge_counters(self._prior_usage, self.llm.usage())
+        if self.run.timings.intervals:
+            self.state["timings"] = merge_timings(
+                self._prior_timings, self.run.timings.summary()
+            )
+        elif self._prior_timings:
+            self.state["timings"] = self._prior_timings
+        else:
             self.state["timings"] = self.run.timings.summary()
         self.state["elapsed_s"] = round(
             max(time.monotonic() - self.t0, float(self.state.get("elapsed_s") or 0.0)), 1
@@ -808,8 +1222,7 @@ class Exp1Runner:
             "run": str(self.journal.path),
             "farplane": str(self.fp.journal_path),
         }
-        with open(self.cfg.results_path, "w", encoding="utf-8") as fh:
-            json.dump(self.state, fh, indent=2, sort_keys=False, default=str)
+        atomic_write_json(self.cfg.results_path, self.state)
 
     # -- budget ------------------------------------------------------------
     def remaining_s(self) -> float:
@@ -829,7 +1242,16 @@ class Exp1Runner:
         node = await self.run.provision_main("s2bake")
         healthy = await asyncio.to_thread(node.bridge.health)
         meta0 = await self.run.infra.meta(node, branch="bake")
-        prod0, auto0 = await self.run.read_baseline(node, "bake")
+        baseline = await self.run.read_baseline(node, "bake")
+        if baseline is None:
+            # Every production number the bake reports is a delta from this, and
+            # S2 is the input to every wave: a checkpoint whose starting counters
+            # were never read cannot be described, so it is not taken.
+            raise RuntimeError(
+                "bake baseline unreadable (/execute could not read the cumulative "
+                "counters); refusing to snapshot an S2 this run cannot describe"
+            )
+        prod0, auto0 = baseline["production"], baseline["automated"]
         traj = Trajectory(tid="bake", node=node, conv=self.run.new_conversation())
         traj.last_production, traj.last_automated = prod0, auto0
         traj.last_ticks = _tick_of(meta0)
@@ -957,6 +1379,8 @@ class Exp1Runner:
             t0 = time.monotonic()
             try:
                 node = await self.run.infra.fork(s2, role)
+            except asyncio.CancelledError:
+                raise  # T-deadline cancel: stop forking, do not fill missing draws
             except BaseException as exc:  # noqa: BLE001 - a missing draw, journaled
                 detail = f"{type(exc).__name__}: {exc}"
                 self.run.incident("fork_failed", detail, branch=role, wave=w)
@@ -976,6 +1400,21 @@ class Exp1Runner:
         self.journal.event("wave_forks_ready", wave=w, ok=len(nodes),
                            requested=cfg.k,
                            fork_wall_s=[f["wall_s"] for f in forks])
+        # Children evolve while the remaining forks are taken; nothing is
+        # measured until they are back on a common start (see _release_barrier).
+        unusable: dict[int, str] = {}
+        barrier = await self._release_barrier(w, nodes, unusable)
+        if barrier.get("outcome") == "aborted_skew":
+            # An unequal start is not a measurement: the children are torn down,
+            # the wave is recorded with no draws, and the abort is re-raised
+            # after the evidence is saved.
+            await asyncio.gather(
+                *(self._delete(node) for node in nodes.values()),
+                return_exceptions=True,
+            )
+            for i in list(nodes):
+                unusable[i] = barrier["abort_reason"][:500]
+            nodes.clear()
         results = await asyncio.gather(
             *(
                 self.branch(w, i, nodes[i], STRATEGY_HINTS[(i - 1) % len(STRATEGY_HINTS)])
@@ -983,6 +1422,9 @@ class Exp1Runner:
             ),
             return_exceptions=True,
         )
+        for res in results:
+            if isinstance(res, asyncio.CancelledError):
+                raise res  # wave aborted: propagate, never record k failed draws
         branches: list[dict[str, Any]] = []
         for i, res in zip(sorted(nodes), results):
             if isinstance(res, BaseException):
@@ -1000,7 +1442,8 @@ class Exp1Runner:
                 label, hint = STRATEGY_HINTS[(i - 1) % len(STRATEGY_HINTS)]
                 branches.append({
                     "branch": f"w{w}b{i}", "hint_label": label, "hint": hint,
-                    "status": "failed", "error": "fork/health failed -- no sandbox",
+                    "status": "failed",
+                    "error": unusable.get(i, "fork/health failed -- no sandbox"),
                     "scores": {},
                 })
         branches.sort(key=lambda b: b["branch"])
@@ -1015,22 +1458,220 @@ class Exp1Runner:
             "wave": w,
             "snapshot": s2,
             "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "status": "aborted" if barrier.get("outcome") == "aborted_skew" else "ok",
             "k_requested": cfg.k,
             "k_drawn": sum(1 for b in branches if b["status"] == "ok"),
+            "required_draws": self.required_draws,
+            "barrier": barrier,
             "forks": forks,
             "branches": branches,
-            "metrics": wave_metrics([b for b in branches], self.ms),
+            "metrics": wave_metrics(branches, self.ms),
         }
         self.state["waves"] = [
             x for x in self.state.get("waves", []) if x.get("wave") != w
         ] + [wave_rec]
         self.state["waves"].sort(key=lambda x: x["wave"])
         self.journal.event("wave_done", wave=w, k_drawn=wave_rec["k_drawn"],
+                           status=wave_rec["status"],
+                           barrier=barrier.get("outcome"),
                            metrics={m: {k: v for k, v in rec.items()
                                         if not k.startswith("_")}
                                     for m, rec in wave_rec["metrics"].items()})
         self.save()
+        if barrier.get("outcome") == "aborted_skew":
+            raise BarrierSkewError(barrier["abort_reason"])
         return wave_rec
+
+    async def _child_meta(
+        self, w: int, nodes: dict[int, Node]
+    ) -> dict[int, dict[str, Any]]:
+        """``/meta`` for every child concurrently: real game tick + entity count.
+
+        A tick that cannot be read stays ``None``. It is never defaulted to 0 --
+        a fabricated tick would make the barrier's skew check answer a question
+        it did not measure.
+        """
+        order = sorted(nodes)
+        results = await asyncio.gather(
+            *(self.run.infra.meta(nodes[i], branch=f"w{w}b{i}") for i in order),
+            return_exceptions=True,
+        )
+        out: dict[int, dict[str, Any]] = {}
+        for i, res in zip(order, results):
+            if isinstance(res, asyncio.CancelledError):
+                raise res
+            if isinstance(res, BaseException):
+                detail = f"{type(res).__name__}: {res}"
+                self.run.incident("barrier_meta_failed", detail, wave=w,
+                                  branch=f"w{w}b{i}")
+                out[i] = {"tick": None, "entity_count": None, "error": detail[:300]}
+                continue
+            out[i] = {"tick": _tick_or_none(res),
+                      "entity_count": res.get("entity_count")}
+        return out
+
+    async def _release_barrier(
+        self, w: int, nodes: dict[int, Node], unusable: dict[int, str]
+    ) -> dict[str, Any]:
+        """Put every forked child back on a common start, then release the wave.
+
+        Forks of one lineage serialise, so by the time child K exists child 1's
+        world has been RUNNING for the whole fork loop -- and because the strategy
+        hints are positional, that head start would be a repeatable confound
+        rather than noise. The strongest equaliser the bridge API offers is a
+        state round-trip: capture the LEAST advanced child's world (the closest
+        thing to S2 still in hand) with ``/state-save`` and restore it onto every
+        child with ``/state-restore``, the capture source included so the
+        restore's own losses (ore replenished, fluid boxes dropped, production
+        counters reset) land on all K identically. Each branch reads its own
+        baseline after this, so those resets are inside every draw's baseline.
+
+        A child whose restore fails is DROPPED as a missing draw -- never left to
+        run from an unequal start. If the state endpoints are unavailable at all,
+        the wave proceeds only while the measured tick skew is inside
+        ``cfg.barrier_skew_tolerance_ticks``, and is aborted past it.
+        """
+        if not nodes:
+            return {"outcome": "no_children", "k": 0,
+                    "note": "no child was forked, so there was nothing to equalise"}
+        t0 = time.monotonic()
+        pre = await self._child_meta(w, nodes)
+        rec: dict[str, Any] = {
+            "k": len(nodes),
+            "method": "state-save on the least advanced child, state-restore onto all",
+            "tolerance_ticks": self.cfg.barrier_skew_tolerance_ticks,
+            "pre_ticks": {f"w{w}b{i}": pre[i]["tick"] for i in sorted(pre)},
+            "pre_skew_ticks": _skew(m["tick"] for m in pre.values()),
+            "pre_entity_counts": {
+                f"w{w}b{i}": pre[i]["entity_count"] for i in sorted(pre)
+            },
+        }
+        known = {i: m["tick"] for i, m in pre.items() if m["tick"] is not None}
+        # The least advanced child is the best proxy for S2 still in hand; with
+        # no readable tick, the last child forked is the youngest by construction.
+        source = min(known, key=lambda i: known[i]) if known else max(nodes)
+        rec["source_child"] = f"w{w}b{source}"
+        blob: str | None = None
+        try:
+            blob = await self.run.infra.state_save(
+                nodes[source], branch=f"w{w}b{source}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - journaled, degrades to the guard
+            detail = f"{type(exc).__name__}: {exc}"
+            self.run.incident("barrier_capture_failed", detail, wave=w,
+                              branch=f"w{w}b{source}")
+            rec["capture_error"] = detail[:500]
+        if blob:
+            rec["state_chars"] = len(blob)
+            order = sorted(nodes)
+            results = await asyncio.gather(
+                *(
+                    self.run.infra.state_restore(nodes[i], blob, branch=f"w{w}b{i}")
+                    for i in order
+                ),
+                return_exceptions=True,
+            )
+            restored: list[str] = []
+            failed: list[dict[str, Any]] = []
+            for i, res in zip(order, results):
+                if isinstance(res, asyncio.CancelledError):
+                    raise res
+                if isinstance(res, BaseException):
+                    detail = f"{type(res).__name__}: {res}"
+                    self.run.incident("barrier_restore_failed", detail, wave=w,
+                                      branch=f"w{w}b{i}")
+                    failed.append({"branch": f"w{w}b{i}", "error": detail[:300]})
+                    unusable[i] = f"barrier restore failed -- {detail}"[:500]
+                    continue
+                restored.append(f"w{w}b{i}")
+            for entry in failed:
+                idx = int(entry["branch"].split("b")[-1])
+                node = nodes.pop(idx, None)
+                if node is not None:
+                    await self._delete(node)
+            post = await self._child_meta(w, nodes) if nodes else {}
+            counts = [
+                m["entity_count"] for m in post.values() if m["entity_count"] is not None
+            ]
+            rec.update(
+                # No survivor is not an equalised wave: it is a wave with no
+                # usable child left, and every branch is already recorded as a
+                # missing draw by the caller.
+                outcome="equalized" if restored else "all_restores_failed",
+                restored=restored,
+                restore_failed=failed,
+                post_ticks={f"w{w}b{i}": post[i]["tick"] for i in sorted(post)},
+                post_skew_ticks=_skew(m["tick"] for m in post.values()),
+                post_entity_counts={
+                    f"w{w}b{i}": post[i]["entity_count"] for i in sorted(post)
+                },
+                # Restoring identical state must leave identical world content.
+                # The reads are a few milliseconds apart on separate running
+                # worlds, so a mismatch is reported (and journaled) rather than
+                # treated as proof of failure.
+                entity_counts_equal=bool(counts) and len(set(counts)) == 1,
+                tick_note=(
+                    "/state-restore transplants the world without rewinding the "
+                    "Factorio clock, so per-child game ticks stay apart; what the "
+                    "probe reads is world content, and every branch takes its own "
+                    "baseline right after this barrier"
+                ),
+                wall_s=round(time.monotonic() - t0, 3),
+            )
+            if not rec["entity_counts_equal"]:
+                self.run.incident(
+                    "barrier_content_unverified",
+                    f"post-restore entity counts differ: {rec['post_entity_counts']}",
+                    wave=w,
+                )
+            self.journal.event("wave_barrier", wave=w, **rec)
+            return rec
+        # Degraded path: no state round-trip available, so the only defence is
+        # the measured skew itself.
+        skew = rec["pre_skew_ticks"]
+        tolerance = self.cfg.barrier_skew_tolerance_ticks
+        if skew is None:
+            rec.update(
+                outcome="aborted_skew",
+                abort_reason=(
+                    f"wave {w}: the children could not be equalised "
+                    f"({rec.get('capture_error', 'no state capture')}) and no "
+                    "child's game tick could be read, so the start skew is "
+                    "unknown -- the wave is aborted rather than measured from an "
+                    "unverified start"
+                ),
+            )
+        elif skew > tolerance:
+            rec.update(
+                outcome="aborted_skew",
+                abort_reason=(
+                    f"wave {w}: the children could not be equalised "
+                    f"({rec.get('capture_error', 'no state capture')}) and their "
+                    f"start skew is {skew} ticks, past the "
+                    f"{tolerance}-tick tolerance -- the positional hints would "
+                    "turn that head start into a repeatable confound"
+                ),
+            )
+        else:
+            rec.update(
+                outcome="skew_within_tolerance",
+                note=(
+                    f"no state round-trip ({rec.get('capture_error', 'unavailable')}); "
+                    f"released on the measured skew of {skew} ticks, inside the "
+                    f"{tolerance}-tick tolerance"
+                ),
+            )
+            self.run.incident(
+                "barrier_degraded", rec["note"], wave=w,
+                skew_ticks=skew, tolerance_ticks=tolerance,
+            )
+        rec["wall_s"] = round(time.monotonic() - t0, 3)
+        self.journal.event("wave_barrier", wave=w, **rec)
+        if rec["outcome"] == "aborted_skew":
+            self.run.incident("barrier_aborted", rec["abort_reason"], wave=w)
+        return rec
 
     def _fork_journal_facts(self, mark: int) -> dict[str, Any]:
         """Fork attempts / placement, read out of the farplane journal records."""
@@ -1050,6 +1691,8 @@ class Exp1Runner:
     async def _delete(self, node: Node) -> None:
         try:
             await self.run.infra.delete(node)
+        except asyncio.CancelledError:
+            raise
         except BaseException as exc:  # noqa: BLE001
             self.run.incident("delete_failed", f"{type(exc).__name__}: {exc}",
                               target=node.name)
@@ -1075,7 +1718,17 @@ class Exp1Runner:
             conv.inject(HINT_TEMPLATE.format(hint=hint))
             traj = Trajectory(tid=tid, node=node, conv=conv)
             meta0 = await self.run.infra.meta(node, branch=tid)
-            prod0, auto0 = await self.run.read_baseline(node, tid)
+            baseline = await self.run.read_baseline(node, tid)
+            if baseline is None:
+                # Every score in this experiment is a DELTA from the P5 baseline,
+                # so a branch without one is unscorable: it becomes a reported
+                # missing draw instead of being credited with the whole
+                # cumulative score of the checkpoint it inherited.
+                raise RuntimeError(
+                    "P5 baseline unreadable -- this branch cannot be scored "
+                    "against S2 and is reported as a missing draw"
+                )
+            prod0, auto0 = baseline["production"], baseline["automated"]
             traj.last_production, traj.last_automated = prod0, auto0
             traj.last_ticks = _tick_of(meta0)
             rec.update(entities_start=meta0.get("entity_count"),
@@ -1108,6 +1761,9 @@ class Exp1Runner:
                 api_calls=api_calls(traj.conv.messages),
                 curve=traj.curve.points,
             )
+        except asyncio.CancelledError:
+            # An aborted wave must propagate, not masquerade as k failed draws.
+            raise
         except BaseException as exc:  # noqa: BLE001 - a missing draw, never a resample
             rec["status"] = "failed"
             rec["error"] = f"{type(exc).__name__}: {exc}"[:500]
@@ -1140,16 +1796,80 @@ class Exp1Runner:
         rng = random.Random(self.cfg.seed)
         endpoint_m = self.cfg.steps
         third_possible = self.usable_s() >= self.cfg.wave_estimate_s
-        gate = evaluate_gate(waves, self.ms, third_wave_possible=third_possible)
+        # The read point the FIRST TWO waves selected, once a third wave has been
+        # called: the extra wave breaks a tie AT that m and must not be able to
+        # move the horizon it was called to settle.
+        pin = (self.state.get("read_point") or {}).get("m")
+        gate = evaluate_gate(
+            waves, self.ms, third_wave_possible=third_possible,
+            required_n=self.required_draws, fixed_m=pin,
+        )
+        if pin is None and gate.get("third_wave_required") and len(waves) >= 2:
+            self.state["read_point"] = {
+                "m": gate["best_m"],
+                "pinned_after_waves": [w["wave"] for w in waves],
+                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "rule": gate.get("best_m_rule"),
+                "reason": (
+                    "the first two waves disagreed at this m and called a third "
+                    "wave; the majority is read HERE so the extra wave cannot "
+                    "shift the horizon it was called to settle"
+                ),
+            }
+            self.journal.event("read_point_pinned", **self.state["read_point"])
         endpoints = [
             [b["scores"][str(endpoint_m)] for b in w["branches"]
              if b.get("scores", {}).get(str(endpoint_m)) is not None]
             for w in waves
         ]
+        # The same endpoint draws keyed by the CONFIGURED strategy arm: the
+        # best-of-K bootstrap resamples arms (one outcome each), not anonymous
+        # pooled draws, because a fan-out wave runs K DIFFERENT strategies.
+        arm_labels = list(dict.fromkeys(
+            STRATEGY_HINTS[(i - 1) % len(STRATEGY_HINTS)][0]
+            for i in range(1, self.cfg.k + 1)
+        ))
+        endpoints_by_arm: list[dict[str, list[float]]] = []
+        for w in waves:
+            per_arm: dict[str, list[float]] = {}
+            for b in w["branches"]:
+                value = b.get("scores", {}).get(str(endpoint_m))
+                if value is None:
+                    continue
+                key = b.get("hint_label") or b["branch"]
+                per_arm.setdefault(key, []).append(float(value))
+            endpoints_by_arm.append(per_arm)
+        pooled_by_arm: dict[str, list[float]] = {}
+        for per_arm in endpoints_by_arm:
+            for label, values in per_arm.items():
+                pooled_by_arm.setdefault(label, []).extend(values)
         analysis: dict[str, Any] = {
             "ms": list(self.ms),
             "endpoint_m": endpoint_m,
             "waves_completed": [w["wave"] for w in waves],
+            "waves_aborted": [
+                x["wave"] for x in self.state.get("waves", [])
+                if x.get("status") == "aborted"
+            ],
+            "required_draws_per_wave": self.required_draws,
+            "read_point": self.state.get("read_point"),
+            "barriers": [
+                {
+                    "wave": x["wave"],
+                    # A wave recorded before the barrier existed says so, rather
+                    # than reading as a barrier with every field empty.
+                    "outcome": "not_recorded",
+                    **{
+                        k: v for k, v in (x.get("barrier") or {}).items()
+                        if k in (
+                            "outcome", "source_child", "tolerance_ticks",
+                            "pre_skew_ticks", "post_skew_ticks",
+                            "entity_counts_equal", "restore_failed",
+                        )
+                    },
+                }
+                for x in self.state.get("waves", [])
+            ],
             "draws": {
                 "requested": self.cfg.k * len(waves),
                 "obtained_at_endpoint": sum(len(e) for e in endpoints),
@@ -1194,61 +1914,100 @@ class Exp1Runner:
         zero_action = set(analysis["execution_quality"]["zero_action_branches"])
         if zero_action and len(waves) >= 2:
             filtered = []
+            needs: list[int] = []
             for w in waves:
                 kept = [b for b in w["branches"] if b["branch"] not in zero_action]
                 filtered.append({
                     "wave": w["wave"], "branches": kept, "k_drawn": len(kept),
                     "metrics": wave_metrics(kept, self.ms),
                 })
-            alt = evaluate_gate(filtered, self.ms, third_wave_possible=False)
+                # Dropping the no-ops may not smuggle in a missing draw: every
+                # RETAINED branch still has to hold its endpoint.
+                needs.append(len(kept))
+            # Deliberately NOT pinned to the primary read point -- if dropping
+            # the no-ops moves the best m, that is exactly what has to show.
+            alt = evaluate_gate(
+                filtered, self.ms, third_wave_possible=False, required_n=needs,
+            )
             analysis["gate_sensitivity_excluding_no_ops"] = {
                 "rationale": (
                     "Robustness check only -- the pre-registered gate above keeps "
                     "every draw. This re-reads it with the zero-action branches "
-                    "removed, so a PASS here means the verdict does not depend on "
-                    "agent no-ops being in the pool."
+                    "removed: the primary is robust to them only if BOTH the "
+                    "verdict and the m it is read at come back unchanged, so a "
+                    "matching verdict at a DIFFERENT m is a change, not a "
+                    "confirmation."
                 ),
                 "excluded": sorted(zero_action),
                 "best_m": alt["best_m"],
                 "verdict": alt["verdict"],
                 "per_wave": alt["per_wave"],
+                "required_n": needs,
+                "reason": alt.get("reason"),
+                "same_verdict": alt["verdict"] == gate.get("verdict"),
+                "same_best_m": alt["best_m"] == gate.get("best_m"),
+                "matches_primary": bool(
+                    alt["verdict"] == gate.get("verdict")
+                    and alt["best_m"] == gate.get("best_m")
+                ),
             }
-        if len(waves) >= 2:
+        # The pooling guard compares locations and spreads: a wave with no
+        # endpoint draw has neither, and running the guard on it would compare
+        # against a median of 0 that nothing measured.
+        if not any(endpoints):
+            analysis["pooling"] = {"poolable": False, "note": "no endpoint draws"}
+        elif not all(endpoints):
+            analysis["pooling"] = {
+                "poolable": False,
+                "note": (
+                    "wave(s) "
+                    + ", ".join(
+                        str(waves[i]["wave"]) for i, e in enumerate(endpoints) if not e
+                    )
+                    + f" produced no m={endpoint_m} endpoint draw, so there is "
+                    "nothing to compare locations and spreads across; every read "
+                    "stays per wave"
+                ),
+            }
+        elif len(waves) >= 2:
             spreads = [
                 w["metrics"][str(endpoint_m)]["_spread"] for w in waves
             ]
             analysis["pooling"] = pooling_guard(endpoints, spreads)
-        elif endpoints:
+        else:
             analysis["pooling"] = {
                 "poolable": False,
                 "note": "fewer than two waves completed; nothing to pool",
             }
-        else:
-            analysis["pooling"] = {"poolable": False, "note": "no endpoint draws"}
 
         sigmas = [statistics.stdev(e) if len(e) > 1 else 0.0 for e in endpoints]
+        # Only a wave that HAS endpoint draws can be the variance source; a wave
+        # with none has an SD of 0 by convention, which is not a small variance.
+        drawn = [i for i, e in enumerate(endpoints) if e]
+        worst = max(drawn, key=lambda idx: sigmas[idx]) if drawn else None
         if analysis["pooling"].get("poolable") and len(endpoints) >= 2:
             pool = [v for e in endpoints for v in e]
             analysis["best_of_k"] = {
                 "source": "pooled (both waves)",
-                **best_of_k(pool, resamples=self.cfg.resamples, rng=rng),
+                **best_of_k(pooled_by_arm, arms=arm_labels,
+                            resamples=self.cfg.resamples, rng=rng),
             }
             sigma = statistics.stdev(pool) if len(pool) > 1 else 0.0
             analysis["power"] = {
                 "variance_source": f"pooled m={endpoint_m} endpoints",
                 **power_check(pool, sigma=sigma, sims=self.cfg.resamples, rng=rng),
             }
-        elif endpoints:
+        elif worst is not None:
             analysis["best_of_k"] = {
                 "source": "per wave (pooling guard refused)",
                 "per_wave": {
                     str(w["wave"]): best_of_k(
-                        e, resamples=self.cfg.resamples, rng=rng
+                        per_arm, arms=arm_labels,
+                        resamples=self.cfg.resamples, rng=rng,
                     )
-                    for w, e in zip(waves, endpoints) if e
+                    for w, per_arm in zip(waves, endpoints_by_arm) if per_arm
                 },
             }
-            worst = max(range(len(endpoints)), key=lambda idx: sigmas[idx])
             analysis["power"] = {
                 "variance_source": (
                     f"wave {waves[worst]['wave']} m={endpoint_m} endpoints "
@@ -1261,36 +2020,83 @@ class Exp1Runner:
                 ),
             }
         else:
-            analysis["best_of_k"] = {"source": "none", "note": "no endpoint draws"}
-            analysis["power"] = {"note": "no endpoint draws"}
-        if "recommendation" in analysis["power"]:
-            curve = (
-                analysis["best_of_k"].get("curve")
-                or analysis["best_of_k"]["per_wave"][
-                    str(waves[max(range(len(endpoints)), key=lambda i: sigmas[i])]["wave"])
-                ]["curve"]
-            )
-            sel = curve.get(str(self.cfg.k)) or curve[max(curve, key=int)]
-            analysis["power"]["secondary_arm_level"] = {
-                "rationale": (
-                    "Exp 2's arms report ONE endpoint per run -- the SELECTED best "
-                    "of K branches -- so the replicate-level variance an Exp 2 "
-                    "contrast actually faces is the variance of the best-of-K "
-                    "statistic, not of a single branch draw. SECONDARY read: the "
-                    "recommendation above is the design's (single-branch within-S "
-                    "variance). The best-of-K SD is a bootstrap over the same "
-                    "endpoints, so it inherits their discreteness."
-                ),
-                "k": self.cfg.k,
-                "expected_best_of_k": sel["expected_best"],
-                "sd_best_of_k": sel["sd_best"],
-                **power_check(
-                    [sel["expected_best"]], sigma=sel["sd_best"],
-                    scale=sel["expected_best"],
-                    scale_kind=f"expected best-of-{self.cfg.k} endpoint",
-                    sims=self.cfg.resamples, rng=rng,
+            # Not one endpoint draw anywhere: no curve, no variance, no power
+            # recommendation. Reported as ABSENT, never as zero.
+            analysis["best_of_k"] = {
+                "source": "none",
+                "status": "no_draws",
+                "note": (
+                    f"no branch produced an m={endpoint_m} endpoint draw, so there "
+                    "is no pool to bootstrap a best-of-K curve from"
                 ),
             }
+            analysis["power"] = {
+                "status": "no_draws",
+                "note": (
+                    f"no branch produced an m={endpoint_m} endpoint draw, so this "
+                    "run measures no within-S variance and cannot recommend an n "
+                    "for Exp 2"
+                ),
+            }
+        if "recommendation" in analysis["power"]:
+            curve = analysis["best_of_k"].get("curve")
+            if curve is None and worst is not None:
+                curve = (
+                    (analysis["best_of_k"].get("per_wave") or {})
+                    .get(str(waves[worst]["wave"]), {})
+                    .get("curve")
+                )
+            sel = None
+            if curve:
+                sel = curve.get(str(self.cfg.k)) or curve[max(curve, key=int)]
+            arm_rationale = (
+                "Exp 2's arms report ONE endpoint per run -- the SELECTED best "
+                "of K branches -- so the replicate-level variance an Exp 2 "
+                "contrast actually faces is the variance of the best-of-K "
+                "statistic, not of a single branch draw. SECONDARY read: the "
+                "recommendation above is the design's (single-branch within-S "
+                "variance). The best-of-K SD is an arm-level bootstrap over the "
+                "same endpoints, so it inherits their discreteness."
+            )
+            if sel is None:
+                analysis["power"]["secondary_arm_level"] = {
+                    "status": "unavailable",
+                    "rationale": arm_rationale,
+                    "note": (
+                        "The best-of-K curve for this variance source is absent, so "
+                        "the arm-level read is reported missing rather than computed "
+                        "off a substitute pool."
+                    ),
+                }
+            elif float(sel.get("sd_best") or 0.0) <= 0.0:
+                analysis["power"]["secondary_arm_level"] = {
+                    "status": "not_estimable",
+                    "rationale": arm_rationale,
+                    "k": self.cfg.k,
+                    "expected_best_of_k": sel["expected_best"],
+                    "sd_best_of_k": sel.get("sd_best"),
+                    "note": (
+                        f"The best-of-{self.cfg.k} statistic has no spread across "
+                        "this resample (K covers every observed arm and each arm "
+                        "has a single outcome, so there is nothing left to vary), "
+                        "so its replicate-level variance is NOT estimable from "
+                        "these waves -- reported as such instead of as a power of 1."
+                    ),
+                }
+            else:
+                analysis["power"]["secondary_arm_level"] = {
+                    "status": "ok",
+                    "rationale": arm_rationale,
+                    "k": self.cfg.k,
+                    "expected_best_of_k": sel["expected_best"],
+                    "sd_best_of_k": sel["sd_best"],
+                    **power_check(
+                        [sel["expected_best"]], sigma=sel["sd_best"],
+                        scale=sel["expected_best"],
+                        scale_kind=f"expected best-of-{self.cfg.k} endpoint",
+                        sims=self.cfg.resamples, rng=rng,
+                    ),
+                }
         analysis["third_wave_affordable_at_analysis"] = third_possible
         self.state["analysis"] = analysis
         self.save()
@@ -1454,11 +2260,31 @@ def render_report(state: dict[str, Any]) -> str:
     flag = " *(borderline)*" if gate.get("borderline") else ""
     A(f"## GATE VERDICT: **{verdict}**{flag}")
     A("")
-    A(f"- Read at **m = {gate.get('best_m', '-')}** ({gate.get('best_m_rule', '-')}).")
+    A(
+        f"- Read at **m = {gate.get('best_m') or '-'}** "
+        f"({gate.get('best_m_rule', '-')})."
+    )
+    rp = gate.get("read_point") or {}
+    if rp.get("pinned"):
+        A(
+            f"- Read point PINNED at m={rp.get('m')} by the first two waves"
+            + (
+                f"; a free re-selection over all waves would read m="
+                f"{rp.get('free_best_m')} instead, which is why it is pinned."
+                if rp.get("moved_by_pin") else
+                " (a free re-selection over all waves lands on the same m)."
+            )
+        )
     A(f"- {gate.get('reason', '-')}")
     for pw in gate.get("per_wave", []):
         A(
-            f"- wave {pw['wave']}: n={pw['n']}, median {_fmt(pw['median'],3)}, "
+            f"- wave {pw['wave']}: n={pw['n']}"
+            + (
+                f" of {pw['required_n']} required"
+                + ("" if pw.get("complete") else " -- **INCOMPLETE**")
+                if pw.get("required_n") is not None else ""
+            )
+            + f", median {_fmt(pw['median'],3)}, "
             f"max {_fmt(pw['max'],3)}, min {_fmt(pw['min'],3)} -> "
             f"spread {_fmt(pw['spread'])}, gain {_fmt(pw['gain'])}"
             + (f" [edge: {pw['edge']}]" if pw.get("edge") else "")
@@ -1488,16 +2314,50 @@ def render_report(state: dict[str, Any]) -> str:
     A("")
     sens = analysis.get("gate_sensitivity_excluding_no_ops")
     if sens:
+        # The primary is robust to the exclusion only if BOTH the verdict and the
+        # m it is read at survive it. Anything else is a CHANGE, and saying "so
+        # the verdict does not rest on them" would then be false.
+        same_verdict = sens.get("same_verdict")
+        if same_verdict is None:
+            same_verdict = sens.get("verdict") == gate.get("verdict")
+        same_m = sens.get("same_best_m")
+        if same_m is None:
+            same_m = sens.get("best_m") == gate.get("best_m")
+        matches = bool(same_verdict and same_m)
+        if matches:
+            change = (
+                ", the same verdict at the same m, so the verdict does not rest "
+                "on them."
+            )
+        elif same_verdict:
+            change = (
+                f" -- same verdict, but the READ POINT MOVES (primary m="
+                f"{gate.get('best_m') or '-'} -> m={sens['best_m']}): the tier "
+                "survives the exclusion, which horizon is best supported does not."
+            )
+        else:
+            change = (
+                f" -- **CHANGED** from the primary read (**{gate.get('verdict')}** "
+                f"at m={gate.get('best_m') or '-'}): the verdict above DOES depend "
+                "on the no-op draws being in the pool, and this run does not "
+                "establish it without them."
+            )
         A(
             f"**Robustness:** dropping the {len(sens['excluded'])} zero-action "
             f"branch(es) ({', '.join('`' + b + '`' for b in sens['excluded'])}) and "
             f"re-reading the same gate gives **{sens['verdict']}** at m="
             f"{sens['best_m']} ("
-            + "; ".join(
+            + ("; ".join(
                 f"wave {p['wave']} spread {_fmt(p['spread'])}, gain {_fmt(p['gain'])}"
                 for p in sens["per_wave"]
+            ) or "no readable wave")
+            + ")"
+            + change
+            + (
+                f" Robustness read's own basis: {sens['reason']}."
+                if sens.get("reason") else ""
             )
-            + f"), so the verdict does not rest on them. {sens['rationale']}"
+            + f" {sens['rationale']}"
         )
         A("")
 
@@ -1532,13 +2392,23 @@ def render_report(state: dict[str, Any]) -> str:
         )
         + "."
     )
+    equalized_waves = [
+        b.get("wave") for b in (analysis.get("barriers") or [])
+        if b.get("outcome") == "equalized"
+    ]
     A(
         f"- {len(waves)} wave(s) of K={cfg.get('k')} forks from the SAME S2, "
         f"{cfg.get('steps')} steps per branch, probed en route at m="
         f"{'/'.join(str(m) for m in ms)} (nested design; probe cadence = Exp 2's "
         f"parity cadence, so the m={analysis.get('endpoint_m')} endpoints are "
-        "protocol-identical to Exp 2's "
-        "A*K-from-S arm)."
+        "read on Exp 2's A*K-from-S cadence"
+        + (
+            f"; wave(s) {', '.join(str(w) for w in equalized_waves)} were released "
+            "through Exp 1's own state barrier on top of that fork path -- see "
+            "*Fork barrier* below"
+            if equalized_waves else ""
+        )
+        + ")."
     )
     draws = analysis.get("draws", {})
     A(
@@ -1643,25 +2513,42 @@ def render_report(state: dict[str, Any]) -> str:
         )
     )
     A(f"- Source: {bok.get('source','-')}.")
+    bok_design = bok.get("design") or {}
+    if bok_design:
+        A(
+            f"- Resample unit: {bok_design.get('resample_unit')} -- "
+            f"{bok_design.get('arms_observed')} of "
+            f"{bok_design.get('arms_configured')} configured arms observed"
+            + (
+                f", unobserved: {', '.join(bok_design.get('arms_unobserved') or [])}"
+                if bok_design.get("arms_unobserved") else ""
+            )
+            + f". {bok_design.get('rule')}."
+        )
+    if bok.get("note"):
+        A(f"- {bok['note']}")
     A("")
 
     def _curve_table(payload: dict[str, Any], title: str) -> None:
-        A(f"**{title}** ({payload.get('n_draws')} draws, "
+        design = payload.get("design") or {}
+        A(f"**{title}** ({payload.get('n_draws')} draws over "
+          f"{design.get('arms_observed', '-')} arm(s), "
           f"{payload.get('resamples')} resamples, median of draws "
           f"{_fmt(payload.get('median_of_draws'),3)})")
         A("")
-        A("| K | E[best-of-K] | median | SD | p10 | p90 | / median of draws | gain over K=1 |")
-        A("|---|---|---|---|---|---|---|---|")
+        A("| K | E[best-of-K] | median | SD | p10 | p90 | / median of draws | gain over K=1 | arm sampling |")
+        A("|---|---|---|---|---|---|---|---|---|")
         for k, row in payload.get("curve", {}).items():
             A(
                 f"| {k} | {_fmt(row['expected_best'],3)} | {_fmt(row['median_best'],3)} | "
                 f"{_fmt(row.get('sd_best'),3)} | "
                 f"{_fmt(row['p10'],3)} | {_fmt(row['p90'],3)} | "
-                f"{_fmt(row['vs_median_of_draws'],3)} | {_fmt(row['gain_over_k1'],4)} |"
+                f"{_fmt(row['vs_median_of_draws'],3)} | {_fmt(row['gain_over_k1'],4)} | "
+                f"{row.get('arm_sampling','-')} |"
             )
         A("")
 
-    if "curve" in bok:
+    if bok.get("curve"):
         _curve_table(bok, "Best-of-K")
     for wave_id, payload in (bok.get("per_wave") or {}).items():
         _curve_table(payload, f"Best-of-K, wave {wave_id}")
@@ -1701,7 +2588,7 @@ def render_report(state: dict[str, Any]) -> str:
         )
         A("")
         sec = power.get("secondary_arm_level")
-        if sec:
+        if sec and sec.get("status") in (None, "ok"):
             A(
                 f"**Secondary read -- arm-level variance (best-of-{sec['k']}).** "
                 f"{sec['rationale']}"
@@ -1722,6 +2609,12 @@ def render_report(state: dict[str, Any]) -> str:
                     "arm's expected endpoint."
                     if sec.get("mde_n3_as_fraction_of_reference") is not None else "."
                 )
+            )
+            A("")
+        elif sec:
+            A(
+                f"**Secondary read -- arm-level variance: {sec['status']}.** "
+                f"{sec.get('note', '')} {sec.get('rationale', '')}"
             )
             A("")
         A(
@@ -1770,6 +2663,57 @@ def render_report(state: dict[str, Any]) -> str:
         "measurement taken solo."
     )
     A("")
+    barriers = analysis.get("barriers") or []
+    if barriers:
+        A("## Fork barrier (what the branches were released from)")
+        A("")
+        A(
+            "Forks of one lineage serialise, so the first child of a wave has been "
+            "RUNNING for the whole fork loop by the time the last one exists. The "
+            "strategy hints are POSITIONAL, so that head start would be a "
+            "repeatable confound, not noise. Every wave is therefore released "
+            "through a barrier: the least advanced child's world is captured with "
+            "`/state-save` and restored onto all K children (the capture source "
+            "included) with `/state-restore` immediately before the concurrent "
+            "rollouts start."
+        )
+        A("")
+        A("| wave | outcome | capture source | start skew (ticks) | skew after restore | tolerance | content equal | dropped |")
+        A("|---|---|---|---|---|---|---|---|")
+        for b in barriers:
+            failed = b.get("restore_failed") or []
+            A(
+                f"| {b.get('wave')} | {b.get('outcome','-')} | "
+                f"{b.get('source_child') or '-'} | "
+                f"{b.get('pre_skew_ticks') if b.get('pre_skew_ticks') is not None else '-'} | "
+                f"{b.get('post_skew_ticks') if b.get('post_skew_ticks') is not None else '-'} | "
+                f"{b.get('tolerance_ticks','-')} | "
+                f"{b.get('entity_counts_equal') if 'entity_counts_equal' in b else '-'} | "
+                f"{', '.join(f['branch'] for f in failed) or 'none'} |"
+            )
+        A("")
+        A(
+            "`/state-restore` transplants the world without rewinding Factorio's "
+            "clock, so per-child game ticks stay apart after the barrier; what a "
+            "probe reads is world CONTENT, and each branch takes its own P5 "
+            "baseline immediately after the barrier. A child whose restore failed "
+            "is dropped as a missing draw rather than run from an unequal start; a "
+            "wave that could neither be equalised nor shown to be inside the tick "
+            "tolerance is aborted with no draws."
+        )
+        unbarriered = [b.get("wave") for b in barriers
+                       if b.get("outcome") == "not_recorded"]
+        if unbarriered:
+            A("")
+            A(
+                f"Wave(s) {', '.join(str(w) for w in unbarriered)} carry NO barrier "
+                "record: they were drawn before the barrier existed, so their "
+                "children were released straight out of the sequential fork loop "
+                "and their start skew was never measured. Under positional hints "
+                "that skew is systematic; those waves are evidence of what the "
+                "unbarriered protocol returns, not of the barriered one."
+            )
+        A("")
 
     A("## LIMITATIONS (read before any number above is quoted)")
     A("")
@@ -1794,16 +2738,97 @@ def render_report(state: dict[str, Any]) -> str:
         "mid-rebuild at its probe step measures low, and that is indistinguishable "
         "from a real difference at n=1 per branch-step.",
         "**Bootstrap is not new data.** The best-of-K curve resamples the same "
-        f"{(bok.get('n_draws') if 'n_draws' in bok else 'available')} endpoints; "
-        "its intervals describe selection over THIS draw pool, not sampling of new "
-        "waves.",
+        f"{(bok.get('n_draws') if 'n_draws' in bok else 'available')} endpoints at "
+        "ARM level (one outcome per configured strategy, arm subsets without "
+        "replacement); its intervals describe selection over THIS draw pool, not "
+        "sampling of new waves.",
         "**Warm-slot width cap (deployment, not primitive).** Forks pin to the "
         "source's node and serialise, so K=8 was provisioned as 8 sequential forks "
         "on one node; this is a property of this deployment's warm supervisor lane, "
         "separate from fork exactness/speed as a primitive.",
     ]
+    equalized = [b for b in (analysis.get("barriers") or [])
+                 if b.get("outcome") == "equalized"]
+    if equalized:
+        lims.append(
+            "**The barrier is a state round-trip, not a re-fork.** Every wave's "
+            "children were put back on a common world with `/state-restore` before "
+            "their rollouts, which is what removes the sequential-fork head start "
+            "from the positional hints -- but a restore is not fork-exact: it "
+            "replenishes ore, drops fluid boxes and resets production counters. "
+            "Those losses land on all K children identically and every branch's P5 "
+            "baseline is taken after them, so they cannot favour a strategy; they "
+            "do mean the branch lines are Exp 1's own release procedure on top of "
+            "the A*K-from-S fork path, not a byte-identical copy of it."
+        )
+    degraded = [b for b in (analysis.get("barriers") or [])
+                if b.get("outcome") == "skew_within_tolerance"]
+    if degraded:
+        lims.insert(
+            0,
+            "**Wave(s) "
+            + ", ".join(str(b.get("wave")) for b in degraded)
+            + " were released WITHOUT the state barrier.** The bridge could not "
+            "round-trip the children's state, so they started with the measured "
+            "tick skew of the fork loop (inside the pre-registered tolerance, and "
+            "recorded per wave above). Under positional hints that residual skew "
+            "is systematic, not noise."
+        )
+    aborted = analysis.get("waves_aborted") or []
+    if aborted:
+        lims.insert(
+            0,
+            "**Wave(s) "
+            + ", ".join(str(w) for w in aborted)
+            + " were ABORTED at the barrier** and contribute no draws: their "
+            "children could not be shown to start from a common state, and an "
+            "unequal start under positional hints is a repeatable confound rather "
+            "than a measurement."
+        )
+    underfilled = (gate.get("underfilled_waves") or []) if gate else []
+    if underfilled:
+        lims.insert(
+            0,
+            "**Incomplete wave(s) at the read point.** "
+            + "; ".join(
+                f"wave {u['wave']} holds {u['n']} of {u['required_n']} "
+                "pre-registered draws"
+                for u in underfilled
+            )
+            + ". The gate is read only on waves that drew their full complement, "
+            "so the verdict above is `borderline-undecided` by construction: the "
+            "spread and gain of a thinner pool are not the pre-registered "
+            "statistic, and a missing draw is never resampled."
+        )
     zero = (analysis.get("execution_quality") or {}).get("zero_action_branches") or []
     if zero:
+        # Whether the gate rests on the no-ops is exactly what the sensitivity
+        # re-read answers; it is never asserted from the side.
+        if not sens:
+            rests = (
+                " Whether the gate rests on them is not established here: the "
+                "robustness re-read needs two waves and at least one excluded "
+                "branch."
+            )
+        elif matches:
+            rests = (
+                " The gate does not rest on them: re-reading it with those draws "
+                "removed gives the same verdict at the same m (see *Robustness* "
+                "above)."
+            )
+        elif same_verdict:
+            rests = (
+                f" The tier does not rest on them (it is still {sens.get('verdict')} "
+                f"without them), but the read point does: excluded, the gate reads "
+                f"best at m={sens.get('best_m')} rather than "
+                f"m={gate.get('best_m') or '-'} (see *Robustness* above)."
+            )
+        else:
+            rests = (
+                f" The gate DOES rest on them: re-reading it without those draws "
+                f"gives **{sens.get('verdict')}** at m={sens.get('best_m')} "
+                "instead (see *Robustness* above)."
+            )
         lims.insert(
             1,
             f"**{len(zero)} of {draws.get('obtained_at_endpoint')} draws are agent "
@@ -1814,9 +2839,8 @@ def render_report(state: dict[str, Any]) -> str:
             "so those branches never touched the factory and their endpoints "
             "measure S2 left running. They are legitimate draws of what a fan-out "
             "wave actually returns on this model -- and part of the measured spread "
-            "is therefore agent unreliability rather than strategy divergence. The "
-            "gate does not rest on them: the top branches that DID act reach "
-            "roughly twice the median.",
+            "is therefore agent unreliability rather than strategy divergence."
+            + rests,
         )
     if draws.get("missing"):
         lims.insert(
@@ -1939,7 +2963,12 @@ async def run_experiment(cfg: Exp1Config, *, phase: str, wave: int | None) -> in
             else:
                 await runner.bake()
         if phase == "run":
-            done = {w["wave"] for w in runner.state.get("waves", [])}
+            # A wave aborted at the barrier contributed no draws, so it is not
+            # done: the next invocation re-runs that wave number.
+            done = {
+                w["wave"] for w in runner.state.get("waves", [])
+                if w.get("status") != "aborted"
+            }
             for w in range(1, cfg.waves + 1):
                 if w in done:
                     continue
@@ -1962,7 +2991,12 @@ async def run_experiment(cfg: Exp1Config, *, phase: str, wave: int | None) -> in
                     best_m=gate.get("best_m"),
                     usable_s=round(runner.usable_s(), 1),
                 )
-                await runner.wave(len(runner.state["waves"]) + 1)
+                next_wave = max(
+                    (w["wave"] for w in runner.state.get("waves", [])
+                     if w.get("status") != "aborted"),
+                    default=0,
+                ) + 1
+                await runner.wave(next_wave)
                 runner.analyze()
         elif phase == "wave":
             if wave is None:
@@ -1994,6 +3028,24 @@ async def run_experiment(cfg: Exp1Config, *, phase: str, wave: int | None) -> in
             )
         )
         return 0
+    except BaseException as exc:
+        # A failure mid-run leaves branch sandboxes holding warm slots on the
+        # very node the next attempt has to fork onto, and the reaper lives in
+        # ``cleanup`` (which builds its own keep-list: TEMPLATE_SNAP and S2).
+        # Best-effort, never masking the failure, and only for the phases that
+        # can have created substrate.
+        if phase in ("run", "bake", "wave", "reap"):
+            try:
+                await runner.cleanup()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as sweep_exc:  # noqa: BLE001 - journaled, not raised
+                runner.journal.event(
+                    "cleanup_best_effort_failed",
+                    after=f"{type(exc).__name__}: {exc}"[:500],
+                    error=f"{type(sweep_exc).__name__}: {sweep_exc}"[:500],
+                )
+        raise
     finally:
         await runner.aclose()
 

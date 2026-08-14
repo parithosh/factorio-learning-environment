@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tier 0 -- the mechanics gate for the Farplane fan-out benchmark.
 
-Five stages, each independently re-runnable via ``--stages``:
+Six stages, each independently re-runnable via ``--stages``:
 
 ``bake``
     Create a ``debian-warm`` sandbox, stream ``fle-sandbox:bench`` into it,
@@ -9,6 +9,9 @@ Five stages, each independently re-runnable via ``--stages``:
     snapshot.  That snapshot is TEMPLATE_SNAP -- every later stage forks it.
 ``constants``
     5x each: snapshot / fork / expose / health / delete, with subcomponents.
+``cooldown``
+    Vary only the idle gap after a delete goes terminal, to separate intrinsic
+    fork cost from waiting on a deleted child's warm supervisor slot.
 ``fidelity``
     Plant a factory, snapshot, fork three children sequentially, and compare
     ``factorio_pid`` / ``entity_count`` / ``/probe`` across children and parent.
@@ -22,6 +25,13 @@ Five stages, each independently re-runnable via ``--stages``:
 
 Everything we create is named ``flebench-*`` and journalled; the run ends with a
 reaper pass that keeps only TEMPLATE_SNAP and the bake sandbox.
+
+Bridge auth: the in-guest bridge opens its TCP listener only when it has a
+credential, and every exposed-port request is TCP, so export
+``FLE_BRIDGE_TOKEN`` before running -- it is injected into the guest container's
+environment at container start and sent by the host client on every call.
+``FLE_BRIDGE_ALLOW_INSECURE=1`` is the explicit loopback/dev opt-out; with
+neither set the run stops before it creates anything.
 
 Image transfer note (measured, not assumed): the host sits behind NAT on
 192.168.69.0/24 and the sandbox egress policy denies RFC1918, so a host-side
@@ -38,8 +48,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import http.client
 import json
+import os
+import re
 import ssl
 import statistics
 import subprocess
@@ -53,6 +66,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bench.bridge_client import Bridge, BridgeError  # noqa: E402
+from bench.common import atomic_write_json  # noqa: E402
 from bench.farplane import Farplane, SB, summarize  # noqa: E402
 
 BENCH_DIR = Path(__file__).resolve().parent
@@ -70,12 +84,26 @@ BRIDGE_PORT = 8730
 UPLOAD_PORT = 8899
 CHUNK_BYTES = 900_000  # ingress rejects bodies past ~1 MiB
 CONTAINER = "fle-bench"
+GUEST_ENV_FILE = "/root/.fle-bridge.env"
 
-DOCKER_RUN = (
-    f"docker run -d --name {CONTAINER} --restart unless-stopped "
-    f"-e FLE_BENCH_MODE=1 -e FLE_ENV_ID=iron_ore_throughput "
-    f"-p {BRIDGE_PORT}:{BRIDGE_PORT} {IMAGE_TAG}"
-)
+#: Guest bridge environment that carries no credentials.  The C4 auth wiring
+#: (FLE_BRIDGE_TOKEN / FLE_BRIDGE_ALLOW_INSECURE) is added by
+#: :func:`bridge_guest_env` from the host environment at container start.
+GUEST_ENV_BASE: dict[str, str] = {"FLE_BENCH_MODE": "1", "FLE_ENV_ID": "iron_ore_throughput"}
+
+
+def docker_run_command() -> str:
+    """``docker run`` for the guest bridge; its environment is GUEST_ENV_FILE.
+
+    An env *file* rather than ``-e KEY=VALUE`` keeps the bridge token out of the
+    guest process list.
+    """
+    return (
+        f"docker run -d --name {CONTAINER} --restart unless-stopped "
+        f"--env-file {GUEST_ENV_FILE} "
+        f"-p {BRIDGE_PORT}:{BRIDGE_PORT} {IMAGE_TAG}"
+    )
+
 
 # Receiver that turns a sequence of size-capped PUTs back into one byte stream.
 RECV_PY = r'''#!/usr/bin/env python3
@@ -201,6 +229,38 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class StageError(RuntimeError):
+    """A stage failure that still carries the evidence it managed to collect.
+
+    A stage that fails halfway has usually measured something worth keeping (and
+    something worth explaining), but its payload must never be mistaken for a
+    valid stage result -- :func:`ok_stage` keys off the ``error`` field, so the
+    partial lands beside it rather than instead of it.
+    """
+
+    def __init__(self, message: str, *, partial: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.partial = partial or {}
+
+
+def numeric_column(rows: list[dict[str, Any]], key: str) -> list[float]:
+    """Every numeric ``key`` across ``rows``; missing and non-numeric are dropped."""
+    return [float(row[key]) for row in rows if isinstance(row.get(key), (int, float))]
+
+
+def stat_value(stat: Any, key: str = "p95") -> float | None:
+    """One value out of a :func:`summarize` dict, or None if nothing was sampled.
+
+    ``summarize`` reports zeros for an empty sample, so an ``or 0`` read turns
+    "never measured" into "costs nothing"; ``n`` is the only honest guard.
+    """
+    if not isinstance(stat, dict) or not stat.get("n"):
+        return None
+    value = stat.get(key)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+
 # ----------------------------------------------------------------------
 # state
 # ----------------------------------------------------------------------
@@ -212,7 +272,7 @@ def load_state() -> dict[str, Any]:
 
 def save_state(state: dict[str, Any]) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
+    atomic_write_json(STATE_PATH, state)
 
 
 def last_timing(fp: Farplane, op: str) -> dict[str, Any]:
@@ -327,28 +387,123 @@ def install_image(fp: Farplane, sb: SB, tar_path: Path) -> dict[str, Any]:
     stats["docker_load"] = loaded.strip()[-500:]
     inspect = fp.exec(sb, f"docker image inspect {IMAGE_TAG} --format '{{{{.Id}}}}'").strip()
     stats["image_id"] = inspect
-    TRANSFER_PATH.write_text(json.dumps(stats, indent=2))
+    atomic_write_json(TRANSFER_PATH, stats)
     return stats
 
 
+def host_bridge_auth() -> tuple[str, bool]:
+    """The host's bridge credentials: ``(token, insecure_opt_in)``."""
+    return (
+        os.environ.get("FLE_BRIDGE_TOKEN") or "",
+        (os.environ.get("FLE_BRIDGE_ALLOW_INSECURE") or "") == "1",
+    )
+
+
+def auth_fingerprint(token: str) -> str:
+    """Stable, non-reversible id for a bridge token (the empty token hashes too)."""
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def bridge_guest_env() -> dict[str, str]:
+    """Guest container environment, including the bridge auth wiring.
+
+    The guest bridge is only reachable through an exposed port, i.e. over TCP,
+    and the service refuses to open a TCP listener without either a token or an
+    explicit insecure opt-in.  So an unset host credential is a hard error here
+    rather than a five-minute health-check timeout later.
+    """
+    token, insecure = host_bridge_auth()
+    if not token and not insecure:
+        raise SystemExit(
+            "bridge auth is unset: export FLE_BRIDGE_TOKEN=<secret> (injected into the guest "
+            "container here and sent by the host Bridge client), or FLE_BRIDGE_ALLOW_INSECURE=1 "
+            "for a throwaway loopback run. With neither, the in-guest bridge serves its unix "
+            "socket only and every exposed-port call fails."
+        )
+    if token and not re.fullmatch(r"[A-Za-z0-9_.:\-]{8,}", token):
+        raise SystemExit(
+            "FLE_BRIDGE_TOKEN must be at least 8 chars of [A-Za-z0-9_.:-]: it is carried to the "
+            "guest in a docker --env-file and sourced by the in-guest health probe, neither of "
+            "which quotes shell metacharacters."
+        )
+    env = dict(GUEST_ENV_BASE)
+    if token:
+        env["FLE_BRIDGE_TOKEN"] = token
+    if insecure:
+        env["FLE_BRIDGE_ALLOW_INSECURE"] = "1"
+    return env
+
+
+def write_guest_env(fp: Farplane, sb: SB, env: dict[str, str]) -> None:
+    """Install GUEST_ENV_FILE (mode 0600) in the guest.
+
+    base64 so the token is not an argv literal in the guest process list; it
+    still transits the exec gateway, so rotate it if the operation journal is
+    shared.
+    """
+    body = "".join(f"{key}={value}\n" for key, value in env.items())
+    payload = base64.b64encode(body.encode()).decode()
+    fp.exec(sb, f"umask 077 && echo {payload} | base64 -d > {GUEST_ENV_FILE}")
+
+
+def guest_health_probe() -> str:
+    """In-guest ``/health`` curl.
+
+    127.0.0.1 is a TCP client of the bridge, so it needs the bearer token; the
+    probe sources the container's env file instead of embedding the secret in
+    this argv.
+    """
+    url = f"http://127.0.0.1:{BRIDGE_PORT}/health"
+    return (
+        f". {GUEST_ENV_FILE} 2>/dev/null || true; "
+        'if [ -n "${FLE_BRIDGE_TOKEN:-}" ]; then '
+        f'curl -sf -m 5 -H "Authorization: Bearer $FLE_BRIDGE_TOKEN" {url}; '
+        f"else curl -sf -m 5 {url}; fi || echo WAIT"
+    )
+
+
 def start_container(fp: Farplane, sb: SB) -> dict[str, Any]:
-    """(Re)start the bridge container and wait for in-guest health."""
+    """(Re)start the bridge container and wait for in-guest health.
+
+    A container left over from a run with a different bridge token is recreated
+    rather than trusted: its env was fixed at create time, so a rotated host
+    token would otherwise surface as an unexplained 401 in every later stage.
+    """
+    env = bridge_guest_env()
+    write_guest_env(fp, sb, env)
+    want_fp = auth_fingerprint(env.get("FLE_BRIDGE_TOKEN", ""))
     running = fp.exec(
         sb, f"docker inspect -f '{{{{.State.Running}}}}' {CONTAINER} 2>/dev/null || echo none",
         check=False,
     ).strip()
-    if not running.endswith("true"):
-        fp.exec(sb, f"docker rm -f {CONTAINER} >/dev/null 2>&1; {DOCKER_RUN}", timeout="120s")
+    have_fp = ""
+    if running.endswith("true"):
+        # sha256 of the container's own FLE_BRIDGE_TOKEN (empty when unset,
+        # which hashes to the same digest the host computes for insecure mode).
+        words = fp.exec(
+            sb,
+            "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "
+            f"{CONTAINER} 2>/dev/null | sed -n 's/^FLE_BRIDGE_TOKEN=//p' "
+            "| tr -d '\\n' | sha256sum | cut -c1-12",
+            check=False,
+        ).split()
+        have_fp = words[-1] if words else ""
+        if have_fp != want_fp:
+            log("  guest container was created with a different bridge token; recreating")
+    if not running.endswith("true") or have_fp != want_fp:
+        fp.exec(sb, f"docker rm -f {CONTAINER} >/dev/null 2>&1; {docker_run_command()}",
+                timeout="120s")
     started = time.monotonic()
     deadline = started + 300
+    probe_cmd = guest_health_probe()
     while time.monotonic() < deadline:
-        probe = fp.exec(
-            sb,
-            f"curl -sf -m 5 http://127.0.0.1:{BRIDGE_PORT}/health || echo WAIT",
-            check=False,
-        ).strip()
+        probe = fp.exec(sb, probe_cmd, check=False).strip()
         if '"ok"' in probe:
-            return {"guest_health_s": round(time.monotonic() - started, 2)}
+            return {
+                "guest_health_s": round(time.monotonic() - started, 2),
+                "bridge_auth": "token" if env.get("FLE_BRIDGE_TOKEN") else "insecure",
+                "bridge_auth_fp": want_fp,
+            }
         time.sleep(3)
     logs = fp.exec(sb, f"docker logs --tail 40 {CONTAINER} 2>&1", check=False)
     raise RuntimeError(f"bridge never became healthy in guest; logs:\n{logs[-3000:]}")
@@ -384,7 +539,9 @@ def stage_bake(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
     guest_bootstrap(fp, sb)
     result["transfer"] = install_image(fp, sb, tar_path)
     result["container"] = start_container(fp, sb)
-    log(f"  bridge healthy in guest after {result['container']['guest_health_s']}s")
+    state["bridge_auth_fp"] = result["container"]["bridge_auth_fp"]
+    log(f"  bridge healthy in guest after {result['container']['guest_health_s']}s "
+        f"(auth {result['container']['bridge_auth']})")
 
     t0 = time.monotonic()
     url = fp.expose(sb, BRIDGE_PORT)
@@ -447,18 +604,30 @@ def fork_and_ready(
     parts["preclaim_miss"] = bool((fork_rec.get("result") or {}).get("fork_preclaim_miss"))
     parts["node"] = child.node
 
-    t0 = time.monotonic()
-    url = fp.expose(child, BRIDGE_PORT)
-    parts["expose_s"] = round(time.monotonic() - t0, 3)
-    parts["url"] = url
-    if wait_health:
-        bridge = Bridge(url)
+    # The fork succeeded, so from here on the child exists and is billed even if
+    # exposing it or its bridge health fails: nothing may return without either
+    # handing the caller the child or deleting it.
+    try:
         t0 = time.monotonic()
-        bridge.wait_healthy(240, poll_interval=0.5)
-        parts["health_s"] = round(time.monotonic() - t0, 3)
-        parts["total_to_healthy_s"] = round(
-            parts["fork_total_s"] + parts["expose_s"] + parts["health_s"], 3
-        )
+        url = fp.expose(child, BRIDGE_PORT)
+        parts["expose_s"] = round(time.monotonic() - t0, 3)
+        parts["url"] = url
+        if wait_health:
+            bridge = Bridge(url)
+            t0 = time.monotonic()
+            bridge.wait_healthy(240, poll_interval=0.5)
+            parts["health_s"] = round(time.monotonic() - t0, 3)
+            parts["total_to_healthy_s"] = round(
+                parts["fork_total_s"] + parts["expose_s"] + parts["health_s"], 3
+            )
+    except BaseException:
+        try:
+            fp.delete_sandbox(child)
+            log(f"  deleted unusable child {child.id} after post-fork failure")
+        except Exception as exc:
+            log(f"  LEAK: child {child.id} survived a post-fork failure: "
+                f"{type(exc).__name__}: {exc}")
+        raise
     return child, parts
 
 
@@ -615,6 +784,33 @@ def plant_factory(bridge: Bridge, args: argparse.Namespace) -> dict[str, Any]:
             "meta": bridge.meta()}
 
 
+def restore_bake_baseline(parent: Bridge, baseline_state: str) -> dict[str, Any]:
+    """Put the bake sandbox back the way the fidelity stage found it.
+
+    Round-trips the saved baseline (which also proves ``/state-restore`` on the
+    parent), then resets to the task's greenfield start so the bake sandbox
+    still matches TEMPLATE_SNAP for Tier 1.  Never raises: it runs in a finally,
+    so it must not mask the exception that sent it there -- the caller decides
+    whether a failed restore fails the stage.
+    """
+    report: dict[str, Any] = {"attempted": True, "ok": False}
+    try:
+        t0 = time.monotonic()
+        parent.state_restore(baseline_state)
+        report["restore_s"] = round(time.monotonic() - t0, 3)
+        report["restored_meta"] = parent.meta()
+        parent.reset()
+        report["greenfield_meta"] = parent.meta()
+        report["ok"] = True
+        log(f"  restored bake sandbox: "
+            f"entity_count={report['restored_meta'].get('entity_count')} -> reset greenfield "
+            f"entity_count={report['greenfield_meta'].get('entity_count')}")
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        log(f"  BAKE SANDBOX LEFT DIRTY: baseline restore failed: {report['error']}")
+    return report
+
+
 def stage_fidelity(
     fp: Farplane, args: argparse.Namespace, state: dict[str, Any]
 ) -> dict[str, Any]:
@@ -626,99 +822,118 @@ def stage_fidelity(
     baseline_state = parent.state_save()
     log(f"  saved parent state ({len(baseline_state)} bytes) for post-stage restore")
 
-    planted = plant_factory(parent, args)
-    log(f"  planted via {planted['method']}: "
-        f"entity_count={planted['meta'].get('entity_count')}")
-
-    parent_meta_before = parent.meta()
-    parent_probe_before = parent.probe(args.probe_entity)
-    log(f"  parent probe before fork: {parent_probe_before}")
-
-    snap = fp.snapshot(source, ttl="2h", note="flebench-fidelity")
-    children: list[dict[str, Any]] = []
-    child_objs: list[SB] = []
+    # Everything below mutates the bake sandbox -- the one Tier 1 inherits --
+    # starting with the fixture plant, so the baseline restore is a finally, not
+    # a happy-path step at the end.
     try:
-        for i in range(args.fidelity_children):
-            child, parts = fork_and_ready(fp, snap, "40m", f"fid-{i}")
-            child_objs.append(child)
-            bridge = Bridge(parts["url"])
-            meta = bridge.meta()
-            probe = bridge.probe(args.probe_entity)
-            children.append({"i": i, "sandbox": child.id, "node": child.node,
-                             "fork": parts, "meta": meta, "probe": probe})
-            log(f"  child {i} {child.id}@{child.node}: pid={meta.get('factorio_pid')} "
-                f"entities={meta.get('entity_count')} tick={meta.get('game_tick')} "
-                f"throughput={probe.get('throughput')} "
-                f"items={probe.get('end_count')} - {probe.get('start_count')}")
+        planted = plant_factory(parent, args)
+        log(f"  planted via {planted['method']}: "
+            f"entity_count={planted['meta'].get('entity_count')}")
 
-        parent_meta_after = parent.meta()
-        parent_probe_after = parent.probe(args.probe_entity)
-    finally:
-        for child in child_objs:
-            try:
-                fp.delete_sandbox(child)
-            except Exception as exc:
-                log(f"  child cleanup failed: {exc}")
+        parent_meta_before = parent.meta()
+        parent_probe_before = parent.probe(args.probe_entity)
+        log(f"  parent probe before fork: {parent_probe_before}")
+
+        snap = fp.snapshot(source, ttl="2h", note="flebench-fidelity")
+        children: list[dict[str, Any]] = []
+        child_objs: list[SB] = []
         try:
-            fp.delete_snapshot(snap)
-        except Exception as exc:
-            log(f"  snapshot cleanup failed: {exc}")
+            for i in range(args.fidelity_children):
+                child, parts = fork_and_ready(fp, snap, "40m", f"fid-{i}")
+                child_objs.append(child)
+                bridge = Bridge(parts["url"])
+                meta = bridge.meta()
+                probe = bridge.probe(args.probe_entity)
+                children.append({"i": i, "sandbox": child.id, "node": child.node,
+                                 "fork": parts, "meta": meta, "probe": probe})
+                log(f"  child {i} {child.id}@{child.node}: pid={meta.get('factorio_pid')} "
+                    f"entities={meta.get('entity_count')} tick={meta.get('game_tick')} "
+                    f"throughput={probe.get('throughput')} "
+                    f"items={probe.get('end_count')} - {probe.get('start_count')}")
 
-    pids = {c["meta"].get("factorio_pid") for c in children}
-    entity_counts = {c["meta"].get("entity_count") for c in children}
-    throughputs = [c["probe"].get("throughput") for c in children]
-    items = [
-        (c["probe"].get("end_count") or 0) - (c["probe"].get("start_count") or 0)
-        for c in children
-    ]
-    spread = (max(throughputs) - min(throughputs)) if throughputs else 0.0
-    verdict = {
-        "factorio_pid_identical": len(pids) == 1,
-        "factorio_pid_matches_parent": pids == {parent_meta_before.get("factorio_pid")},
-        "entity_count_identical": len(entity_counts) == 1,
-        "entity_count_matches_parent": entity_counts == {parent_meta_before.get("entity_count")},
-        "probe_spread": round(spread, 6),
-        "probe_identical": spread == 0.0,
-        "probe_items_per_window": items,
-        "probe_items_identical": len(set(items)) == 1,
-        "probe_tolerance": args.probe_tolerance,
-        "parent_entity_count_unchanged": (
-            parent_meta_before.get("entity_count") == parent_meta_after.get("entity_count")
-        ),
-        "parent_probe_delta": round(
-            abs((parent_probe_after.get("throughput") or 0)
-                - (parent_probe_before.get("throughput") or 0)), 6
-        ),
-        "parent_pid_unchanged": (
-            parent_meta_before.get("factorio_pid") == parent_meta_after.get("factorio_pid")
-        ),
-    }
-    verdict["pass"] = bool(
-        verdict["factorio_pid_identical"]
-        and verdict["entity_count_identical"]
-        and verdict["entity_count_matches_parent"]
-        and verdict["probe_spread"] <= args.probe_tolerance
-        and verdict["parent_entity_count_unchanged"]
-        and verdict["parent_pid_unchanged"]
-    )
-    log(f"  verdict: {verdict}")
+            parent_meta_after = parent.meta()
+            parent_probe_after = parent.probe(args.probe_entity)
+        finally:
+            for child in child_objs:
+                try:
+                    fp.delete_sandbox(child)
+                except Exception as exc:
+                    log(f"  child cleanup failed: {exc}")
+            try:
+                fp.delete_snapshot(snap)
+            except Exception as exc:
+                log(f"  snapshot cleanup failed: {exc}")
 
-    # Round-trip the saved baseline (proves /state-restore on the parent), then
-    # reset to the task's greenfield start so the bake sandbox matches
-    # TEMPLATE_SNAP for Tier 1.
-    parent.state_restore(baseline_state)
-    restored = parent.meta()
-    parent.reset()
-    greenfield = parent.meta()
-    log(f"  restored bake sandbox: entity_count={restored.get('entity_count')} "
-        f"-> reset greenfield entity_count={greenfield.get('entity_count')}")
+        pids = {c["meta"].get("factorio_pid") for c in children}
+        entity_counts = {c["meta"].get("entity_count") for c in children}
+        throughputs = [c["probe"].get("throughput") for c in children]
+        items = [
+            (c["probe"].get("end_count") or 0) - (c["probe"].get("start_count") or 0)
+            for c in children
+        ]
+        spread = (max(throughputs) - min(throughputs)) if throughputs else 0.0
+        verdict = {
+            "factorio_pid_identical": len(pids) == 1,
+            "factorio_pid_matches_parent": pids == {parent_meta_before.get("factorio_pid")},
+            "entity_count_identical": len(entity_counts) == 1,
+            "entity_count_matches_parent": (
+                entity_counts == {parent_meta_before.get("entity_count")}
+            ),
+            "probe_spread": round(spread, 6),
+            "probe_identical": spread == 0.0,
+            "probe_items_per_window": items,
+            "probe_items_identical": len(set(items)) == 1,
+            "probe_tolerance": args.probe_tolerance,
+            "parent_entity_count_unchanged": (
+                parent_meta_before.get("entity_count") == parent_meta_after.get("entity_count")
+            ),
+            "parent_probe_delta": round(
+                abs((parent_probe_after.get("throughput") or 0)
+                    - (parent_probe_before.get("throughput") or 0)), 6
+            ),
+            "parent_pid_unchanged": (
+                parent_meta_before.get("factorio_pid") == parent_meta_after.get("factorio_pid")
+            ),
+        }
+        # Every invariant this stage computes is scored.  Two are scored against
+        # a tolerance rather than as-is: probe_spread against --probe-tolerance,
+        # and probe_identical (spread exactly 0.0) is NOT a gate because the
+        # probe closes 1-2 ticks past its 3600-tick window and divides by the
+        # actual delta -- the exactness claim is carried by probe_items_identical
+        # (integer production counters).  parent_probe_delta is not an invariant
+        # at all: the parent keeps running and its burner drills run out of coal.
+        checks = {
+            "children_probed": len(children) == args.fidelity_children and bool(children),
+            "factorio_pid_identical": verdict["factorio_pid_identical"],
+            "factorio_pid_matches_parent": verdict["factorio_pid_matches_parent"],
+            "entity_count_identical": verdict["entity_count_identical"],
+            "entity_count_matches_parent": verdict["entity_count_matches_parent"],
+            "probe_items_identical": verdict["probe_items_identical"],
+            "probe_spread_within_tolerance": verdict["probe_spread"] <= args.probe_tolerance,
+            "parent_entity_count_unchanged": verdict["parent_entity_count_unchanged"],
+            "parent_pid_unchanged": verdict["parent_pid_unchanged"],
+        }
+        verdict["checks"] = checks
+        verdict["failed_checks"] = sorted(key for key, ok in checks.items() if not ok)
+        verdict["pass"] = not verdict["failed_checks"]
+        log(f"  verdict: {verdict}")
+    finally:
+        restore = restore_bake_baseline(parent, baseline_state)
+
+    if not restore["ok"]:
+        # The bake sandbox is a Tier 1 input; a polluted one is a stage failure
+        # even though every fidelity check passed.
+        raise RuntimeError(
+            f"fidelity fixture left in the bake sandbox: {restore.get('error')}"
+        )
 
     return {
         "planted": planted,
         "parent_before": {"meta": parent_meta_before, "probe": parent_probe_before},
         "parent_after": {"meta": parent_meta_after, "probe": parent_probe_after},
-        "parent_restored_meta": restored,
-        "parent_greenfield_meta": greenfield,
+        "parent_restored_meta": restore.get("restored_meta"),
+        "parent_greenfield_meta": restore.get("greenfield_meta"),
+        "baseline_restore": restore,
         "baseline_state_bytes": len(baseline_state),
         "children": children,
         "verdict": verdict,
@@ -728,6 +943,15 @@ def stage_fidelity(
 # ----------------------------------------------------------------------
 # probe cycle
 # ----------------------------------------------------------------------
+def cycle_fork_parts(cycle: dict[str, Any]) -> dict[str, Any]:
+    """The fork subcomponents a probe cycle recorded under its ``fork_`` prefix.
+
+    Empty when the cycle never got a child (its fork raised), which is how
+    callers tell a measured probe fork from a failed one.
+    """
+    return {key[5:]: value for key, value in cycle.items() if key.startswith("fork_")}
+
+
 def probe_cycle(
     fp: Farplane,
     source: SB,
@@ -817,6 +1041,7 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
     events: list[dict[str, Any]] = []
     events_lock = threading.Lock()
     errors: list[str] = []
+    stop = threading.Event()
 
     def record(event: dict[str, Any]) -> None:
         with events_lock:
@@ -824,8 +1049,12 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
 
     def branch_worker(index: int, source: SB) -> None:
         for round_index in range(args.soak_rounds):
-            if time.monotonic() > deadline:
-                record({"kind": "budget_stop", "source": index, "round": round_index})
+            # A round owns live children, so the stop flag is honoured at round
+            # boundaries only -- never mid-round, where an abort would strand
+            # them.
+            if stop.is_set() or time.monotonic() > deadline:
+                record({"kind": "budget_stop", "source": index, "round": round_index,
+                        "reason": "stop_requested" if stop.is_set() else "budget"})
                 return
             children: list[SB] = []
             round_snap = ""
@@ -889,7 +1118,7 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
 
     def probe_worker(source: SB) -> None:
         i = 0
-        while time.monotonic() < deadline:
+        while not stop.is_set() and time.monotonic() < deadline:
             try:
                 cycle = probe_cycle(fp, source, args.probe_entity, f"soak{i}",
                                     deadline=args.fork_deadline_s,
@@ -906,40 +1135,86 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
                 return
 
     threads = [
-        threading.Thread(target=branch_worker, args=(i, sources[i]), daemon=True)
+        threading.Thread(target=branch_worker, args=(i, sources[i]),
+                         name=f"soak-branch{i}", daemon=True)
         for i in range(args.soak_sources)
     ]
-    threads.append(threading.Thread(target=probe_worker, args=(sources[-1],), daemon=True))
+    threads.append(threading.Thread(target=probe_worker, args=(sources[-1],),
+                                    name="soak-probe", daemon=True))
     soak_started = time.monotonic()
     for thread in threads:
         thread.start()
+
+    # Workers own live sandboxes, so they are joined to completion rather than on
+    # a timeout: the wall-clock budget is their stopping rule, and one bounded
+    # grace covers the round in flight when it expires.
+    grace_s = (args.soak_join_grace_s if args.soak_join_grace_s > 0
+               else max(300.0, args.fork_deadline_s + 120.0))
     for thread in threads:
-        thread.join(timeout=max(60.0, deadline - time.monotonic() + 600))
+        thread.join(timeout=max(1.0, deadline + grace_s - time.monotonic()))
+    stuck = [t.name for t in threads if t.is_alive()]
+    if stuck:
+        log(f"  workers past their budget ({', '.join(stuck)}); asking them to stop")
+        stop.set()
+        hard_deadline = time.monotonic() + grace_s
+        for thread in threads:
+            thread.join(timeout=max(1.0, hard_deadline - time.monotonic()))
+        stuck = [t.name for t in threads if t.is_alive()]
     soak_wall = time.monotonic() - soak_started
 
-    for sb in sources:
-        try:
-            fp.delete_sandbox(sb)
-        except Exception as exc:
-            errors.append(f"cleanup {sb.id}: {exc}")
+    # Never delete a source out from under a live worker: its next fork would
+    # fail against a vanished parent and its children would be stranded on the
+    # node with nothing owning them.
+    if stuck:
+        log(f"  NOT deleting soak sources: {', '.join(stuck)} still running")
+    else:
+        for sb in sources:
+            try:
+                fp.delete_sandbox(sb)
+            except Exception as exc:
+                errors.append(f"cleanup {sb.id}: {exc}")
 
     branch_rounds = [e for e in events if e["kind"] == "branch_round"]
     probe_cycles = [e for e in events if e["kind"] == "probe_cycle"]
-    all_forks = [f for e in branch_rounds for f in e["forks"]]
+    budget_stops = [e for e in events if e["kind"] == "budget_stop"]
+    branch_forks = [f for e in branch_rounds for f in e["forks"]]
+    # The parity probe cycle forks a child of its own, and design v2.4.1 counts
+    # it among the K forks a B run issues per round -- so it belongs in every
+    # throughput, placement and capacity aggregate here, not just its own
+    # cycle-time stat.
+    probe_forks = [parts for parts in (cycle_fork_parts(c) for c in probe_cycles) if parts]
+    all_forks = branch_forks + probe_forks
     node_counts: dict[str, int] = {}
     for fork in all_forks:
         node_counts[str(fork.get("node"))] = node_counts.get(str(fork.get("node")), 0) + 1
     capacity_waits = sum(int(f.get("capacity_waits") or 0) for f in all_forks)
     attempts = [int(f.get("fork_op_attempts") or 1) for f in all_forks]
 
+    requested_rounds = args.soak_sources * args.soak_rounds
+    incomplete: list[str] = []
+    if stuck:
+        incomplete.append(f"workers never finished: {', '.join(stuck)}")
+    if errors:
+        incomplete.append(f"{len(errors)} worker error(s)")
+    if not branch_rounds:
+        incomplete.append("no branch round completed at all")
+    elif len(branch_rounds) < requested_rounds:
+        incomplete.append(f"only {len(branch_rounds)}/{requested_rounds} branch rounds completed")
+    if budget_stops:
+        incomplete.append(f"{len(budget_stops)} worker(s) stopped early on the wall-clock budget")
+    if not probe_cycles:
+        incomplete.append("no parity probe cycle completed")
+
     summary = {
         "sources": [{"id": sb.id, "name": sb.name, "node": sb.node} for sb in sources],
         "source_create_s": summarize(create_times),
         "probe_source_fixture": probe_fixture,
         "rounds_completed": len(branch_rounds),
-        "rounds_requested": args.soak_sources * args.soak_rounds,
+        "rounds_requested": requested_rounds,
         "probe_cycles_completed": len(probe_cycles),
         "forks_total": len(all_forks),
+        "branch_forks_total": len(branch_forks),
+        "probe_forks_total": len(probe_forks),
         "wall_s": round(soak_wall, 1),
         "aggregate_fork_rate_per_min": round(len(all_forks) / (soak_wall / 60.0), 2)
         if soak_wall else 0.0,
@@ -947,25 +1222,47 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
         "fork_op_attempts": summarize(attempts),
         "fork_attempts_gt1": sum(1 for a in attempts if a > 1),
         "latency": {
-            "snapshot_s": summarize([e["snapshot_s"] for e in branch_rounds]),
-            "fork_total_s": summarize([f["fork_total_s"] for f in all_forks]),
-            "fork_op_s": summarize([f["fork_op_s"] for f in all_forks if f.get("fork_op_s")]),
-            "child_ready_s": summarize(
-                [f["child_ready_s"] for f in all_forks if f.get("child_ready_s")]
-            ),
-            "expose_s": summarize([f["expose_s"] for f in all_forks]),
-            "health_s": summarize([f["health_s"] for f in all_forks if f.get("health_s")]),
+            "snapshot_s": summarize(numeric_column(branch_rounds, "snapshot_s")
+                                    + numeric_column(probe_cycles, "snapshot_s")),
+            "fork_total_s": summarize(numeric_column(all_forks, "fork_total_s")),
+            "fork_op_s": summarize(numeric_column(all_forks, "fork_op_s")),
+            "child_ready_s": summarize(numeric_column(all_forks, "child_ready_s")),
+            "expose_s": summarize(numeric_column(all_forks, "expose_s")),
+            "health_s": summarize(numeric_column(all_forks, "health_s")),
             "delete_child_s": summarize(
                 [d for e in branch_rounds for d in e["delete_child_s"]]
+                + numeric_column(probe_cycles, "delete_child_s")
             ),
-            "delete_snapshot_s": summarize([e["delete_snapshot_s"] for e in branch_rounds]),
-            "branch_round_s": summarize([e["round_s"] for e in branch_rounds]),
-            "probe_cycle_s": summarize([e["t_probe_cycle_s"] for e in probe_cycles]),
+            "delete_snapshot_s": summarize(numeric_column(branch_rounds, "delete_snapshot_s")
+                                           + numeric_column(probe_cycles, "delete_snapshot_s")),
+            "branch_round_s": summarize(numeric_column(branch_rounds, "round_s")),
+            "probe_cycle_s": summarize(numeric_column(probe_cycles, "t_probe_cycle_s")),
         },
+        "latency_sample_scope": "branch rounds + parity probe cycles",
         "node_placement": node_counts,
         "errors": errors,
+        "complete": not incomplete,
+        "incomplete_reasons": incomplete,
+        "stuck_workers": stuck,
+        "sources_deleted": not stuck,
+        "config": {
+            "soak_sources": args.soak_sources,
+            "soak_rounds": args.soak_rounds,
+            "soak_width": args.soak_width,
+            "soak_health": args.soak_health,
+            "soak_budget_s": args.soak_budget_s,
+            "source_snapshot": snap,
+        },
         "events": events,
     }
+    if stuck:
+        raise StageError(
+            f"soak workers {stuck} never finished within the budget plus {grace_s:.0f}s of "
+            f"grace; the {len(sources)} soak sources were left in place because a live worker "
+            f"still owns children off them -- reap once the control plane releases the "
+            f"operations, then rerun the soak",
+            partial=summary,
+        )
     return summary
 
 
@@ -989,6 +1286,7 @@ def analyze_fork_ops(journal_dir: Path, since: str | None = None) -> dict[str, A
     total = 0
     failed = 0
     queued_timeouts = 0
+    unparsable = 0
     reasons: dict[str, int] = {}
     for path in sorted(journal_dir.glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -997,6 +1295,9 @@ def analyze_fork_ops(journal_dir: Path, since: str | None = None) -> dict[str, A
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                # A torn line is evidence we could not read, not evidence of
+                # nothing: it is counted so the rates below can be doubted.
+                unparsable += 1
                 continue
             if record.get("op") != "fork":
                 continue
@@ -1024,6 +1325,7 @@ def analyze_fork_ops(journal_dir: Path, since: str | None = None) -> dict[str, A
         "fork_ops": total,
         "fork_ops_failed": failed,
         "fork_ops_queued_timeout": queued_timeouts,
+        "unparsable_journal_lines": unparsable,
         "op_attempts": summarize(attempts),
         "duration_s": summarize(durations),
         "preclaim_wait_ms": summarize(preclaim_wait_ms),
@@ -1045,24 +1347,63 @@ def recommended_run_cap(soak: dict[str, Any] | None, args: argparse.Namespace) -
 
     Concurrency does not raise the numerator -- the soak measures that directly
     -- so this is a throughput cap, not a slot count.
+
+    There is no default cap.  Without a complete soak the answer is ``None``: a
+    fabricated 1 reads as "one B run is safe" when nothing was measured, and
+    Tier 1 would size itself on it.  A measured-but-too-slow node yields 0,
+    which is a different statement and also not 1.
     """
-    if not soak or not soak.get("wall_s"):
-        return {"cap": 1, "basis": "no soak data", "fork_rate_per_min": 0.0}
-    rate_per_min = float(soak.get("aggregate_fork_rate_per_min") or 0.0)
     window_s = args.m * args.llm_round_s
+    blockers: list[str] = []
+    if not soak:
+        blockers.append("no valid soak stage in the results")
+    else:
+        if not soak.get("wall_s"):
+            blockers.append("soak recorded no wall clock")
+        if not soak.get("complete", False):
+            reasons = soak.get("incomplete_reasons") or []
+            blockers.append(
+                "soak incomplete: " + ("; ".join(str(r) for r in reasons) if reasons
+                                       else "stage carries no completeness record")
+            )
+        if float(soak.get("aggregate_fork_rate_per_min") or 0.0) <= 0.0:
+            blockers.append("soak measured no completed forks")
+    if args.K < 1:
+        blockers.append(f"K={args.K} is not a fan-out width")
+    if blockers:
+        return {
+            "cap": None,
+            "fork_rate_per_min": None,
+            "forks_per_run_per_window": args.K,
+            "window_s": window_s,
+            "forks_affordable_per_window": None,
+            "blockers": blockers,
+            "basis": (
+                "no cap established: " + "; ".join(blockers)
+                + " -- rerun the soak to completion before sizing Tier 1"
+            ),
+        }
+    rate_per_min = float(soak.get("aggregate_fork_rate_per_min") or 0.0)
     budget = rate_per_min / 60.0 * window_s
-    cap = max(1, int(budget // max(1, args.K)))
+    cap = int(budget // args.K)
+    basis = (
+        f"measured aggregate {rate_per_min} forks/min on "
+        f"{len(soak.get('node_placement') or {})} node(s); a B run needs K={args.K} forks "
+        f"per m={args.m} steps of {args.llm_round_s}s"
+    )
+    if cap == 0:
+        basis += (
+            f" -- that affords {budget:.2f} forks per window, short of one B run's K={args.K}, "
+            f"so no B run fits at this K/m"
+        )
     return {
         "cap": cap,
         "fork_rate_per_min": rate_per_min,
         "forks_per_run_per_window": args.K,
         "window_s": window_s,
         "forks_affordable_per_window": round(budget, 2),
-        "basis": (
-            f"measured aggregate {rate_per_min} forks/min on "
-            f"{len(soak.get('node_placement') or {})} node(s); a B run needs K={args.K} forks "
-            f"per m={args.m} steps of {args.llm_round_s}s"
-        ),
+        "blockers": [],
+        "basis": basis,
     }
 
 
@@ -1079,9 +1420,11 @@ def _all_fork_parts(stage: dict[str, Any] | None) -> list[dict[str, Any]]:
             parts.append(child["fork"])
     for event in stage.get("events") or []:
         parts.extend(event.get("forks") or [])
+        # A soak probe cycle is an event too, and its fork is a fork.
+        parts.append(cycle_fork_parts(event))
     for cycle in stage.get("cycles") or []:
-        parts.append({k[5:]: v for k, v in cycle.items() if k.startswith("fork_")})
-    return [p for p in parts if isinstance(p, dict)]
+        parts.append(cycle_fork_parts(cycle))
+    return [p for p in parts if isinstance(p, dict) and p]
 
 
 def ok_stage(results: dict[str, Any], name: str) -> dict[str, Any] | None:
@@ -1138,6 +1481,11 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
                 f"`docker load` result: `{transfer.get('docker_load')}`")
         add(f"- container start -> in-guest `/health` ok: "
             f"{(bake.get('container') or {}).get('guest_health_s')}s")
+        container = bake.get("container") or {}
+        add(f"- guest bridge auth: **{container.get('bridge_auth', 'unrecorded')}** "
+            f"(token fingerprint `{container.get('bridge_auth_fp', '-')}`; the host's "
+            f"`FLE_BRIDGE_TOKEN` is injected into the container env at start, and the exposed "
+            f"port is TCP so every request carries `Authorization: Bearer`)")
         add(f"- `expose {BRIDGE_PORT}`: {bake.get('expose_s')}s; host-side `/health` ok after "
             f"{bake.get('host_health_s')}s")
         add(f"- template snapshot: {bake.get('template_snapshot_s')}s")
@@ -1263,13 +1611,19 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
             f"{len(fidelity['children'])} children forked sequentially from one snapshot of a "
             f"{fidelity['parent_before']['meta'].get('entity_count')}-entity factory.")
         add("")
-        add("| check | result |")
-        add("|---|---|")
-        for key in ("factorio_pid_identical", "factorio_pid_matches_parent",
-                    "entity_count_identical", "entity_count_matches_parent",
-                    "probe_identical", "probe_spread", "parent_entity_count_unchanged",
-                    "parent_pid_unchanged", "parent_probe_delta"):
-            add(f"| {key} | {verdict.get(key)} |")
+        if verdict.get("failed_checks"):
+            add(f"Failed checks: {', '.join(str(f) for f in verdict['failed_checks'])}.")
+            add("")
+        add("| check | scores the verdict | result |")
+        add("|---|---|---|")
+        scored = verdict.get("checks") or {}
+        for key, ok in scored.items():
+            add(f"| {key} | yes | {ok} |")
+        if not scored:
+            add("| (stage recorded no per-check breakdown; rerun it) | - | - |")
+        for key in ("probe_spread", "probe_identical", "probe_items_per_window",
+                    "probe_tolerance", "parent_probe_delta"):
+            add(f"| {key} | no (context) | {verdict.get(key)} |")
         add("")
         add("| child | sandbox | node | factorio_pid | entity_count | game_tick | "
             "items/window | throughput |")
@@ -1289,12 +1643,18 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
             f"{parent_meta.get('game_tick')} | {parent_items} | "
             f"{parent_probe.get('throughput')} |")
         add("")
-        add("Reading: every child produced the **same integer item count** in its 3600-tick "
-            "window; the residual throughput spread of "
-            f"{verdict.get('probe_spread')} is pure window-normalisation noise (the probe "
-            "closes 1-2 ticks past 3600 and divides by the actual tick delta), i.e. below the "
-            "one-item resolution floor of the production counter. `game_tick` differs by a few "
-            "ticks because each child ran briefly before its probe.")
+        if verdict.get("probe_items_identical"):
+            add("Reading: every child produced the **same integer item count** in its 3600-tick "
+                "window; the residual throughput spread of "
+                f"{verdict.get('probe_spread')} is pure window-normalisation noise (the probe "
+                "closes 1-2 ticks past 3600 and divides by the actual tick delta), i.e. below "
+                "the one-item resolution floor of the production counter. `game_tick` differs "
+                "by a few ticks because each child ran briefly before its probe.")
+        else:
+            add(f"Reading: the children did **not** agree on their integer item counts "
+                f"({verdict.get('probe_items_per_window')}), so the exactness claim fails on "
+                f"the production counters themselves, not on the "
+                f"{verdict.get('probe_spread')} throughput spread.")
         add("")
         parent_after_probe = (fidelity.get("parent_after") or {}).get("probe") or {}
         add(f"Parent drift is expected and benign: the parent kept running for the whole stage "
@@ -1330,8 +1690,9 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
         add("")
         add(f"{soak['rounds_completed']}/{soak['rounds_requested']} branch rounds and "
             f"{soak['probe_cycles_completed']} probe cycles in {soak['wall_s']}s; "
-            f"{soak['forks_total']} forks total "
-            f"({soak['aggregate_fork_rate_per_min']} forks/min aggregate).")
+            f"{soak['forks_total']} forks total ({soak.get('branch_forks_total')} branch + "
+            f"{soak.get('probe_forks_total')} parity probe) at "
+            f"{soak['aggregate_fork_rate_per_min']} forks/min aggregate.")
         add("")
         add(f"- **waiting_for_capacity observations: {soak['waiting_for_capacity_observations']}**")
         add(f"- fork operation attempts (control-plane internal retries): p50 "
@@ -1340,6 +1701,9 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
             f"{soak['fork_attempts_gt1']}/{soak['forks_total']} forks needed >1 attempt")
         add(f"- node placement of children: `{json.dumps(soak['node_placement'])}`")
         add(f"- errors: {len(soak['errors'])}")
+        if not soak.get("complete", False):
+            reasons = soak.get("incomplete_reasons") or ["stage carries no completeness record"]
+            add(f"- **incomplete**: {'; '.join(str(r) for r in reasons)}")
         add("")
         add("| op | p50 | p95 | max | n |")
         add("|---|---|---|---|---|")
@@ -1348,22 +1712,35 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
                 f"{stat.get('n')} |")
         add("")
         cap = results.get("run_cap") or {}
-        add(f"**Per-node Tier-1 run cap: {cap.get('cap')}** concurrent B-runs "
-            f"({cap.get('basis')}); a window of {cap.get('window_s')}s affords "
-            f"{cap.get('forks_affordable_per_window')} forks node-wide. Consumed by "
-            f"`bench/run_tier1.py` from `bench/results/tier0_soak.json` "
-            f"(`recommended_run_cap` / `per_node_run_cap` / `node_cap`).")
+        if cap.get("cap") is None:
+            add(f"**Per-node Tier-1 run cap: not established** -- {cap.get('basis')}. "
+                f"`bench/results/tier0_soak.json` carries a null cap, so Tier 1 must refuse to "
+                f"size itself from this run rather than assume one.")
+        else:
+            add(f"**Per-node Tier-1 run cap: {cap['cap']}** concurrent B-runs "
+                f"({cap.get('basis')}); a window of {cap.get('window_s')}s affords "
+                f"{cap.get('forks_affordable_per_window')} forks node-wide. Consumed by "
+                f"`bench/run_tier1.py` from `bench/results/tier0_soak.json` "
+                f"(`recommended_run_cap` / `per_node_run_cap` / `node_cap`).")
         add("")
 
     gate = results.get("gate")
     if gate:
         add("## GATE")
         add("")
-        add(f"Steady-state branch-round critical path (p95): **{gate['critical_path_p95_s']}s** "
-            f"at K={gate['K']}, m={gate['m']}.")
+        critical = gate.get("critical_path_p95_s")
+        add(f"Steady-state round critical path (p95): "
+            f"**{f'{critical}s' if critical is not None else 'not established'}** at "
+            f"K={gate['K']}, m={gate['m']} -- {gate.get('paths_combined')} of branch "
+            f"{gate.get('branch_path_p95_s')}s and parity probe cycle "
+            f"{gate.get('probe_path_p95_s')}s.")
+        add(f"Basis: {gate.get('critical_path_basis')}.")
         add(f"LLM sampling round used for the comparison: {gate['llm_round_s']}s "
             f"({gate['llm_round_basis']}).")
         add("")
+        if gate.get("evidence_gaps"):
+            add(f"Evidence gaps: {'; '.join(str(g) for g in gate['evidence_gaps'])}.")
+            add("")
         add(f"**Verdict: {gate['verdict']}** -- {gate['rationale']}")
         add("")
 
@@ -1381,39 +1758,122 @@ def build_report(state: dict[str, Any], results: dict[str, Any]) -> str:
 
 
 def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    """Does one steady-state branch round fit inside one LLM sampling round?"""
+    """Does one steady-state branch round fit inside one LLM sampling round?
+
+    A round at (K, m) per design v2.4.1 is one snapshot, the parity probe cycle,
+    and the K-1 branch children forked off it.  The probe cycle runs alongside
+    the branch forks (that is exactly how the soak drives them), so the critical
+    path is the *max* of the two paths; ``--probe-serialized`` says the harness
+    runs them back to back and sums them instead.
+
+    The verdict is PASS, FAIL, or INCOMPLETE.  INCOMPLETE is not a soft FAIL: it
+    means the evidence for a decision is missing, and it is the answer whenever a
+    required stage is absent, failed, or measured a different shape than the K
+    being gated.  A gate that reads zeros as "costs nothing" would PASS on an
+    empty run, which is the one outcome that must be impossible here.
+    """
     soak = ok_stage(results, "soak") or {}
     constants = ok_stage(results, "constants") or {}
+    fidelity = ok_stage(results, "fidelity") or {}
     latency = soak.get("latency") or {}
-    branch_round = latency.get("branch_round_s") or {}
-    probe_cycle_stat = (ok_stage(results, "probe") or {}).get("t_probe_cycle_s") or {}
-
     const_stats = constants.get("stats") or {}
-    # Per design v2.4/v2.4.1 a branch round at K,m is: one snapshot, then the
-    # parity probe fork plus K-1 branch forks off it, plus the child deletes.
-    # The soak measures that shape directly (width 3 = K-1 at K=4) and its p95
-    # includes real cross-source contention, so prefer it.
-    critical = branch_round.get("p95")
-    basis = "soak branch_round p95 (snapshot + 3 sequential forks + deletes, under contention)"
-    if not critical:
-        fork = const_stats.get("total_to_healthy_s") or {}
-        snap = const_stats.get("t_snap_s") or {}
-        critical = (snap.get("p95") or 0) + (args.K - 1) * (fork.get("p95") or 0)
-        basis = "constants: t_snap p95 + (K-1) x t_fork_to_healthy p95 (no contention)"
+    soak_width = (soak.get("config") or {}).get("soak_width")
     llm_round = args.llm_round_s
-    verdict = "PASS" if critical <= llm_round else "FAIL"
+    gaps: list[str] = []
+    notes: list[str] = []
+
+    def pick(*stats: Any) -> float | None:
+        for stat in stats:
+            value = stat_value(stat)
+            if value is not None:
+                return value
+        return None
+
+    # --- required evidence ------------------------------------------------
+    if not fidelity:
+        gaps.append("fidelity stage missing or failed: fork exactness is unproven")
+    elif not (fidelity.get("verdict") or {}).get("pass"):
+        failed = (fidelity.get("verdict") or {}).get("failed_checks") or ["unrecorded checks"]
+        gaps.append(f"fidelity FAILED ({', '.join(str(f) for f in failed)})")
+    if not soak:
+        gaps.append("soak stage missing or failed: no steady-state evidence")
+    elif not soak.get("complete", False):
+        reasons = soak.get("incomplete_reasons") or ["stage carries no completeness record"]
+        gaps.append("soak incomplete: " + "; ".join(str(r) for r in reasons))
+    run_cap = results.get("run_cap")
+    if isinstance(run_cap, dict) and run_cap.get("cap") is None:
+        # A node whose sustainable width could not be measured cannot be said to
+        # fit the fan-out, whatever the percentiles look like.
+        gaps.append("no per-node run cap established: " + str(run_cap.get("basis")))
+    provenance = results.get("stage_provenance") or {}
+    for name in provenance.get("unfingerprinted") or []:
+        if name in ("constants", "fidelity", "probe", "soak"):
+            gaps.append(f"stage {name} carries no input fingerprint, so it cannot be shown to "
+                        f"belong with the stages it is combined with; rerun it")
+
+    # --- branch path: snapshot + K-1 sequential branch forks + deletes ----
+    branch_path = pick(latency.get("branch_round_s"))
+    branch_basis = (f"soak branch_round p95 (snapshot + {soak_width} sequential forks + "
+                    f"deletes, under contention)")
+    if branch_path is not None and soak_width != args.K - 1:
+        notes.append(f"soak branch rounds ran at width {soak_width}, not K-1={args.K - 1}, so "
+                     f"their round time is not this K's branch path")
+        branch_path = None
+    if branch_path is None:
+        snap_p95 = pick(const_stats.get("t_snap_s"))
+        fork_p95 = pick(const_stats.get("total_to_healthy_s"))
+        if snap_p95 is not None and fork_p95 is not None:
+            branch_path = snap_p95 + (args.K - 1) * fork_p95
+            branch_basis = (f"constants: t_snap p95 + (K-1={args.K - 1}) x t_fork_to_healthy "
+                            f"p95 (no contention)")
+        else:
+            branch_basis = ""
+            gaps.append(f"no branch-round evidence: no soak at width K-1={args.K - 1} and no "
+                        f"constants t_snap/t_fork_to_healthy percentiles")
+
+    # --- parity probe path: its own snapshot -> fork -> probe -> deletes ---
+    probe_path = pick(latency.get("probe_cycle_s"))
+    probe_basis = "soak probe_cycle p95 (under contention)"
+    if probe_path is None:
+        probe_path = pick((ok_stage(results, "probe") or {}).get("t_probe_cycle_s"))
+        probe_basis = "probe stage t_probe_cycle p95 (no contention)"
+    if probe_path is None:
+        probe_basis = ""
+        gaps.append("no parity probe cycle evidence: neither the soak nor the probe stage "
+                    "completed one, and design v2.4.1 puts it on every round")
+
+    if branch_path is None or probe_path is None:
+        critical: float | None = None
+        basis = "critical path not established: " + "; ".join(gaps)
+    elif args.probe_serialized:
+        critical = branch_path + probe_path
+        basis = (f"serialised: branch {branch_path:.1f}s [{branch_basis}] + parity probe "
+                 f"{probe_path:.1f}s [{probe_basis}]")
+    else:
+        critical = max(branch_path, probe_path)
+        basis = (f"max of the concurrent paths: branch {branch_path:.1f}s [{branch_basis}] vs "
+                 f"parity probe {probe_path:.1f}s [{probe_basis}]")
+
+    if gaps or critical is None:
+        verdict = "INCOMPLETE"
+    else:
+        verdict = "PASS" if critical <= llm_round else "FAIL"
+
     candidates = [
-        ("fork", (latency.get("fork_total_s") or {}).get("p95")
-         or (const_stats.get("fork_total_s") or {}).get("p95") or 0),
-        ("snapshot", (latency.get("snapshot_s") or {}).get("p95")
-         or (const_stats.get("t_snap_s") or {}).get("p95") or 0),
-        ("child_health", (latency.get("health_s") or {}).get("p95")
-         or (const_stats.get("health_s") or {}).get("p95") or 0),
-        ("delete", (latency.get("delete_child_s") or {}).get("p95")
-         or (const_stats.get("t_delete_s") or {}).get("p95") or 0),
+        ("fork", pick(latency.get("fork_total_s"), const_stats.get("fork_total_s"))),
+        ("snapshot", pick(latency.get("snapshot_s"), const_stats.get("t_snap_s"))),
+        ("child_health", pick(latency.get("health_s"), const_stats.get("health_s"))),
+        ("delete", pick(latency.get("delete_child_s"), const_stats.get("t_delete_s"))),
+        ("parity_probe_cycle", probe_path),
     ]
-    binding = max(candidates, key=lambda pair: pair[1])
-    if verdict == "PASS":
+    measured = [(name, value) for name, value in candidates if value is not None]
+    binding = max(measured, key=lambda pair: pair[1]) if measured else ("unmeasured", None)
+    if verdict == "INCOMPLETE":
+        rationale = (
+            "the gate cannot be decided on this evidence: " + "; ".join(gaps)
+            + ". Rerun the named stages -- an undecided gate is INCOMPLETE, never a PASS."
+        )
+    elif verdict == "PASS":
         rationale = (
             f"a branch round hides inside one sampling round with "
             f"{llm_round - critical:.0f}s of slack, so snapshot+forks can be overlapped with "
@@ -1434,27 +1894,106 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
             + f". Report infra-bound with fork serialisation named; raising m to "
               f"{max(1, int(critical / llm_round) + 1)} or dropping K would be the levers."
         )
+    if notes:
+        rationale += " Note: " + "; ".join(notes) + "."
     return {
         "K": args.K,
         "m": args.m,
         "llm_round_s": llm_round,
         "llm_round_basis": args.llm_round_basis,
-        "critical_path_p95_s": round(float(critical), 2),
+        "critical_path_p95_s": round(critical, 2) if critical is not None else None,
         "critical_path_basis": basis,
+        "branch_path_p95_s": round(branch_path, 2) if branch_path is not None else None,
+        "probe_path_p95_s": round(probe_path, 2) if probe_path is not None else None,
+        "paths_combined": "serialised-sum" if args.probe_serialized else "concurrent-max",
+        "soak_width": soak_width,
         "binding_primitive": binding[0],
         "binding_primitive_p95_s": binding[1],
-        "probe_cycle_p95_s": probe_cycle_stat.get("p95"),
+        "probe_cycle_p95_s": probe_path,
+        "evidence_gaps": gaps,
+        "notes": notes,
         "verdict": verdict,
         "rationale": rationale,
+    }
+
+
+#: Every stage, in the order the runner drives them.
+STAGE_NAMES: tuple[str, ...] = ("bake", "constants", "cooldown", "fidelity", "probe", "soak")
+
+
+def stage_inputs(name: str, args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]:
+    """The inputs a stage's numbers are only valid for.
+
+    Stages persist independently and are recombined by the run cap, the gate and
+    the report on later invocations, so each records what it was measured
+    against: the sandbox or snapshot it forked from, the fan-out width K it was
+    shaped for, and the soak width that shape was realised at.
+    """
+    return {
+        "source": state.get("template_snap") if name == "soak" else state.get("bake_sandbox"),
+        "K": args.K,
+        "soak_width": args.soak_width,
+    }
+
+
+def check_stage_provenance(
+    results: dict[str, Any], args: argparse.Namespace, state: dict[str, Any]
+) -> dict[str, Any]:
+    """Refuse to recombine stages that were measured against different inputs.
+
+    Only the keys that actually invalidate a stage are compared: ``source``
+    everywhere (a different bake sandbox or TEMPLATE_SNAP is a different
+    experiment) and ``soak_width`` for the soak.  ``K`` is recorded but not
+    compared -- it is applied at gate time, and the gate already refuses a soak
+    whose width is not K-1.
+    """
+    compared = {name: ("source", "soak_width") if name == "soak" else ("source",)
+                for name in STAGE_NAMES}
+    stale: list[tuple[str, dict[str, tuple[Any, Any]]]] = []
+    unfingerprinted: list[str] = []
+    checked: list[str] = []
+    for name in STAGE_NAMES:
+        if not ok_stage(results, name):
+            continue
+        recorded = (results[name] or {}).get("inputs")
+        if not isinstance(recorded, dict):
+            unfingerprinted.append(name)
+            continue
+        want = stage_inputs(name, args, state)
+        diff = {key: (recorded.get(key), want[key])
+                for key in compared[name] if recorded.get(key) != want[key]}
+        if diff:
+            stale.append((name, diff))
+        else:
+            checked.append(name)
+    if stale:
+        detail = "\n".join(
+            f"  {name}: " + ", ".join(f"{key} was {was!r}, this run has {now!r}"
+                                     for key, (was, now) in diff.items())
+            for name, diff in stale
+        )
+        raise SystemExit(
+            f"stale stage results in {JSON_PATH}: these stages were measured against different "
+            f"inputs than this invocation's, so combining them would mix experiments:\n{detail}\n"
+            f"Rerun the dependents (--stages {','.join(name for name, _ in stale)}) or move "
+            f"{JSON_PATH.name} aside."
+        )
+    if unfingerprinted:
+        log(f"stages without an input fingerprint (rerun to make them gateable): "
+            f"{', '.join(unfingerprinted)}")
+    return {
+        "expected": stage_inputs("constants", args, state),
+        "expected_soak": stage_inputs("soak", args, state),
+        "checked": checked,
+        "unfingerprinted": unfingerprinted,
     }
 
 
 # ----------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stages", default="bake,constants,cooldown,fidelity,probe,soak",
-                        help="comma-separated subset of "
-                             "bake,constants,cooldown,fidelity,probe,soak")
+    parser.add_argument("--stages", default=",".join(STAGE_NAMES),
+                        help=f"comma-separated subset of {','.join(STAGE_NAMES)}")
     parser.add_argument("--image-tar", default="/tmp/flebench-image.zst")
     parser.add_argument("--bake-sandbox", default=None)
     parser.add_argument("--bake-ttl", default="6h")
@@ -1480,6 +2019,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--soak-width", type=int, default=3)
     parser.add_argument("--soak-ttl", default="3h")
     parser.add_argument("--soak-budget-s", type=float, default=3600.0)
+    parser.add_argument("--soak-join-grace-s", type=float, default=0.0,
+                        help="how long past the budget a soak worker may take to finish the "
+                             "round it is in before the stage fails and leaves its sources for "
+                             "the reaper; 0 derives it from --fork-deadline-s")
     parser.add_argument("--fork-deadline-s", type=float, default=900.0,
                         help="wrapper deadline for one fork op; must exceed the queued wait "
                              "under concurrency or the soak measures timeouts, not latency")
@@ -1493,6 +2036,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="one LLM sampling round in seconds, for the gate comparison")
     parser.add_argument("--llm-round-basis", default="design v2 default: 30-120s per LLM step, "
                                                      "upper bound used")
+    parser.add_argument("--probe-serialized", action="store_true",
+                        help="the harness runs the parity probe cycle back-to-back with the "
+                             "branch forks rather than alongside them, so the gate sums the "
+                             "two paths instead of taking their max")
     parser.add_argument("--keep-going", action="store_true",
                         help="continue to the next stage when one raises")
     parser.add_argument("--report-only", action="store_true",
@@ -1526,51 +2073,122 @@ def main(argv: list[str] | None = None) -> int:
         results["state"] = state
         if not args.report_only:
             results["timing_summary"] = fp.timing_summary()
-        JSON_PATH.write_text(json.dumps(results, indent=2, default=str))
+        atomic_write_json(JSON_PATH, results)
 
-    for name in requested:
-        if name not in stages:
-            raise SystemExit(f"unknown stage {name!r}")
-        started = time.monotonic()
+    def reaper_pass(context: str) -> None:
+        """Best-effort reap that never raises and never drops the keep-list."""
+        if args.report_only:
+            return
+        keep = [k for k in (state.get("bake_sandbox"), state.get("template_snap")) if k]
+        log(f"reaper pass ({context}; keeping {keep})")
         try:
-            results[name] = stages[name](fp, args, state)
-            results[name]["stage_wall_s"] = round(time.monotonic() - started, 1)
+            deleted = fp.reaper(keep=keep)
+            results["reaper_deleted"] = deleted
+            residual = fp.reaper(keep=keep, dry_run=True)
+            results["reaper"] = residual
+            log(f"reaper deleted {len(deleted)}; residual {len(residual)}")
         except Exception as exc:
-            log(f"STAGE {name} FAILED: {type(exc).__name__}: {exc}")
-            results[name] = {"error": f"{type(exc).__name__}: {exc}",
-                             "stage_wall_s": round(time.monotonic() - started, 1)}
+            results["reaper_error"] = f"{type(exc).__name__}: {exc}"
+            log(f"reaper pass FAILED: {type(exc).__name__}: {exc}")
+
+    def finalize_soak_artifact(cap: dict[str, Any], *, publish: bool = True) -> None:
+        """Write tier0_soak.json -- or an explicit invalid marker in its place.
+
+        Tier 1 sizes itself from this file, so a rerun whose soak failed must not
+        leave the previous run's numbers sitting on disk looking authoritative.
+        The marker carries no ``latency`` block and a null cap, so a consumer
+        fails closed instead of quietly using stale percentiles; the numbers
+        themselves are kept under ``partial`` and in tier0.json.
+
+        ``publish=False`` is the abnormal-exit path: the soak was never checked
+        against the rest of the run (no provenance check, no cap, no gate), so
+        even a valid-looking stage is not published.  ``--report-only`` republishes
+        it once the run completes.
+        """
+        soak_stage = ok_stage(results, "soak")
+        recorded = results.get("soak")
+        if soak_stage and publish:
+            payload = dict(soak_stage)
+            payload["valid"] = True
+            payload["generated"] = now_iso()
+            payload["recommended_run_cap"] = cap["cap"]
+            payload["per_node_run_cap"] = cap["cap"]
+            payload["node_cap"] = cap["cap"]
+            payload["run_cap_derivation"] = cap
+            payload["fork_op_analysis"] = results.get("fork_op_analysis")
+            atomic_write_json(SOAK_PATH, payload)
+            log(f"wrote {SOAK_PATH} (run cap {cap['cap']})")
+            return
+        if not isinstance(recorded, dict) and "soak" not in requested:
+            return  # this invocation has nothing to say about the soak
+        reason = str(
+            (recorded or {}).get("error")
+            or "the run did not complete, so this soak was never validated against it"
+        )
+        atomic_write_json(SOAK_PATH, {
+            "valid": False,
+            "invalid_reason": reason,
+            "generated": now_iso(),
+            "recommended_run_cap": None,
+            "per_node_run_cap": None,
+            "node_cap": None,
+            "run_cap_derivation": cap,
+            "partial": (recorded or {}).get("partial") or soak_stage or {},
+        })
+        log(f"marked {SOAK_PATH} INVALID: {reason}")
+
+    try:
+        for name in requested:
+            if name not in stages:
+                raise SystemExit(f"unknown stage {name!r}")
+            started = time.monotonic()
+            try:
+                results[name] = stages[name](fp, args, state)
+                results[name]["stage_wall_s"] = round(time.monotonic() - started, 1)
+            except Exception as exc:
+                log(f"STAGE {name} FAILED: {type(exc).__name__}: {exc}")
+                results[name] = {"error": f"{type(exc).__name__}: {exc}",
+                                 "stage_wall_s": round(time.monotonic() - started, 1)}
+                partial = getattr(exc, "partial", None)
+                if isinstance(partial, dict) and partial:
+                    # Evidence beside the error, never instead of it: ok_stage()
+                    # still refuses the stage because "error" is set.
+                    results[name]["partial"] = partial
+                results[name]["inputs"] = stage_inputs(name, args, state)
+                flush()
+                if not args.keep_going:
+                    raise
+            else:
+                results[name]["inputs"] = stage_inputs(name, args, state)
+            save_state(state)
             flush()
-            if not args.keep_going:
-                raise
-        save_state(state)
-        flush()
-        log(f"STAGE {name} done in {results[name]['stage_wall_s']}s")
+            log(f"STAGE {name} done in {results[name]['stage_wall_s']}s")
 
-    soak = ok_stage(results, "soak")
-    cap = recommended_run_cap(soak, args)
-    results["run_cap"] = cap
-    results["recommended_run_cap"] = cap["cap"]
-    results["fork_op_analysis"] = analyze_fork_ops(fp.journal_path.parent)
-    results["gate"] = evaluate_gate(results, args)
+        results["stage_provenance"] = check_stage_provenance(results, args, state)
+        soak = ok_stage(results, "soak")
+        cap = recommended_run_cap(soak, args)
+        results["run_cap"] = cap
+        results["recommended_run_cap"] = cap["cap"]
+        results["fork_op_analysis"] = analyze_fork_ops(fp.journal_path.parent)
+        results["gate"] = evaluate_gate(results, args)
+    except BaseException:
+        # A stage that raised leaves children, snapshots and possibly a stale
+        # soak artifact behind; both are cleaned up before the traceback leaves
+        # main, and neither is allowed to mask the original failure.
+        for step in (
+            lambda: finalize_soak_artifact(
+                recommended_run_cap(ok_stage(results, "soak"), args), publish=False),
+            lambda: reaper_pass("after failure"),
+            flush,
+        ):
+            try:
+                step()
+            except Exception as exc:
+                log(f"cleanup step failed: {type(exc).__name__}: {exc}")
+        raise
 
-    if not args.report_only:
-        keep = [state.get("bake_sandbox"), state.get("template_snap")]
-        log(f"reaper pass (keeping {keep})")
-        deleted = fp.reaper(keep=[k for k in keep if k])
-        results["reaper_deleted"] = deleted
-        residual = fp.reaper(keep=[k for k in keep if k], dry_run=True)
-        results["reaper"] = residual
-        log(f"reaper deleted {len(deleted)}; residual {len(residual)}")
-
-    if soak:
-        soak_payload = dict(soak)
-        soak_payload["recommended_run_cap"] = cap["cap"]
-        soak_payload["per_node_run_cap"] = cap["cap"]
-        soak_payload["node_cap"] = cap["cap"]
-        soak_payload["run_cap_derivation"] = cap
-        soak_payload["fork_op_analysis"] = results["fork_op_analysis"]
-        SOAK_PATH.write_text(json.dumps(soak_payload, indent=2, default=str))
-
+    reaper_pass("end of run")
+    finalize_soak_artifact(cap)
     flush()
     MD_PATH.write_text(build_report(state, results))
     log(f"wrote {JSON_PATH} and {MD_PATH}")

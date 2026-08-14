@@ -73,6 +73,7 @@ import json
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol, Sequence
 
@@ -83,6 +84,7 @@ from bench.common import (
     RunJournal,
     ScoreRecord,
     TimingBuckets,
+    atomic_write_json,
     new_run_id,
     resource_name,
 )
@@ -122,7 +124,8 @@ class FarplaneLike(Protocol):
 
     def create_from_template(self, template: str, ttl: int, vcpu: int | None = ...,
                              mem: int | None = ..., name: str = ...) -> SBLike: ...
-    def create_from_snapshot(self, snap_id: str, ttl: int, name: str = ...) -> SBLike: ...
+    def create_from_snapshot(self, snap_id: str, ttl: int, name: str = ...,
+                             *, deadline: float | None = ...) -> SBLike: ...
     def snapshot(self, sb: SBLike) -> str: ...
     def fork(self, snap_id: str, ttl: int, name: str = ...,
              *, deadline: float | None = ...) -> SBLike: ...
@@ -637,6 +640,14 @@ class BranchOutcome:
     probe: dict[str, Any] | None = None
     rollout_s: float = 0.0
     incidents: list[str] = field(default_factory=list)
+    #: Game tick counter the branch ENDED on, carried into promotion: the
+    #: feedback template reports each step's tick cost as a delta against it,
+    #: and the pre-round main's counter is not this line's.
+    last_ticks: int = 0
+    #: Non-empty -> this branch cannot be RANKED (no P5 baseline, or a sandbox
+    #: holding a substrate call this run could not join). Journaled and
+    #: archived as a diagnostic, never promoted.
+    unscorable: str = ""
 
 
 @dataclass
@@ -697,7 +708,13 @@ class RunResult:
 
 @dataclass
 class Node:
-    """A live sandbox plus its bridge client."""
+    """A live sandbox plus its bridge client.
+
+    ``bridge`` is None for the window between the sandbox EXISTING and its
+    health poll passing: :meth:`Infra._attach` owns the sandbox from creation,
+    so a failed attach cannot leak it, and both teardown and the reaper reach
+    it through ``Infra.live_sandboxes`` before there is anything to talk to.
+    """
 
     sb: Any
     bridge: Any
@@ -743,6 +760,11 @@ class Infra:
         #: thread is still talking to the sandbox -- so they stay here until
         #: :meth:`drain` joins them. See :meth:`ArmRun.terminal_probe`.
         self._inflight: dict[asyncio.Future, dict[str, Any]] = {}
+        #: Sandboxes whose call a bounded drain gave up on. Kept on Infra, not
+        #: on the joining caller: ANY line's drain joins whatever is in flight,
+        #: so the seat that owns the abandoned call is usually not the one that
+        #: learns about it. Reading such a sandbox again is never sound.
+        self.abandoned_nodes: set[str] = set()
         #: Fork calls abandoned on their own deadline. The child may still land
         #: on the control plane, so its source snapshot stays owned (never
         #: deleted by the round or by teardown) and the reaper claims the child
@@ -751,6 +773,22 @@ class Infra:
         self.orphan_sources: set[str] = set()
 
     # -- internals ---------------------------------------------------------
+    def _finished(self, task: "asyncio.Future", rec: dict[str, Any]) -> None:
+        """Done-callback: stamp the instant the worker actually finished.
+
+        A call abandoned at a step deadline is settled later -- by
+        :meth:`drain`, possibly minutes later -- and stamping it THEN charges
+        every second between the deadline and the join to its bucket: a 6s
+        ``/execute`` joined 300s later landed in ``rollout_exec`` as 300s and
+        drowned the whole timing partition. The completion instant belongs to
+        the call, so it is captured here, the moment the future resolves -- with
+        the outcome, because whoever settles the record later may be a drain
+        that never awaited this call at all.
+        """
+        if rec["t1"] is None:
+            rec["t1"] = time.monotonic()
+            rec["cancelled"] = task.cancelled()
+
     def _settle(self, task: "asyncio.Future", rec: dict[str, Any], *,
                 exc: BaseException | None = None, outcome: str = "") -> None:
         """Record one substrate call's interval and journal it, exactly once."""
@@ -758,7 +796,10 @@ class Infra:
             return
         rec["logged"] = True
         self._inflight.pop(task, None)
-        t1 = time.monotonic()
+        # The completion instant :meth:`_finished` captured. Only a call that is
+        # STILL RUNNING settles at "now", and that one is journaled as abandoned
+        # by :meth:`drain` rather than measured.
+        t1 = rec["t1"] if rec["t1"] is not None else time.monotonic()
         self.timings.record(rec["bucket"], rec["t0"], t1, f"{rec['op']}:{rec['target']}")
         self.journal.infra_op(
             op=rec["op"], bucket=rec["bucket"], duration_s=t1 - rec["t0"],
@@ -769,10 +810,15 @@ class Infra:
         )
 
     async def _timed(self, op: str, bucket: str, fn: Callable[[], Any], *,
-                     target: str = "", branch: str = "", **extra: Any) -> Any:
+                     target: str = "", branch: str = "", node_id: str = "",
+                     **extra: Any) -> Any:
         rec = {"op": op, "bucket": bucket, "t0": time.monotonic(), "target": target,
-               "branch": branch, "extra": extra, "logged": False}
+               "branch": branch, "extra": extra, "logged": False, "t1": None,
+               "cancelled": False, "node_id": node_id}
         task = asyncio.ensure_future(asyncio.to_thread(fn))
+        # Attached before anything awaits the task, so the completion time is
+        # captured even for a call nobody is waiting on any more.
+        task.add_done_callback(lambda t, rec=rec: self._finished(t, rec))
         self._inflight[task] = rec
         try:
             # shield: a deadline cancellation must reach US, not the thread --
@@ -781,7 +827,8 @@ class Infra:
             result = await asyncio.shield(task)
         except asyncio.CancelledError:
             if task.done():
-                self._settle(task, rec, exc=task.exception())
+                self._settle(task, rec,
+                             exc=None if rec["cancelled"] else task.exception())
             raise
         except BaseException as exc:  # noqa: BLE001 - journaled then re-raised
             self._settle(task, rec, exc=exc)
@@ -789,7 +836,8 @@ class Infra:
         self._settle(task, rec)
         return result
 
-    async def drain(self, timeout_s: float) -> list[dict[str, Any]]:
+    async def drain(self, timeout_s: float, *,
+                    node_id: str = "") -> list[dict[str, Any]]:
         """Join every substrate call abandoned at a step deadline.
 
         ``asyncio.wait_for`` hands control back at the deadline but the worker
@@ -797,28 +845,37 @@ class Infra:
         Reading that sandbox before the call concludes measures a state that is
         still moving, so every arm drains here before its terminal probe. The
         join is bounded: a wedged call is journaled and the reaper owns it.
+
+        ``node_id`` narrows the join to ONE sandbox's calls, which is what a
+        mid-run step timeout needs: the line that timed out must not touch its
+        node again while a program is still running on it, and waiting on a
+        SIBLING seat's call would serialise the arms that run K lines at once.
         """
-        if not self._inflight:
+        pending = [t for t, rec in self._inflight.items()
+                   if not node_id or rec["node_id"] == node_id]
+        if not pending:
             return []
-        pending = list(self._inflight)
         self.journal.event("drain_start", n=len(pending),
                            ops=[self._inflight[t]["op"] for t in pending],
-                           timeout_s=round(timeout_s, 3))
+                           timeout_s=round(timeout_s, 3), node=node_id)
         done, still = await asyncio.wait(pending, timeout=max(0.0, timeout_s))
         out: list[dict[str, Any]] = []
         for task in done:
             rec = self._inflight.get(task)
             if rec is None:
                 continue
-            exc = None if task.cancelled() else task.exception()
+            exc = None if rec["cancelled"] else task.exception()
             self._settle(task, rec, exc=exc, outcome="settled_after_deadline")
             out.append({"op": rec["op"], "target": rec["target"],
+                        "node_id": rec["node_id"],
                         "outcome": "settled_after_deadline"})
         for task in still:
             rec = self._inflight.pop(task, None)
             if rec is None:
                 continue
             rec["logged"] = True
+            if rec["node_id"]:
+                self.abandoned_nodes.add(rec["node_id"])
             self.journal.infra_op(
                 op=rec["op"], bucket=rec["bucket"],
                 duration_s=time.monotonic() - rec["t0"], outcome="abandoned",
@@ -826,8 +883,9 @@ class Infra:
                 error=f"still running after a {timeout_s:.1f}s drain", **rec["extra"],
             )
             out.append({"op": rec["op"], "target": rec["target"],
-                        "outcome": "abandoned"})
-        self.journal.event("drain_done", settled=len(done), abandoned=len(still))
+                        "node_id": rec["node_id"], "outcome": "abandoned"})
+        self.journal.event("drain_done", settled=len(done), abandoned=len(still),
+                           node=node_id)
         return out
 
     def _name(self, role: str) -> str:
@@ -910,22 +968,56 @@ class Infra:
         self.journal.write("fork_orphan", **rec)
 
     async def _attach(self, sb: Any, role: str) -> Node:
-        base_url = getattr(sb, "base_url", None)
-        if not base_url:
-            base_url = await self._timed(
-                "expose", "infra_expose",
-                lambda: self.fp.expose(sb, self.cfg.expose_port),
-                target=getattr(sb, "name", role),
-            )
-        bridge = self.bridge_factory(base_url)
-        node = Node(sb=sb, bridge=bridge, label=role)
-        await self._timed(
-            "health", "infra_poll",
-            lambda: bridge.wait_healthy(self.cfg.health_deadline_s),
-            target=node.name,
-        )
+        """Expose and health-poll a fresh sandbox, OWNING it from the first line.
+
+        Ownership is taken before anything can fail. An expose or health poll
+        that raised used to leave the sandbox out of ``live_sandboxes``
+        entirely, so neither this run's teardown nor :func:`_live_nodes` could
+        see it and only the lease would ever reclaim it -- a leak that costs a
+        warm slot for the whole TTL.
+        """
+        node = Node(sb=sb, bridge=None, label=role)
         self.live_sandboxes[node.id] = node
+        try:
+            base_url = getattr(sb, "base_url", None)
+            if not base_url:
+                base_url = await self._timed(
+                    "expose", "infra_expose",
+                    lambda: self.fp.expose(sb, self.cfg.expose_port),
+                    target=node.name, node_id=node.id,
+                )
+            node.bridge = self.bridge_factory(base_url)
+            await self._timed(
+                "health", "infra_poll",
+                lambda: node.bridge.wait_healthy(self.cfg.health_deadline_s),
+                target=node.name, node_id=node.id,
+            )
+        except asyncio.CancelledError:
+            # Still OWNED and deliberately not deleted here: the delete would
+            # have to be awaited inside a cancelled scope. Teardown reads
+            # live_sandboxes, and the block reaper claims it by prefix.
+            self.journal.event("attach_abandoned", target=node.name, role=role,
+                               reason="cancelled")
+            raise
+        except BaseException:
+            await self._discard(node)
+            raise
         return node
+
+    async def _discard(self, node: Node) -> None:
+        """Delete a sandbox that never finished attaching (best effort).
+
+        A delete that itself fails leaves the node in ``live_sandboxes`` on
+        purpose, so teardown retries it instead of the lease being the only
+        cleanup left.
+        """
+        try:
+            await self.delete(node)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - journaled; teardown retries
+            self.journal.event("attach_cleanup_failed", target=node.name,
+                               error=f"{type(exc).__name__}: {exc}"[:1000])
 
     async def delete(self, node: Node) -> None:
         await self._timed(
@@ -955,38 +1047,39 @@ class Infra:
     async def execute(self, node: Node, code: str, *, branch: str = "") -> dict:
         return await self._timed(
             "execute", "rollout_exec", lambda: node.bridge.execute(code),
-            target=node.name, branch=branch, code_chars=len(code),
+            target=node.name, branch=branch, node_id=node.id, code_chars=len(code),
         )
 
     async def probe(self, node: Node, entity: str, *, branch: str = "") -> dict:
         return await self._timed(
             "probe", "probe", lambda: node.bridge.probe(entity),
-            target=node.name, branch=branch, entity=entity,
+            target=node.name, branch=branch, node_id=node.id, entity=entity,
         )
 
     async def state_save(self, node: Node, *, branch: str = "") -> str:
         return await self._timed(
             "state_save", "infra_snapshot", lambda: node.bridge.state_save(),
-            target=node.name, branch=branch,
+            target=node.name, branch=branch, node_id=node.id,
         )
 
     async def state_restore(self, node: Node, state: str, *, branch: str = "") -> None:
         await self._timed(
             "state_restore", "infra_fork",
             lambda: node.bridge.state_restore(state),
-            target=node.name, branch=branch, state_chars=len(state),
+            target=node.name, branch=branch, node_id=node.id,
+            state_chars=len(state),
         )
 
     async def meta(self, node: Node, *, branch: str = "") -> dict:
         return await self._timed(
             "meta", "infra_poll", lambda: node.bridge.meta(),
-            target=node.name, branch=branch,
+            target=node.name, branch=branch, node_id=node.id,
         )
 
     async def system_prompt(self, node: Node) -> str:
         return await self._timed(
             "system_prompt", "infra_poll", lambda: node.bridge.system_prompt(),
-            target=node.name,
+            target=node.name, node_id=node.id,
         )
 
 
@@ -1009,6 +1102,10 @@ class Trajectory:
     last_ticks: int = 0
     curve: Curve = field(default_factory=Curve)
     terminal_probe: dict[str, Any] | None = None
+    #: Non-empty -> this line's sandbox was left holding a substrate call this
+    #: run could not join, so the line is PARTIAL: it stops stepping and is
+    #: never probed again (see :meth:`ArmRun.settle_node`).
+    partial: str = ""
 
 
 class ArmRun:
@@ -1040,6 +1137,9 @@ class ArmRun:
         #: Sandboxes already probed at least once: the first probe on a fresh
         #: microVM pays the cold-page tax, which v2.6 measures and reports.
         self._probed_nodes: set[str] = set()
+        #: Sandboxes holding a substrate call this run could not join. Nothing
+        #: steps, probes or re-seeds on them again (:meth:`settle_node`).
+        self.quarantined: set[str] = set()
         #: The lines this run finished on, published by :func:`_finish` so a
         #: caller (the dry validator) can assert promotion invariants on the
         #: exact conversation that produced the endpoint.
@@ -1059,6 +1159,43 @@ class ArmRun:
         one step that was already in flight when the budget ran out.
         """
         return max(0.0, min(self.cfg.step_timeout_s, self.budget.remaining_s()))
+
+    async def settle_node(self, traj: Trajectory, *, reason: str) -> bool:
+        """Join whatever is still running on this line's sandbox; True if clean.
+
+        ``asyncio.wait_for`` cancels the awaiting coroutine, not the worker
+        thread under :meth:`Infra._timed`'s shield: a step abandoned at its
+        deadline is STILL executing its program against the sandbox. Touching
+        that node again -- another step, the boundary probe -- reads and mutates
+        a state that is still moving, so the join happens here, bounded by the
+        step cap (the same bound the terminal drain trusts).
+
+        A call that outlives the join quarantines the sandbox and marks the line
+        PARTIAL: it stops stepping and is never measured, because there is no
+        honest way to measure a factory something else is still building.
+        """
+        drained = await self.infra.drain(self.cfg.step_timeout_s,
+                                        node_id=traj.node.id)
+        stuck = [d for d in drained if d["outcome"] == "abandoned"]
+        if not stuck and traj.node.id not in self.infra.abandoned_nodes:
+            return True
+        detail = (
+            f"{reason}: "
+            + (", ".join(f"{d['op']} on {d['target']}" for d in stuck)
+               or f"an earlier call on {traj.node.name}")
+            + f" outlived a {self.cfg.step_timeout_s:.0f}s join; line "
+            f"{traj.tid} is partial and stops here"
+        )
+        self.quarantine(traj.node, detail, branch=traj.tid)
+        traj.partial = detail
+        return False
+
+    def quarantine(self, node: Node, detail: str, *, branch: str = "") -> None:
+        """Retire a sandbox this run can no longer account for."""
+        if node.id in self.quarantined:
+            return
+        self.quarantined.add(node.id)
+        self.incident("node_quarantined", detail, target=node.name, branch=branch)
 
     def hints_for(self, n: int, *, offset: int = 0) -> list[str] | None:
         """The n per-seat strategy hints, or None when hinting is off.
@@ -1176,8 +1313,16 @@ class ArmRun:
             "ticks": ticks,
         }
 
-    async def read_baseline(self, node: Node, branch: str) -> tuple[float, float]:
-        """P5 baseline immediately after fork/restore (cumulative counters)."""
+    async def read_baseline(self, node: Node, branch: str) -> dict[str, Any] | None:
+        """P5 baseline immediately after fork/restore (cumulative counters).
+
+        ``None`` when the counters could not be read. A fabricated ``(0.0,
+        0.0)`` is worse than no baseline at all: every score in this module is a
+        DELTA from it, so a branch that failed its baseline read would be
+        credited with the entire cumulative score of the checkpoint it
+        inherited and would beat every sibling whose baseline did land. The
+        caller marks such a branch unscorable instead of ranking it.
+        """
         try:
             res = await self.infra.execute(node, BASELINE_CODE, branch=branch)
         except asyncio.CancelledError:
@@ -1185,11 +1330,26 @@ class ArmRun:
         except BaseException as exc:  # noqa: BLE001
             self.incident("baseline_read_failed", f"{type(exc).__name__}: {exc}",
                           branch=branch)
-            return 0.0, 0.0
-        return (
-            float(res.get("production_score", 0.0) or 0.0),
-            float(res.get("automated_score", 0.0) or 0.0),
-        )
+            return None
+        if res.get("error"):
+            # The bridge answered, but the program that reads the counters did
+            # not run: the numbers in this response are whatever the sandbox
+            # last held, not a measured baseline.
+            self.incident(
+                "baseline_read_failed",
+                f"/execute reported an error: {str(res.get('result', ''))[:400]}",
+                branch=branch,
+            )
+            return None
+        return {
+            "production": float(res.get("production_score", 0.0) or 0.0),
+            "automated": float(res.get("automated_score", 0.0) or 0.0),
+            # The tick counter the branch INHERITED (a fork keeps its source's,
+            # C's restore resets it). The feedback template charges each step's
+            # tick cost against it, so a branch left at 0 reports its first
+            # step as having burned the whole history.
+            "ticks": int(res.get("ticks", 0) or 0),
+        }
 
     # -- parity probe (v2.6: DIRECT, zero measurement forks) ---------------
     async def probe_line(
@@ -1212,6 +1372,17 @@ class ArmRun:
         tax is part of B's treatment (v2.6 point 3), so it is measured rather
         than amortised away.
         """
+        if node.id in self.quarantined:
+            # Fail closed: a sandbox holding a substrate call this run could not
+            # join is still being mutated by it, so anything measured here is a
+            # reading off a moving target, not a probe.
+            self.incident(
+                "probe_skipped_unsettled",
+                f"{node.name} holds a substrate call this run could not join; "
+                "no probe of that sandbox can be honest",
+                branch=branch, step=step,
+            )
+            return None
         self._probe_seq += 1
         cold = node.id not in self._probed_nodes
         self._probed_nodes.add(node.id)
@@ -1242,7 +1413,8 @@ class ArmRun:
             "cold": cold,
             **extras,
         }
-        if extras.get("timed_out"):
+        timed_out = bool(extras.get("timed_out"))
+        if timed_out:
             self.incident("probe_window_timed_out",
                           f"probe window did not complete: {extras}", branch=branch,
                           step=step)
@@ -1250,8 +1422,13 @@ class ArmRun:
             entity=self.entity, throughput=out["throughput"], wall_s=out["wall_s"],
             start_tick=out["start_tick"], end_tick=out["end_tick"], branch=branch,
             step=step, kind=kind, sandbox=node.name, mode="direct", cold=cold,
-            client_wall_s=client_wall_s, **extras,
+            client_wall_s=client_wall_s, valid=not timed_out, **extras,
         )
+        if timed_out:
+            # Journaled raw above, with its incident, and returned to NOBODY: a
+            # window that never closed is a partial count over an unknown span,
+            # and every caller treats what it gets back as a measurement.
+            return None
         return out
 
     def probe_block(self, probe: dict[str, Any]) -> str:
@@ -1324,6 +1501,10 @@ class ArmRun:
             # the out-of-window accounting. Failures are journaled per node and
             # never block the deletes below.
             for i, node in enumerate(list(nodes)):
+                if node.bridge is None:
+                    # Owned but never attached (expose or the health poll
+                    # failed): there is no bridge to save state through.
+                    continue
                 try:
                     state = await asyncio.to_thread(node.bridge.state_save)
                     self._dump_state(f"final-{i:02d}-{node.label}", state)
@@ -1362,7 +1543,9 @@ class ArmRun:
         A step abandoned on the T deadline leaves its ``/execute`` running in a
         worker thread; probing before it returns would measure a factory that is
         still being built. The join is bounded by the step cap so a wedged call
-        cannot hold the endpoint hostage -- it is journaled as ``abandoned``.
+        cannot hold the endpoint hostage -- and when the join does time out, the
+        sandbox is quarantined and this line gets NO endpoint, because the only
+        alternative is publishing a number read off a moving factory.
         """
         drained = await self.infra.drain(self.cfg.step_timeout_s)
         for item in drained:
@@ -1370,9 +1553,17 @@ class ArmRun:
                 self.incident(
                     "drain_timeout",
                     f"{item['op']} on {item['target']} was still running after a "
-                    f"{self.cfg.step_timeout_s:.0f}s join; the endpoint may race it",
+                    f"{self.cfg.step_timeout_s:.0f}s join",
                     branch=traj.tid,
                 )
+        # Any line's drain may have been the one to give up on THIS line's call
+        # (the join is global), so the verdict is read off Infra's ledger.
+        if traj.node.id in self.infra.abandoned_nodes:
+            detail = (f"{traj.node.name} holds a substrate call abandoned after a "
+                      f"{self.cfg.step_timeout_s:.0f}s join; this line has no "
+                      "honest endpoint")
+            self.quarantine(traj.node, detail, branch=traj.tid)
+            traj.partial = detail
         probe = await self.probe_line(
             traj.node, branch=traj.tid, step=traj.step, kind="terminal"
         )
@@ -1459,6 +1650,11 @@ async def _sequential_loop(
                          f"(cap {cfg.step_timeout_s:.0f}s, clipped to T"
                          f"{'/leg' if until_s is not None else ''})",
                          branch=traj.tid)
+            # wait_for cancelled the awaiting coroutine, NOT the worker thread:
+            # the program is still running against this sandbox. Join it before
+            # the next step or the boundary probe touches the same node.
+            if not await run.settle_node(traj, reason=f"step {traj.step} timeout"):
+                return
         except BudgetExhausted:
             break
         if traj.step % cfg.m == 0:
@@ -1712,6 +1908,8 @@ class BranchingRun(ArmRun):
                     await self.infra.state_restore(node, state, branch=branch)
                     ok = True
                     break
+                except asyncio.CancelledError:
+                    raise  # the deadline, not a restore failure: never retried
                 except BaseException as exc:  # noqa: BLE001
                     self.incident(
                         "child_restore_failed",
@@ -1752,6 +1950,8 @@ class BranchingRun(ArmRun):
                         f"{child_meta.get('entity_count')}",
                         branch=branch,
                     )
+            except asyncio.CancelledError:
+                raise  # the deadline: the round is over, not merely unlogged
             except BaseException as exc:  # noqa: BLE001
                 self.incident("fidelity_check_failed", f"{type(exc).__name__}: {exc}",
                               branch=branch)
@@ -1774,11 +1974,23 @@ class BranchingRun(ArmRun):
         conv = prefix.branch()
         traj = Trajectory(tid=bid, node=node, conv=conv, step=base_step)
         t0 = time.monotonic()
-        baseline_prod, baseline_auto = await self.read_baseline(node, bid)
-        traj.last_production = baseline_prod
-        traj.last_automated = baseline_auto
+        baseline = await self.read_baseline(node, bid)
+        unscorable = ""
+        if baseline is None:
+            # No P5 zero, so no delta from it means anything. The branch still
+            # runs (its steps are real work, its transcript is archived) but it
+            # is out of the ranking -- see :meth:`branch_round`.
+            unscorable = (
+                f"branch {bid} has no P5 baseline: the cumulative counters could "
+                "not be read after materialisation"
+            )
+            self.incident("branch_unscorable", unscorable, branch=bid)
+        traj.last_production = baseline["production"] if baseline else 0.0
+        traj.last_automated = baseline["automated"] if baseline else 0.0
+        traj.last_ticks = baseline["ticks"] if baseline else 0
         score = ScoreRecord(
-            baseline_production=baseline_prod, baseline_automated=baseline_auto
+            baseline_production=traj.last_production,
+            baseline_automated=traj.last_automated,
         )
         # T is hard here too: the round-level estimate keeps a round from
         # STARTING past the deadline, and this keeps the seat that is already
@@ -1807,8 +2019,11 @@ class BranchingRun(ArmRun):
                 self.incident("step_timeout",
                               f"branch {bid} candidate step {traj.step} exceeded "
                               f"{deadline_s:.1f}s", branch=bid)
+                # The candidate is still executing on this branch's sandbox:
+                # join it before another step or the branch probe reads it.
+                await self.settle_node(traj, reason=f"branch {bid} candidate step")
         for _ in range(cfg.m - 1):
-            if self.budget.expired():
+            if traj.partial or self.budget.expired():
                 break
             deadline_s = self.step_deadline_s()
             try:
@@ -1821,10 +2036,14 @@ class BranchingRun(ArmRun):
                 self.incident("step_timeout",
                               f"branch {bid} step {traj.step} exceeded "
                               f"{deadline_s:.1f}s", branch=bid)
+                if not await self.settle_node(traj, reason=f"branch {bid} step"):
+                    break
         # P5: endpoint captured right after the m-th program, BEFORE any probe.
         score.endpoint_production = traj.last_production
         score.endpoint_automated = traj.last_automated
         rollout_s = time.monotonic() - t0
+        # None for a quarantined sandbox, which is what keeps a branch whose
+        # program never concluded out of the selection below.
         probe = await self.probe_line(node, branch=bid, step=traj.step, kind="branch")
         if probe is not None:
             score.probe_throughput = probe["throughput"]
@@ -1833,7 +2052,8 @@ class BranchingRun(ArmRun):
         return BranchOutcome(
             branch=bid, conv=conv, node=node, score=score, steps=traj.step - base_step,
             candidate_chars=len(candidate.code or ""), errors=traj.errors,
-            probe=probe, rollout_s=rollout_s,
+            probe=probe, rollout_s=rollout_s, last_ticks=traj.last_ticks,
+            unscorable=unscorable or traj.partial,
         )
 
     # -- the round ---------------------------------------------------------
@@ -1884,6 +2104,10 @@ class BranchingRun(ArmRun):
             sample_task, infra_task, return_exceptions=True
         )
         if isinstance(sampled, BaseException):
+            # Nothing executed, so the canonical line gets its consumed turn
+            # back: the caller falls back to a sequential step, and without
+            # this the last program's feedback is silently dropped.
+            main.conv.pending_feedback = user_content
             if not isinstance(materialized, BaseException):
                 await self.release(materialized[0], keep=None)
             raise sampled
@@ -1923,6 +2147,13 @@ class BranchingRun(ArmRun):
                 branch=f"r{round_idx}",
             )
         usable = min(len(branch_nodes), len(candidates))
+        if usable < 1:
+            # Pre-execution too: hand the turn back before failing the round.
+            main.conv.pending_feedback = user_content
+            raise RuntimeError(
+                f"round {round_idx}: {len(candidates)} candidate(s) for "
+                f"{len(branch_nodes)} node(s); nothing to roll out"
+            )
         base_step = main.step
         outcomes = await asyncio.gather(
             *(
@@ -1944,14 +2175,26 @@ class BranchingRun(ArmRun):
                 good.append(out)
         if not good:
             raise RuntimeError(f"round {round_idx}: every branch failed")
+        # Ranking is over branches that CAN be ranked: no P5 baseline, or a
+        # sandbox left with a call this run could not join, means the numbers
+        # are not comparable with their siblings'. Excluded branches stay in
+        # the journal, and their transcripts are archived, as diagnostics.
+        scorable = [o for o in good if not o.unscorable]
+        excluded = {o.branch: o.unscorable for o in good if o.unscorable}
+        if not scorable:
+            raise RuntimeError(
+                f"round {round_idx}: none of the {len(good)} surviving branch(es) "
+                f"is scorable ({'; '.join(excluded.values())})"
+            )
 
-        winner = max(good, key=lambda o: o.score.rank_key())
+        winner = max(scorable, key=lambda o: o.score.rank_key())
         losers = [o for o in good if o is not winner]
         self.journal.write(
             "branch_selection",
             round=round_idx,
             winner=winner.branch,
-            k_effective=len(good),
+            k_effective=len(scorable),
+            excluded=excluded,
             scores={
                 o.branch: {
                     **o.score.to_dict(),
@@ -1983,7 +2226,9 @@ class BranchingRun(ArmRun):
             errors=main.errors + winner.errors,
             last_production=winner.score.endpoint_production,
             last_automated=winner.score.endpoint_automated,
-            last_ticks=main.last_ticks,
+            # The winner's OWN tick counter, not the pre-round main's: the
+            # promoted line continues from the state the winner ended in.
+            last_ticks=winner.last_ticks,
             curve=main.curve,
         )
         # SECONDARY curve: every branch probe of this round, winner and losers.
@@ -1997,9 +2242,10 @@ class BranchingRun(ArmRun):
                     "kind": "branch",
                 }
             )
-        await self.release(
-            [o.node for o in losers], keep=winner.node, main_before=main.node
-        )
+        # Every node this round MATERIALIZED goes back except the winner's --
+        # including the nodes of branches that raised, which used to hold a
+        # warm slot until teardown, and the pre-round main when a child won.
+        await self.release(branch_nodes, keep=winner.node, main_before=main.node)
         return new_main
 
     # -- arm-specific hooks ------------------------------------------------
@@ -2074,6 +2320,11 @@ class RestoreBranchingRun(BranchingRun):
             if node is None or node.id == keep_id or node.id in seen:
                 continue
             seen.add(node.id)
+            if node.id in self.quarantined:
+                # Never restored onto again: a sandbox holding a call this run
+                # could not join has an unknown state, and the pool is the
+                # fixture every C branch is supposed to start from cleanly.
+                continue
             pool.append(node)
         self.pool = pool
 
@@ -2128,6 +2379,8 @@ async def _branching_loop(run: BranchingRun, main: Trajectory) -> Trajectory:
                          branch=f"r{round_idx}")
             await _sequential_loop(run, main, hint_at_branch=None)
             break
+        except asyncio.CancelledError:
+            raise  # the run is being torn down; a fallback step would race it
         except BaseException as exc:  # noqa: BLE001 - round failure is survivable
             run.incident("round_failed", f"{type(exc).__name__}: {exc}",
                          branch=f"r{round_idx}")
@@ -2139,6 +2392,8 @@ async def _branching_loop(run: BranchingRun, main: Trajectory) -> Trajectory:
                     run.agent_step(main, tag="@fallback"),
                     timeout=run.step_deadline_s(),
                 )
+            except asyncio.CancelledError:
+                raise  # the T deadline, not a fallback-step failure
             except BaseException as exc2:  # noqa: BLE001
                 run.incident("fallback_step_failed", f"{type(exc2).__name__}: {exc2}")
                 break
@@ -2250,6 +2505,8 @@ async def run_arm_b_once(run: BranchingRun) -> RunResult:
                 raise  # the quota is gone; nothing left to converge onto
             except RoundAborted as exc:
                 run.incident("convergence_stopped_mid_wave", str(exc), branch="r1")
+            except asyncio.CancelledError:
+                raise  # torn down mid-convergence, not a survivable round failure
             except BaseException as exc:  # noqa: BLE001 - survivable, journaled
                 run.incident("round_failed", f"{type(exc).__name__}: {exc}",
                              branch="r1")
@@ -2371,6 +2628,15 @@ async def _hybrid_select(
                 f"{item['op']} on {item['target']} was still running after a "
                 f"{run.cfg.step_timeout_s:.0f}s join; the selection may race it",
             )
+    for traj in trajs:
+        # A seat whose call could not be joined is out of the running: its state
+        # is still moving, so neither its selection probe nor its sandbox (which
+        # leg 2 would descend from) can be trusted.
+        if traj.node.id in run.infra.abandoned_nodes:
+            detail = (f"{traj.node.name} holds a substrate call abandoned after a "
+                      f"{run.cfg.step_timeout_s:.0f}s join")
+            run.quarantine(traj.node, detail, branch=traj.tid)
+            traj.partial = detail
     probes = await asyncio.gather(
         *(
             run.probe_line(t.node, branch=t.tid, step=t.step, kind="selection")
@@ -2398,7 +2664,17 @@ async def _hybrid_select(
                            throughput=probe["throughput"], branch=traj.tid,
                            kind="selection")
         scored.append((traj, score, probe))
-    winner, winner_score, winner_probe = max(scored, key=lambda s: s[1].rank_key())
+    # Quarantined seats are journaled with the rest (that record IS the leg-1
+    # distribution) but must never be promoted: leg 2 would run on a sandbox
+    # this run cannot account for.
+    eligible = [s for s in scored if not s[0].partial]
+    if not eligible:
+        raise RuntimeError(
+            "Exp-3 selection: every leg-1 seat was left with a substrate call "
+            f"this run could not join ({len(scored)} seat(s)); there is no "
+            "state leg 2 could honestly descend from"
+        )
+    winner, winner_score, winner_probe = max(eligible, key=lambda s: s[1].rank_key())
     record = {
         "round": 1,
         "phase": 1,
@@ -2875,20 +3151,34 @@ def _finish(run: ArmRun, result: RunResult, trajs: Sequence[Trajectory], *,
     """Endpoint, curve and totals. ONE endpoint rule for every arm: the max
     terminal probe over the lines handed in.
 
+    The endpoint is only an ENDPOINT when every line was measured. A max over a
+    subset is a max over the seats that happened to survive, which reads high
+    exactly when a run went wrong, so partial coverage is reported as
+    ``status='partial'`` with the unmeasured seats named in ``error``; the
+    subset itself is kept as a diagnostic rather than thrown away.
+
     ``steps``/``steps_per_trajectory`` override the naive per-trajectory sum,
     which Exp 3's Hybrid needs: its leg-2 seats carry the winner's step counter
     (lineage continuity in the journal), so summing them raw would count the
     winner's leg-1 steps K times.
     """
     probed = [(t, t.terminal_probe) for t in trajs if t.terminal_probe]
+    unmeasured = [t.tid for t in trajs if not t.terminal_probe]
     run.trajectories = list(trajs)
     if probed:
         best_traj, best_probe = max(probed, key=lambda p: p[1]["throughput"])
         result.endpoint_throughput = best_probe["throughput"]
         result.endpoint_source = best_traj.tid
-    else:
+    if not probed:
         result.status = "partial"
         result.error = result.error or "no terminal probe"
+    elif unmeasured:
+        result.status = "partial"
+        result.error = result.error or (
+            f"partial seat coverage: {len(probed)} of {len(trajs)} line(s) "
+            f"measured at T; unmeasured "
+            f"({len(unmeasured)}): {', '.join(unmeasured)}"
+        )
     result.steps = sum(t.step for t in trajs) if steps is None else int(steps)
     result.steps_per_trajectory = (
         [t.step for t in trajs] if steps_per_trajectory is None
@@ -3435,7 +3725,12 @@ class LoopbackFarplane:
         self.ops.append("create_from_template")
         return self._sb(name)
 
-    def create_from_snapshot(self, snap_id: str, ttl: int, name: str = "") -> FakeSB:
+    def create_from_snapshot(self, snap_id: str, ttl: int, name: str = "", *,
+                             deadline: float | None = None) -> FakeSB:
+        # ``deadline`` is accepted and ignored: Infra always passes the create
+        # poll budget, and a loopback create is instantaneous, so there is
+        # nothing to bound -- but refusing the keyword made --live-url a
+        # TypeError before the first step.
         self.ops.append("create_from_snapshot")
         return self._sb(name)
 
@@ -3478,7 +3773,10 @@ async def live_smoke(
     from bench.bridge_client import Bridge
 
     os.makedirs(journal_dir, exist_ok=True)
-    run_id = f"live-{model.replace('/', '-')}-{task}"
+    # Unique per invocation: two smokes of the same model and task must not
+    # append into one journal, nor overwrite each other's results file.
+    run_id = (f"live-{model.replace('/', '-')}-{task}-"
+              f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:6]}")
     journal = RunJournal(os.path.join(journal_dir, f"{run_id}.jsonl"), run_id=run_id,
                          meta={"mode": "live_smoke", "base_url": base_url})
     cfg = ArmConfig(arm="A", model=model, task_key=task, T_s=1e9, K=1, m=steps,
@@ -3522,7 +3820,15 @@ async def live_smoke(
         out["incidents"] = run.incidents
         out["conversation_messages"] = len(traj.conv.messages)
         out["pending_feedback_chars"] = len(traj.conv.pending_feedback or "")
-        out["ok"] = bool(out["steps"]) and probe is not None
+        # Fail closed: every requested step must have run, none of them may
+        # carry the error flag (a parse failure or a bridge error is not a
+        # smoke pass), and the probe must be a real measurement -- None means
+        # it failed or its window never closed.
+        out["ok"] = (
+            len(out["steps"]) == steps
+            and not any(s.get("error") for s in out["steps"])
+            and probe is not None
+        )
     finally:
         await llm.aclose()
         journal.close()
@@ -5533,9 +5839,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = asyncio.run(dry_run())
         payload = json.dumps(report, indent=2)
         if args.out:
-            os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-            with open(args.out, "w", encoding="utf-8") as fh:
-                fh.write(payload)
+            atomic_write_json(args.out, report)
         print(payload)
         sizing = report["exp2_sizing"]
         hard, once = report["B-hardT"], report["Bonce"]
@@ -5692,9 +5996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         payload = json.dumps(report, indent=2)
         out = args.out or "bench/results/live_smoke.json"
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        with open(out, "w", encoding="utf-8") as fh:
-            fh.write(payload)
+        atomic_write_json(out, report)
         print(payload)
         return 0 if report.get("ok") else 1
     cfg = ArmConfig(arm=args.arm, model=args.model, task_key=args.task,
@@ -5703,9 +6005,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = asyncio.run(run_one(cfg))
     payload = json.dumps(result.to_dict(), indent=2)
     out = args.out or os.path.join(cfg.results_dir, f"{cfg.run_id}.json")
-    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    with open(out, "w", encoding="utf-8") as fh:
-        fh.write(payload)
+    atomic_write_json(out, result.to_dict())
     print(payload)
     return 0
 

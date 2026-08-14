@@ -3,8 +3,10 @@
 Design v2.5 declares the routing deviation this module implements: Kimi models
 go through the direct Kimi API (``KIMI_BASE_URL``, models ``k3`` and
 ``kimi-for-coding``), OpenAI goes through the repo's Codex subscription
-provider. No OpenRouter, therefore no middle-out transform for any model --
-uniform across the matrix, and logged in :data:`ROUTING_NOTES`.
+provider. That default matrix uses no aggregator, so no middle-out transform
+touches any of its models. ``openrouter/*`` models are an opt-in extra and get
+middle-out disabled by an explicit per-request opt-out instead; each route
+reports its own note (:func:`routing_notes`).
 
 Two measured provider constraints shape the API here (verified against the
 live endpoints, not assumed):
@@ -60,11 +62,34 @@ CLAUDE_CODE_SYSTEM_PROMPT = (
 ROUTING_NOTES = {
     "middle_out": False,
     "note": (
-        "v2.5: Kimi via direct Kimi API, OpenAI via Codex subscription. No "
-        "OpenRouter, so no middle-out context transform for ANY model; "
-        "context-overflow behaviour is a per-model property reported with results."
+        "v2.5 default matrix: Kimi via direct Kimi API, OpenAI via Codex "
+        "subscription. No aggregator on this route, so no middle-out context "
+        "transform for ANY of these models; context-overflow behaviour is a "
+        "per-model property reported with results."
     ),
 }
+
+#: ``openrouter/*`` models do NOT route like the default matrix, so they never
+#: report :data:`ROUTING_NOTES` -- its "no aggregator" claim would be false in
+#: their own result artifact. Middle-out is still off, but by an explicit
+#: per-request opt-out (``transforms: []``) instead of by construction.
+OPENROUTER_ROUTING_NOTES = {
+    "middle_out": False,
+    "note": (
+        "OpenRouter (metered aggregator): middle-out compression disabled "
+        "explicitly with transforms=[] on every request; routing constrained "
+        "by OPENROUTER_QUANTIZATIONS (exactly one value) and/or "
+        "OPENROUTER_PROVIDER; the serving upstream is journaled per call."
+    ),
+}
+
+
+def routing_notes(provider: str) -> dict[str, Any]:
+    """Routing metadata for the provider a model actually RESOLVES to."""
+    if provider == "openrouter":
+        return OPENROUTER_ROUTING_NOTES
+    return ROUTING_NOTES
+
 
 #: Per-branch diversification knob (design DIVERSITY GATE). Injected as an
 #: extra user turn so it is visible in the journal and never a hidden decoding
@@ -171,8 +196,9 @@ def _openrouter_spec(key: str) -> ModelSpec:
         # a spike from truncating to an empty answer.
         max_tokens=32768,
         notes=(
-            "OpenRouter (metered). No transforms sent (no middle-out); "
-            "routing constrained via OPENROUTER_QUANTIZATIONS (filter, "
+            "OpenRouter (metered). Middle-out disabled explicitly "
+            "(transforms=[] per request); "
+            "routing constrained via OPENROUTER_QUANTIZATIONS (one value, "
             "fallbacks on) and/or OPENROUTER_PROVIDER (preference order; "
             "strict pin when no quantization filter); anthropic/* models get "
             "an explicit cache_control breakpoint on the system turn; the "
@@ -243,6 +269,18 @@ class Sample:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
+    def billed_usage(self) -> BilledUsage:
+        """Usage in the shape the journal and the retry accounting want."""
+        return BilledUsage(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            reasoning_tokens=self.reasoning_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            upstream=self.upstream,
+            finish_reason=self.finish_reason,
+        )
+
 
 _PARSER: Any = None
 
@@ -286,6 +324,34 @@ _COMMENT_RE = re.compile(r"(?m)#.*$")
 _DOCSTRING_RE = re.compile(r'("""|\'\'\')(?:.|\n)*?\1')
 
 
+class _DocstringStripper(ast.NodeTransformer):
+    """Strip documentation from EVERY docstring-bearing node.
+
+    Only module-level prose used to be dropped, so two programs differing
+    solely in the docstrings of their functions or classes counted as two
+    distinct branches -- exactly the cosmetic difference the diversity gate
+    must not credit. Module docstrings fall out of the same ``visit_Expr``.
+    """
+
+    def visit_Expr(self, node: ast.Expr) -> Any:
+        if isinstance(node.value, ast.Constant) and isinstance(
+            node.value.value, str
+        ):
+            return None  # docstring or bare prose: documentation, not behaviour
+        return self.generic_visit(node)
+
+    def _strip(self, node: Any) -> Any:
+        self.generic_visit(node)
+        if not node.body:
+            # A docstring-only body IS a ``pass`` body; canonicalize both ways.
+            node.body = [ast.Pass()]
+        return node
+
+    visit_FunctionDef = _strip
+    visit_AsyncFunctionDef = _strip
+    visit_ClassDef = _strip
+
+
 def normalize_program(code: str) -> str:
     """Canonical form for comparing two candidate programs.
 
@@ -302,14 +368,8 @@ def normalize_program(code: str) -> str:
         stripped = _DOCSTRING_RE.sub("", code)
         stripped = _COMMENT_RE.sub("", stripped)
         return " ".join(stripped.split())
-    # Bare string statements are documentation, not behaviour.
-    tree.body = [
-        node for node in tree.body
-        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str))
-    ]
     try:
-        return ast.dump(tree, annotate_fields=False)
+        return ast.dump(_DocstringStripper().visit(tree), annotate_fields=False)
     except (ValueError, RecursionError):
         return " ".join(code.split())
 
@@ -346,8 +406,46 @@ class RetryPolicy:
         return raw * (1.0 + random.uniform(-self.jitter, self.jitter))
 
 
+@dataclass(frozen=True)
+class BilledUsage:
+    """Tokens a provider charged for an attempt that returned nothing usable.
+
+    Travels with the exception so the retry wrapper can account for the attempt
+    before it throws the response away.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    upstream: str = ""
+    finish_reason: str = ""
+
+
 class EmptyCompletion(RuntimeError):
-    """The provider answered 200 with no content (typically truncated reasoning)."""
+    """The provider answered 200 with no content (typically truncated reasoning).
+
+    The attempt was BILLED: the prompt was processed and the completion budget
+    was usually spent in full on reasoning. ``billed`` carries that usage so a
+    retry never silently deletes it from the run's token totals (~11% of k3
+    calls come back empty).
+    """
+
+    def __init__(self, message: str, billed: BilledUsage | None = None) -> None:
+        super().__init__(message)
+        self.billed = billed or BilledUsage()
+
+
+class CodexStreamError(RuntimeError):
+    """The Codex SSE stream broke, errored mid-flight or never terminated.
+
+    Retryable by classification (:data:`_RETRYABLE_NAMES`): the stream only
+    exists once the request passed validation, so a failure here is transport
+    or stream-integrity noise -- the same class as an empty-200, not a bad
+    request. A bare RuntimeError made every one of them terminal, which then
+    fed the provider tripwire noise it is explicitly not supposed to count.
+    """
 
 
 _RETRYABLE_NAMES = frozenset(
@@ -365,6 +463,7 @@ _RETRYABLE_NAMES = frozenset(
         "IncompleteRead",
         "OpenAIResponseError",
         "EmptyCompletion",
+        "CodexStreamError",
     }
 )
 
@@ -422,15 +521,17 @@ def provider_of(model: str) -> str:
 
     Total by construction: the tripwire keys provider health on this, and a model
     that mapped to something the orchestrator does not recognise would leave its
-    siblings running against a dead quota.
+    siblings running against a dead quota. Every alias :func:`resolve_model`
+    accepts (``codex:``, ``claude:``, ``or/``) MUST land on the same canonical
+    provider here, or one seat's health would be filed under ``or`` while its
+    sibling's goes to ``openrouter``.
     """
-    if model.startswith(("codex/", "codex:")):
-        return "codex"
-    if model in KIMI_MODELS or model.startswith(("kimi", "k3")):
-        return "kimi"
     if model.startswith("fake"):
         return "fake"  # the in-memory fake used by every dry gate
-    return model.split("/", 1)[0] or "unknown"
+    try:
+        return resolve_model(model).provider
+    except ValueError:
+        return model.split("/", 1)[0] or "unknown"
 
 
 @dataclass
@@ -580,6 +681,12 @@ class LLMClient:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.reasoning_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+        #: Attempts the provider BILLED but that came back with no content and
+        #: were retried away. Their tokens are folded into the counters above,
+        #: so quota totals stay honest; this is how many calls paid for nothing.
+        self.billed_empty_calls = 0
         self.retries = 0
         self.failures = 0
 
@@ -598,7 +705,7 @@ class LLMClient:
             "max_tokens": self.spec.max_tokens,
             "temperature_locked": self.spec.temperature_locked,
             "notes": self.spec.notes,
-            "routing": ROUTING_NOTES,
+            "routing": routing_notes(self.provider),
         }
 
     def usage(self) -> dict[str, Any]:
@@ -607,7 +714,10 @@ class LLMClient:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "reasoning_tokens": self.reasoning_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.prompt_tokens + self.completion_tokens,
+            "billed_empty_calls": self.billed_empty_calls,
             "retries": self.retries,
             "failures": self.failures,
         }
@@ -727,6 +837,11 @@ class LLMClient:
     ) -> list[Sample]:
         request_id = uuid.uuid4().hex[:12]
         last_exc: BaseException | None = None
+        # END-TO-END clock for the value the caller sees: what a seat actually
+        # waited for, retries and backoff included. Per-attempt latency stays in
+        # the journal records, so "slow provider" and "retried provider" remain
+        # distinguishable in the evidence.
+        started = time.monotonic()
         # Every provider call in every arm funnels through here, which makes this
         # the only honest place to judge whether the provider is still answering.
         health = provider_health(self.provider)
@@ -742,9 +857,23 @@ class LLMClient:
             except BaseException as exc:  # noqa: BLE001 - classified below
                 latency = time.monotonic() - t0
                 detail = f"{type(exc).__name__}: {exc}"
+                # A billed attempt that returned nothing usable (empty-200) is
+                # accounted BEFORE the retry throws it away: k3 comes back empty
+                # on ~11% of calls having burned its whole completion budget on
+                # reasoning, and dropping that would under-report the quota the
+                # run really consumed.
+                billed = getattr(exc, "billed", None)
+                billed = billed if isinstance(billed, BilledUsage) else None
+                if billed is not None:
+                    self.billed_empty_calls += 1
+                    self.prompt_tokens += billed.prompt_tokens
+                    self.completion_tokens += billed.completion_tokens
+                    self.reasoning_tokens += billed.reasoning_tokens
+                    self.cache_read_tokens += billed.cache_read_tokens
+                    self.cache_write_tokens += billed.cache_write_tokens
                 self._log_call(
                     None, attempt, latency, messages, request_id, hint, branch, step,
-                    outcome="error", error=detail[:1000],
+                    outcome="error", error=detail[:1000], billed=billed,
                 )
                 last_exc = exc
                 if attempt >= self.retry.attempts or not is_retryable(exc):
@@ -767,7 +896,8 @@ class LLMClient:
                 s.attempts = attempt
                 s.hint = hint
                 s.request_id = request_id
-                s.latency_s = latency
+                # End-to-end: every retry and every backoff the caller paid for.
+                s.latency_s = time.monotonic() - started
                 # Extract BEFORE journaling: code_chars in the journal is the
                 # evidence that a program actually came back.
                 s.code = extract_code(s.text) if s.text else None
@@ -775,6 +905,8 @@ class LLMClient:
                 self.prompt_tokens += s.prompt_tokens
                 self.completion_tokens += s.completion_tokens
                 self.reasoning_tokens += s.reasoning_tokens
+                self.cache_read_tokens += s.cache_read_tokens
+                self.cache_write_tokens += s.cache_write_tokens
                 self._log_call(
                     s, attempt, latency, messages, request_id, hint, branch, step,
                 )
@@ -812,20 +944,25 @@ class LLMClient:
         step: int | None,
         outcome: str = "ok",
         error: str = "",
+        #: Usage for a FAILED attempt the provider still billed (empty-200).
+        billed: BilledUsage | None = None,
     ) -> None:
         if self.journal is None:
             return
+        usage = sample.billed_usage() if sample is not None else (
+            billed or BilledUsage()
+        )
         self.journal.llm_call(
             model=self.spec.key,
             provider=self.spec.provider,
             attempt=attempt,
             latency_s=latency,
-            prompt_tokens=sample.prompt_tokens if sample else 0,
-            completion_tokens=sample.completion_tokens if sample else 0,
-            reasoning_tokens=sample.reasoning_tokens if sample else 0,
-            cache_read_tokens=sample.cache_read_tokens if sample else 0,
-            cache_write_tokens=sample.cache_write_tokens if sample else 0,
-            upstream=sample.upstream if sample else "",
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            upstream=usage.upstream,
             n_messages=len(messages),
             temperature=self.spec.temperature,
             request_id=request_id,
@@ -835,7 +972,7 @@ class LLMClient:
             error=error,
             response_chars=len(sample.text) if sample else 0,
             code_chars=len(sample.code or "") if sample else 0,
-            finish_reason=sample.finish_reason if sample else "",
+            finish_reason=usage.finish_reason,
             hint=hint,
             request=_request_digest(messages) if self.log_full_requests else None,
             response_text=(
@@ -937,7 +1074,17 @@ class KimiClient(LLMClient):
                 f"{self.spec.key} returned no content "
                 f"(finish_reason={[s.finish_reason for s in out]}, "
                 f"completion_tokens={completion_tokens}, reasoning={reasoning}, "
-                f"max_tokens={self.spec.max_tokens})"
+                f"max_tokens={self.spec.max_tokens})",
+                # Whole-call usage, not the per-choice share: the provider
+                # billed this request once.
+                BilledUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning,
+                    finish_reason=",".join(
+                        sorted({s.finish_reason for s in out if s.finish_reason})
+                    ),
+                ),
             )
         return out
 
@@ -1036,7 +1183,13 @@ class CodexClient(LLMClient):
             raise EmptyCompletion(
                 f"{self.spec.key} returned no output text (status={status}, "
                 f"output_tokens={usage['output_tokens']}, "
-                f"reasoning={usage['reasoning_tokens']})"
+                f"reasoning={usage['reasoning_tokens']})",
+                BilledUsage(
+                    prompt_tokens=usage["input_tokens"],
+                    completion_tokens=usage["output_tokens"],
+                    reasoning_tokens=usage["reasoning_tokens"],
+                    finish_reason=status,
+                ),
             )
         return [
             Sample(
@@ -1096,15 +1249,20 @@ async def _collect_stream(stream: Any) -> tuple[str, dict[str, int], str]:
         elif etype in _TERMINAL_EVENTS:
             response = event.response
         elif etype == "error":
-            raise RuntimeError(
+            # Mid-stream failure of a request the backend already accepted:
+            # transport noise, retryable (a bare RuntimeError made it terminal
+            # and fed the tripwire failures it must not count).
+            raise CodexStreamError(
                 f"codex stream error {getattr(event, 'code', '')}: "
                 f"{getattr(event, 'message', '')}"
             )
     if response is None:
-        raise RuntimeError("codex stream ended without a terminal response event")
+        raise CodexStreamError(
+            "codex stream ended without a terminal response event"
+        )
     if getattr(response, "error", None) is not None:
         err = response.error
-        raise RuntimeError(f"codex response error {err.code}: {err.message}")
+        raise CodexStreamError(f"codex response error {err.code}: {err.message}")
     if not getattr(response, "output", None):
         response.output = items
     texts: list[str] = []
@@ -1299,7 +1457,14 @@ class ClaudeClient(LLMClient):
             raise EmptyCompletion(
                 f"{self.spec.key} returned no text content "
                 f"(stop_reason={stop_reason}, output_tokens={completion_tokens}, "
-                f"max_tokens={self.spec.max_tokens})"
+                f"max_tokens={self.spec.max_tokens})",
+                BilledUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    finish_reason=stop_reason,
+                ),
             )
         return [
             Sample(
@@ -1361,11 +1526,14 @@ class OpenRouterClient(LLMClient):
     """OpenRouter chat completions (metered; any ``openrouter/<vendor>/<m>``).
 
     Deviations that are deliberate and journaled:
-    - No ``transforms`` are ever sent, so no middle-out compression -- same
-      policy as every direct provider here (ROUTING_NOTES).
+    - Middle-out compression is disabled EXPLICITLY on every request
+      (``transforms: []``). OpenRouter compresses the middle of an
+      over-long prompt by DEFAULT, so merely omitting the key would make
+      ROUTING_NOTES' ``middle_out=False`` a false claim about this route.
     - Seats within one cell must not straddle differently-QUANTIZED
-      deployments mid-run. OPENROUTER_QUANTIZATIONS (comma-separated, e.g.
-      "fp8") enforces that invariant as a routing filter with fallbacks ON;
+      deployments mid-run. OPENROUTER_QUANTIZATIONS pins EXACTLY ONE
+      quantization (more than one is rejected: it re-admits the straddle the
+      filter exists to forbid) as a routing filter with fallbacks ON;
       OPENROUTER_PROVIDER is then a preference order. Order WITHOUT a
       quantization filter is a strict pin (fallbacks disabled) -- a measured
       SPOF: one upstream's shared-pool TPM starved 17 seats. The upstream
@@ -1381,6 +1549,13 @@ class OpenRouterClient(LLMClient):
                  provider_order: tuple[str, ...] = (),
                  quantizations: tuple[str, ...] = (), **kw: Any) -> None:
         super().__init__(spec, **kw)
+        if len(quantizations) > 1:
+            raise ValueError(
+                "OPENROUTER_QUANTIZATIONS takes exactly one quantization, got "
+                f"{list(quantizations)}: several values put the seats of one "
+                "cell on differently-quantized deployments, which is precisely "
+                "the straddle the filter exists to prevent."
+            )
         self.quantizations = quantizations
         from openai import AsyncOpenAI
 
@@ -1389,6 +1564,28 @@ class OpenRouterClient(LLMClient):
             api_key=api_key, base_url=OPENROUTER_BASE_URL,
             timeout=timeout_s, max_retries=0,
         )
+
+    def _sort(self) -> str:
+        # Default routing is price-sorted, which lands on the SLOWEST cheap
+        # host once the cheapest is saturated (measured: 373s/call on
+        # OpenInference vs 90s on Baidu). Sorting by throughput keeps a
+        # latency-starved seat from wasting the build clock.
+        return os.environ.get("OPENROUTER_SORT", "throughput")
+
+    def model_info(self) -> dict[str, Any]:
+        """OpenRouter's routing note plus the knobs this client really sends."""
+        info = super().model_info()
+        info["routing"] = {
+            **info["routing"],
+            "transforms": [],
+            "quantizations": list(self.quantizations),
+            "provider_order": list(self.provider_order),
+            "allow_fallbacks": (
+                bool(self.quantizations) if self.provider_order else True
+            ),
+            "sort": self._sort() if self.quantizations else "",
+        }
+        return info
 
     def _system_content(self, text: str) -> Any:
         if self.spec.api_model.startswith("anthropic/"):
@@ -1412,7 +1609,10 @@ class OpenRouterClient(LLMClient):
             else:
                 msgs.append({"role": m.get("role", "user"),
                              "content": m.get("content") or ""})
-        extra_body: dict[str, Any] = {"usage": {"include": True}}
+        # transforms=[] is the EXPLICIT middle-out opt-out: OpenRouter would
+        # otherwise compress over-long prompts for us and silently change what
+        # the model saw (ROUTING_NOTES claims middle_out=False for real).
+        extra_body: dict[str, Any] = {"usage": {"include": True}, "transforms": []}
         # Routing policy (design: seats must not straddle differently-
         # quantized deployments). A quantization filter enforces that
         # invariant directly and leaves fallbacks ON, so one upstream's
@@ -1422,13 +1622,7 @@ class OpenRouterClient(LLMClient):
         provider_body: dict[str, Any] = {}
         if self.quantizations:
             provider_body["quantizations"] = list(self.quantizations)
-            # Default routing is price-sorted, which lands on the SLOWEST
-            # cheap host once the cheapest is saturated (measured: 373s/call
-            # on OpenInference vs 90s on Baidu). Sorting by throughput keeps
-            # a latency-starved seat from wasting the build clock.
-            provider_body["sort"] = os.environ.get(
-                "OPENROUTER_SORT", "throughput"
-            )
+            provider_body["sort"] = self._sort()
         if self.provider_order:
             provider_body["order"] = list(self.provider_order)
             provider_body["allow_fallbacks"] = bool(self.quantizations)
@@ -1458,7 +1652,15 @@ class OpenRouterClient(LLMClient):
             raise EmptyCompletion(
                 f"{self.spec.key} returned no content (finish_reason={finish}, "
                 f"completion_tokens={completion_tokens}, reasoning={reasoning}, "
-                f"upstream={upstream or '?'})"
+                f"upstream={upstream or '?'})",
+                BilledUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning,
+                    cache_read_tokens=cache_read,
+                    upstream=upstream,
+                    finish_reason=finish,
+                ),
             )
         return [
             Sample(
@@ -1637,9 +1839,19 @@ if __name__ == "__main__":  # pragma: no cover - operational entry point
     ap.add_argument("--out", default="bench/results/llm_smoke.json")
     args = ap.parse_args()
 
-    res = asyncio.run(smoke([m for m in args.models.split(",") if m]))
-    payload = {"ts": time.time(), "routing": ROUTING_NOTES, "results": res}
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    models = [m for m in args.models.split(",") if m]
+    res = asyncio.run(smoke(models))
+    payload = {
+        "ts": time.time(),
+        # Per resolved provider, not one global claim: a smoke run of
+        # openrouter/* models must not ship "no aggregator" in its own artifact.
+        "routing": {
+            p: routing_notes(p) for p in sorted({provider_of(m) for m in models})
+        },
+        "results": res,
+    }
+    # ``--out llm_smoke.json`` has no directory part: makedirs("") raises.
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
     print(json.dumps(payload, indent=2))

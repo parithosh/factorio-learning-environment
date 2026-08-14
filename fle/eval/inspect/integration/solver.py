@@ -251,15 +251,23 @@ def factorio_controlled_solver():
                 )
 
                 _instance = gym_env.unwrapped.instance
+                _unwrapped = gym_env.unwrapped
                 _snapshots = {}
                 _snap_counter = [0]
 
                 def _strip_branching():
-                    # Keep closures out of persistent_vars during state
-                    # capture so namespace serialization never sees them.
+                    # Keep closures out of the namespace during state capture
+                    # so namespace serialization never sees them (only
+                    # persistent_vars is serialized, but keep the attributes
+                    # symmetric with _inject_branching).
                     for _ns in _instance.namespaces:
                         _ns.persistent_vars.pop("snapshot", None)
                         _ns.persistent_vars.pop("restore", None)
+                        for _attr in ("snapshot", "restore"):
+                            try:
+                                delattr(_ns, _attr)
+                            except AttributeError:
+                                pass
 
                 def _inject_branching():
                     for _ns in _instance.namespaces:
@@ -298,6 +306,8 @@ def factorio_controlled_solver():
                     # restored world; pin it back so the production-score
                     # baseline matches the snapshot's timeline.
                     _instance.initial_score = saved_initial_score
+                    _unwrapped.initial_score = saved_initial_score
+                    _unwrapped.last_observation = None
                     _inject_branching()
                     branching_stats["restores"] += 1
                     return f"Restored world to {snapshot_id}"

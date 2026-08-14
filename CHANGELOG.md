@@ -64,6 +64,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `basisu -unpack` is now invoked with a resolved absolute path so sprite
   extraction works regardless of the caller's working directory.
 
+**Bench review hardening (PR #5 review fixes)**
+
+- Bridge security: the TCP listener now requires `Authorization: Bearer
+  $FLE_BRIDGE_TOKEN` when a token is configured (UDS exempt); without a token
+  it only starts under `FLE_BRIDGE_ALLOW_INSECURE=1`. Request bodies are
+  bounded and parsed before the global state lock, error responses no longer
+  leak tracebacks (correlation id instead), and a failed `/probe` re-pauses
+  the game.
+- `bench/bridge_client.py` retries only idempotent requests — mutating POSTs
+  (`/execute`, `/probe`, `/reset`, `/state-restore`) are never replayed after
+  ambiguous transport failures (`BridgeError.ambiguous`).
+- `bench/common.py`: `resource_name()` no longer truncates away the seat role
+  (multi-seat name collisions); `RunJournal` records carry a per-invocation
+  `session` id and consumers read via the new `load_journal_records()`
+  (fail-closed on corrupt/multi-session journals); new `atomic_write_json()`
+  used for every result artifact.
+- Fail-closed measurement across the tiers: tier-0 no longer fabricates
+  `cap=1` without soak evidence, includes parity-probe forks in throughput,
+  scores every computed fidelity invariant, and gates on complete evidence;
+  tier-0.5 enforces the LLM/materialization overlap gate, refuses to freeze
+  configs from missing or infeasible calibrations, reads the real tier-0
+  schema, and resets the loopback bridge between models; tier-0.5 merge
+  validates gate K, rejects incomplete/duplicated tracks, and never silently
+  relaxes the block budget.
+- `bench/arms.py`: endpoints are `partial` unless every seat probed at T,
+  timed-out probes and unreadable baselines are excluded from selection,
+  timed-out `/execute` calls are drained (node quarantined) before reuse,
+  sandboxes are owned from creation (no leak on failed attach), and
+  cancellation propagates through every recovery path.
+- `bench/run_tier1.py`: slot pool refuses over-wide cells, every cell outcome
+  is accounted (setup failures, cancellations, second dead provider), `--keep`
+  is additive, `--cells` merges are config-fingerprint checked, per-cell LLM
+  clients are closed, and the process exits nonzero on incomplete matrices.
+- `bench/farplane.py`: honest absolute deadlines across all phases, operation
+  ids are never mistaken for sandbox ids, `--env` values are redacted from
+  errors/journals, and the reaper paginates, settles unresolved operations,
+  and retains source snapshots of pending forks.
+- `bench/llm.py`: billed empty-completion retries are counted in usage,
+  OpenRouter middle-out is explicitly disabled, stream failures retry, and
+  end-to-end sample latency includes retries.
+- Exp-1/2/3 analysis integrity: exp-1 equalizes forked children at a restore
+  barrier, requires full-K draws, resamples the bootstrap at strategy level,
+  and pins the third-wave read point; exp-2's extractor is memory-bounded and
+  fail-closed with a three-state verdict; exp-3 validates the S2B milestone,
+  cleans up template/bake sandboxes on failure, and the blog renderer no
+  longer unpickles namespace blobs from state files.
+
 ### Fixed
 
 - `solver.py` and `sandbox_solver.py` no longer pass the OpenRouter-only

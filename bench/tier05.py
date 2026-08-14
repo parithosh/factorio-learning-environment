@@ -16,9 +16,20 @@ any Tier-1 spend:
     then selected JOINTLY: non-zero for at least two models, not saturating
     (below quota) for any model.
 
+A model is ADMITTED to the pilot only when all three measurements exist and
+succeeded for it; missing or errored evidence keeps it out (there is no
+"not measured, therefore fine"). Arm B needs one more thing: the Tier-0
+OVERLAP GATE, which puts the soak's snapshot+fork p50 against the model's
+median LLM wait. Whatever sampling cannot hide is a per-branch-round tail that
+is charged into the round cost that sizes T.
+
 Outputs ``bench/results/tier05.json`` and ``bench/results/TIER05.md``, including
 the FROZEN pilot config (T, tasks, replicates) sized so the whole Tier-1 pilot
-fits in <= 3h of wall clock at achievable concurrency.
+fits in <= 3h of wall clock at achievable concurrency. When the evidence does
+not support one -- no admitted model, no eligible task, or no ladder point that
+fits the budget with >= 2 branch rounds -- the config is REFUSED
+(``executable: false``, with the blockers) and the CLI exits 1 instead of
+emitting a runnable config the measurements do not back.
 """
 
 from __future__ import annotations
@@ -43,7 +54,7 @@ from bench.arms import (
     fake_substrate,
     task_spec,
 )
-from bench.common import RunJournal, TimingBuckets
+from bench.common import RunJournal, TimingBuckets, atomic_write_json
 from bench.llm import (
     DEFAULT_MODELS,
     LLMClient,
@@ -248,8 +259,9 @@ async def measure_step_latency(
         run.timings.start()
         for _ in range(cfg.latency_steps):
             before = llm.usage()
+            errors_before = traj.errors
             t0 = time.monotonic()
-            await run.agent_step(traj)
+            outcome = await run.agent_step(traj)
             t1 = time.monotonic()
             after = llm.usage()
             steps.append(
@@ -261,6 +273,12 @@ async def measure_step_latency(
                     "completion_tokens": after["completion_tokens"]
                     - before["completion_tokens"],
                     "production_score": traj.last_production,
+                    # Per-step OUTCOME, not the cumulative error counter: a step
+                    # is unparseable only when ITS OWN response carried no
+                    # program, and an /execute failure is not a parse failure.
+                    "parsed": bool(outcome.get("parsed")),
+                    "step_error": bool(outcome.get("error")),
+                    "errors_delta": traj.errors - errors_before,
                     "errors": traj.errors,
                 }
             )
@@ -285,7 +303,8 @@ async def measure_step_latency(
             round(statistics.fmean([s["completion_tokens"] for s in steps]), 1)
             if steps else None
         ),
-        "unparseable_steps": sum(1 for s in steps if s["errors"]),
+        "unparseable_steps": sum(1 for s in steps if not s["parsed"]),
+        "exec_error_steps": sum(1 for s in steps if s["parsed"] and s["step_error"]),
         "incidents": run.incidents,
         "timings": run.timings.summary(),
     }
@@ -336,15 +355,22 @@ async def measure_diversity(
     messages = diversity_prompt(system_prompt)
     hints = [DIVERSITY_HINTS[i % len(DIVERSITY_HINTS)] for i in range(cfg.K)]
     try:
+        # Time the OUTER K-way call: that is the wall clock one branch round
+        # pays. Per-sample latencies hide the fan-out (K concurrent requests,
+        # provider queueing and harness retries all land in the outer call).
+        t0 = time.monotonic()
         plain = await llm.sample_detailed(messages, n=cfg.K, branch="plain")
+        plain_wall_s = time.monotonic() - t0
+        t0 = time.monotonic()
         hinted = await llm.sample_detailed(messages, n=cfg.K, hints=hints,
                                           branch="hinted")
+        hinted_wall_s = time.monotonic() - t0
         usage = llm.usage()
     finally:
         await llm.aclose()
         journal.close()
 
-    def summarize(samples: Sequence[Any], label: str) -> dict[str, Any]:
+    def summarize(samples: Sequence[Any], label: str, wall_s: float) -> dict[str, Any]:
         codes = [s.code for s in samples]
         rate = distinct_program_rate(codes)
         norm = [normalize_program(c or "") for c in codes]
@@ -361,6 +387,7 @@ async def measure_diversity(
             "finish_reasons": [s.finish_reason for s in samples],
             "distinct_program_rate": round(rate, 3),
             "distinct_programs": len({n for n in norm if n}),
+            "k_way_wall_s": round(wall_s, 3),
             "median_latency_s": round(
                 statistics.median([s.latency_s for s in samples]), 3
             ) if samples else None,
@@ -371,8 +398,8 @@ async def measure_diversity(
             "code_heads": [(c or "")[:160] for c in codes],
         }
 
-    plain_sum = summarize(plain, "plain")
-    hinted_sum = summarize(hinted, "hinted")
+    plain_sum = summarize(plain, "plain", plain_wall_s)
+    hinted_sum = summarize(hinted, "hinted", hinted_wall_s)
     verdict, rationale = _verdict(
         plain_sum["distinct_program_rate"], hinted_sum["distinct_program_rate"]
     )
@@ -396,7 +423,9 @@ async def measure_diversity(
         "verdict": verdict,
         "rationale": rationale,
         "unusable_samples": unusable,
-        "k_way_sampling_latency_s": plain_sum["median_latency_s"],
+        "k_way_sampling_latency_s": plain_sum["k_way_wall_s"],
+        "k_way_sampling_latency_hinted_s": hinted_sum["k_way_wall_s"],
+        "median_sample_latency_s": plain_sum["median_latency_s"],
         "usage": usage,
         # Retries here are almost all empty 200s from the provider; each one
         # costs real wall clock inside T, so the rate belongs in the calibration.
@@ -447,22 +476,61 @@ async def task_sanity(
             await run.teardown([node])
         await llm.aclose()
         journal.close()
-    best = max(probes, default=0.0)
+    best = max(probes) if probes else None
     return {
         "model": model,
         "task": task,
         "entity": run.entity,
         "quota": run.quota,
+        # No probe came back at all: the MEASUREMENT failed. Reporting 0.0 here
+        # is indistinguishable from a task the model genuinely cannot move, and
+        # selection would then disqualify the task as a floor on no evidence.
+        "status": "ok" if probes else "no_probe",
         "steps": traj.step if traj else 0,
         "probes": probes,
         "best_throughput": best,
-        "quota_fraction": round(best / run.quota, 4) if run.quota else 0.0,
+        "quota_fraction": (
+            round(best / run.quota, 4) if best is not None and run.quota else None
+        ),
         "final_production_score": traj.last_production if traj else 0.0,
         "errors": traj.errors if traj else 0,
         "incidents": run.incidents,
         "wall_s": run.timings.wall_s,
         "tokens": llm.usage(),
     }
+
+
+def _sanity_measured(row: dict[str, Any]) -> bool:
+    """True when this sanity row carries a real throughput measurement."""
+    if row.get("error") or row.get("status", "ok") != "ok":
+        return False
+    return isinstance(row.get("best_throughput"), (int, float))
+
+
+def _sanity_failure(row: dict[str, Any]) -> str:
+    return str(row.get("error") or row.get("status") or "no measurement")
+
+
+def _task_quota(task: str, rows: Sequence[dict[str, Any]]) -> tuple[int | None, str]:
+    """Quota from FLE's own task registry, never from a measurement row.
+
+    A failed sanity run carries whatever quota its half-built run object had
+    (0 in the error path), and a 0 quota silently turns every ratio in the
+    ranking into nothing. The registry is the authority; a row is only a last
+    resort for hosts where FLE is not importable.
+    """
+    try:
+        _goal, _entity, quota = task_spec(task)
+    except Exception:  # noqa: BLE001 - FLE absent on analysis hosts, or bad key
+        pass
+    else:
+        if quota > 0:
+            return int(quota), "task_spec"
+    for row in rows:
+        value = row.get("quota")
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value), "result_row"
+    return None, "unknown"
 
 
 def select_tasks(
@@ -483,6 +551,11 @@ def select_tasks(
     solves in a couple of steps, leaving little for an arm difference to move.
     Tasks above quota are reported in ``above_quota_models`` but stay eligible.
 
+    A sanity run that ERRORED, or that returned no probe at all, is missing
+    evidence -- not a zero. Those rows are excluded from the ranking entirely
+    and listed in ``missing_evidence``; they cannot make a task look like a
+    floor, and they cannot count toward its model coverage either.
+
     When the sanity phase could only afford ONE model (the v2.6 pilot probes
     tasks with k3 alone), "non-zero for >=2 models" is unsatisfiable, so the
     coverage requirement degrades to every model that was actually probed and
@@ -496,8 +569,13 @@ def select_tasks(
 
     scored: list[dict[str, Any]] = []
     for task, rows in by_task.items():
-        quota = rows[0]["quota"]
-        bests = {r["model"]: r["best_throughput"] for r in rows}
+        quota, quota_source = _task_quota(task, rows)
+        usable = [r for r in rows if _sanity_measured(r)]
+        missing = {
+            str(r.get("model")): _sanity_failure(r)
+            for r in rows if not _sanity_measured(r)
+        }
+        bests = {r["model"]: float(r["best_throughput"]) for r in usable}
         nonzero = [m for m, v in bests.items() if v > 0]
         above = [m for m, v in bests.items() if quota and v >= quota]
         ratios = [v / quota for v in bests.values() if quota and v > 0]
@@ -508,21 +586,34 @@ def select_tasks(
             if ratios else None
         )
         reasons: list[str] = []
+        if quota is None:
+            reasons.append(
+                "quota unknown: the FLE task registry is unavailable and no "
+                "sanity row carried one, so the endpoint cannot be normalised"
+            )
         if len(nonzero) < need_nonzero:
             reasons.append(
                 f"floor: non-zero for only {len(nonzero)} of {need_nonzero} "
-                "required model(s)"
+                f"required model(s) across {len(usable)} usable measurement(s)"
             )
+            if missing:
+                reasons.append(
+                    "missing evidence: "
+                    + "; ".join(f"{m} ({why})" for m, why in sorted(missing.items()))
+                )
         scored.append(
             {
                 "task": task,
                 "quota": quota,
+                "quota_source": quota_source,
                 "best_by_model": bests,
                 "nonzero_models": len(nonzero),
+                "usable_measurements": len(usable),
+                "missing_evidence": missing,
                 "above_quota_models": above,
                 "mean_quota_ratio": (
                     round(statistics.fmean(list(bests.values())) / quota, 4)
-                    if quota and bests else 0.0
+                    if quota and bests else None
                 ),
                 "log10_distance_from_quota": distance,
                 "eligible": not reasons,
@@ -544,12 +635,18 @@ def select_tasks(
         "candidates": scored,
         "criterion": (
             f"non-zero best-probe throughput for >={need_nonzero} of the "
-            f"{n_models} model(s) probed (floor tasks are the only "
-            "disqualifier -- the endpoint is continuous, so the quota is a "
-            "normaliser and not a ceiling); ranked by model coverage, then by "
-            "how few orders of magnitude the sanity probe sat from the quota"
+            f"{n_models} model(s) probed (floor tasks and tasks with no "
+            "registry quota are the only disqualifiers -- the endpoint is "
+            "continuous, so the quota is a normaliser and not a ceiling); "
+            "failed or probe-less sanity runs are missing evidence and are "
+            "excluded from the ranking rather than counted as zero; ranked by "
+            "model coverage, then by how few orders of magnitude the sanity "
+            "probe sat from the quota"
         ),
         "shortfall": max(0, want - len(selected)),
+        "excluded_measurements": sum(
+            len(s["missing_evidence"]) for s in scored
+        ),
     }
 
 
@@ -558,46 +655,241 @@ def select_tasks(
 # ---------------------------------------------------------------------------
 
 
-def load_tier0_caps(cfg: Tier05Config) -> dict[str, Any]:
-    """Read the Tier-0 soak's per-node run cap, if Tier 0 has already run."""
-    out: dict[str, Any] = {"source": "defaults", "run_cap": cfg.run_cap,
-                           "max_sandboxes": cfg.max_sandboxes}
+def _stat(node: Any, *keys: str) -> float | None:
+    """Positive float at ``keys`` inside a nested Tier-0 summary dict."""
+    cur: Any = node
+    for key in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        return None
+    return float(cur) if cur > 0 else None
+
+
+def _stat_n(node: Any, key: str) -> int | None:
+    """Sample count behind a Tier-0 summary stat, when it reports one."""
+    stat = node.get(key) if isinstance(node, dict) else None
+    n = stat.get("n") if isinstance(stat, dict) else None
+    return int(n) if isinstance(n, int) else None
+
+
+def load_tier0_caps(cfg: Tier05Config,
+                    *, journal: RunJournal | None = None) -> dict[str, Any]:
+    """Tier-0 evidence for pilot sizing: run cap, slots, materialisation, probe.
+
+    Reads the REAL Tier-0 schema. The soak stage reports distributions, not
+    flat scalars (``latency.snapshot_s.p50``, ``latency.fork_total_s.p50``),
+    and the direct probe cost only exists in the full ``tier0.json`` under
+    ``probe.cycles[*].probe_s`` -- so both files are read and each measurement
+    is taken from the first file that actually carries it.
+
+    Anything Tier 0 did not measure falls back to the configured default AND is
+    reported in ``warnings`` (journalled when a journal is given). The
+    snapshot+fork materialisation has no default at all: without it the arm-B
+    overlap gate is ``unknown``, which is not the same as fast.
+    """
+    out: dict[str, Any] = {
+        "source": "defaults",
+        "sources": [],
+        "run_cap": cfg.run_cap,
+        "max_sandboxes": cfg.max_sandboxes,
+        "evidence": {},
+        "warnings": [],
+    }
+    evidence: dict[str, Any] = out["evidence"]
+    warnings: list[str] = out["warnings"]
     for name in ("tier0_soak.json", "tier0.json"):
         path = os.path.join(cfg.results_dir, name)
         if not os.path.exists(path):
+            warnings.append(f"{name}: absent")
             continue
         try:
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.append(f"{name}: unreadable ({type(exc).__name__}: {exc})")
             continue
-        soak = data.get("soak", data)
-        for key in ("recommended_run_cap", "per_node_run_cap", "node_cap"):
-            value = data.get(key, soak.get(key) if isinstance(soak, dict) else None)
-            if isinstance(value, int) and value >= 1:
-                out.update(source=name, run_cap=value, cap_key=key)
-                break
-        for key in ("max_sandboxes", "total_slots", "warm_slots"):
-            value = data.get(key, soak.get(key) if isinstance(soak, dict) else None)
-            if isinstance(value, int) and value >= 1:
-                out["max_sandboxes"] = value
-                break
-        for key in ("t_snap_p50_s", "t_snap_s", "snapshot_p50_s"):
-            value = (data.get(key) or (soak.get(key) if isinstance(soak, dict) else None))
-            if isinstance(value, (int, float)) and value > 0:
-                out["t_snap_s"] = float(value)
-                break
-        for key in ("t_fork_p50_s", "t_fork_s", "fork_p50_s"):
-            value = (data.get(key) or (soak.get(key) if isinstance(soak, dict) else None))
-            if isinstance(value, (int, float)) and value > 0:
-                out["t_fork_s"] = float(value)
-                break
-        break
-    if "t_snap_s" in out and "t_fork_s" in out:
-        # v2.6 kept these for B's branch round (snapshot + K-1 forks); the probe
-        # itself no longer forks, so the probe cost is the bare /probe call.
-        out["branch_materialize_s"] = out["t_snap_s"] + out["t_fork_s"]
+        if not isinstance(data, dict):
+            warnings.append(f"{name}: not a JSON object")
+            continue
+        if data.get("valid") is False:
+            # Tier 0 replaces the artifact with an INVALID marker when the soak
+            # failed or was never validated. Its "partial" block still holds
+            # old numbers; reading them would dress a failed soak as capacity.
+            warnings.append(
+                f"{name}: INVALID marker "
+                f"({data.get('invalid_reason') or 'no reason recorded'}); "
+                "Tier-0 evidence is ABSENT, not zero"
+            )
+            continue
+        out["sources"].append(name)
+        # tier0_soak.json IS the soak payload; tier0.json nests it under "soak".
+        soak = data.get("soak")
+        if not isinstance(soak, dict):
+            soak = data
+        latency = soak.get("latency")
+        if not isinstance(latency, dict):
+            latency = {}
+        constants = data.get("constants")
+        const_stats = constants.get("stats") if isinstance(constants, dict) else {}
+        if not isinstance(const_stats, dict):
+            const_stats = {}
+
+        if "run_cap" not in evidence:
+            for key in ("recommended_run_cap", "per_node_run_cap", "node_cap"):
+                value = data.get(key, soak.get(key))
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                    out.update(source=name, run_cap=value, cap_key=key)
+                    evidence["run_cap"] = {"file": name, "path": key, "value": value}
+                    break
+        if "max_sandboxes" not in evidence:
+            for key in ("max_sandboxes", "total_slots", "warm_slots"):
+                value = data.get(key, soak.get(key))
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                    out["max_sandboxes"] = value
+                    evidence["max_sandboxes"] = {"file": name, "path": key,
+                                                 "value": value}
+                    break
+        # v2.6 keeps snapshot + fork for B's branch round (the probe itself no
+        # longer forks). The soak p50 is the operative number; the constants
+        # stage is the fallback when the soak never ran.
+        for field, node, keys in (
+            ("t_snap_s", latency, ("snapshot_s", "p50")),
+            ("t_snap_s", const_stats, ("t_snap_s", "p50")),
+            ("t_fork_s", latency, ("fork_total_s", "p50")),
+            ("t_fork_s", const_stats, ("fork_total_s", "p50")),
+        ):
+            if field in evidence:
+                continue
+            value = _stat(node, *keys)
+            if value is not None:
+                out[field] = value
+                evidence[field] = {
+                    "file": name,
+                    "path": ("soak.latency." if node is latency else "constants.stats.")
+                            + ".".join(keys),
+                    "value": value,
+                    "n": _stat_n(node, keys[0]),
+                }
+        if "probe_s" not in evidence:
+            probe = data.get("probe")
+            cycles = probe.get("cycles") if isinstance(probe, dict) else None
+            values = [
+                float(c["probe_s"]) for c in (cycles or [])
+                if isinstance(c, dict)
+                and isinstance(c.get("probe_s"), (int, float))
+                and not isinstance(c.get("probe_s"), bool)
+                and c["probe_s"] > 0
+            ]
+            if values:
+                out["probe_s"] = round(statistics.median(values), 3)
+                evidence["probe_s"] = {"file": name,
+                                       "path": "probe.cycles[*].probe_s",
+                                       "value": out["probe_s"], "n": len(values)}
+
+    for field, default, what in (
+        ("run_cap", cfg.run_cap, "per-node run cap"),
+        ("max_sandboxes", cfg.max_sandboxes, "sandbox slot ceiling"),
+        ("probe_s", cfg.probe_s, "direct /probe cost"),
+    ):
+        if field not in evidence:
+            out.setdefault(field, default)
+            warnings.append(
+                f"{what}: not measured by Tier 0; falling back to the configured "
+                f"default {out[field]}"
+            )
+    if "t_snap_s" in evidence and "t_fork_s" in evidence:
+        out["branch_materialize_s"] = round(out["t_snap_s"] + out["t_fork_s"], 3)
+    else:
+        # No default: a fabricated materialisation cost would silently pass the
+        # arm-B overlap gate that exists precisely to measure it.
+        out["branch_materialize_s"] = None
+        warnings.append(
+            "snapshot+fork materialisation: not measured by Tier 0 "
+            "(soak.latency.snapshot_s.p50 / soak.latency.fork_total_s.p50); the "
+            "arm-B overlap gate is unknown and no default is substituted"
+        )
+    if journal is not None:
+        journal.event("tier0_caps", source=out["source"], sources=list(out["sources"]),
+                      run_cap=out["run_cap"], max_sandboxes=out["max_sandboxes"],
+                      branch_materialize_s=out["branch_materialize_s"],
+                      probe_s=out.get("probe_s"), evidence=evidence)
+        for warning in warnings:
+            journal.incident(kind="tier0_evidence_missing", detail=warning)
     return out
+
+
+#: Arm-B OVERLAP GATE (design doc (a)). One B branch round materialises a
+#: snapshot plus K-1 forks and hides that work under the model's sampling wait.
+#: What sampling cannot hide is a per-round TAIL charged straight to T:
+#:     tail = max(0, branch_materialize_s - median_llm_s)
+#: Pre-registered: a tail no larger than the sampling wait it had to hide under
+#: is tolerated (B pays it, and pilot sizing charges it into the branch-round
+#: cost). Beyond that, more than half of every branch round is Farplane
+#: latency rather than the arm, and B is not admitted for that model.
+OVERLAP_TAIL_RATIO = 1.0
+
+
+def _positive(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value > 0 else None
+
+
+def overlap_gate(median_llm_s: Any, branch_materialize_s: Any) -> dict[str, Any]:
+    """Tier-0 overlap verdict for one model: can B hide snap+fork under sampling?
+
+    ``hidden``   materialisation fits inside the sampling wait; B is free.
+    ``partial``  a tail is exposed but stays within ``OVERLAP_TAIL_RATIO`` x the
+                 sampling wait; B is admitted and the tail is charged into the
+                 branch-round cost that sizes T.
+    ``exposed``  the tail is larger than that; B would measure Farplane rather
+                 than the arm, so B is not admitted for the model.
+    ``unknown``  a side is missing. Fail closed: B is not admitted, because an
+                 unmeasured materialisation is not the same as a hidden one.
+    """
+    llm_s = _positive(median_llm_s)
+    mat_s = _positive(branch_materialize_s)
+    if llm_s is None or mat_s is None:
+        missing = []
+        if llm_s is None:
+            missing.append("median_llm_s (Tier 0.5 latency phase)")
+        if mat_s is None:
+            missing.append("branch_materialize_s (Tier 0 soak snapshot+fork p50)")
+        return {
+            "verdict": "unknown",
+            "median_llm_s": llm_s,
+            "branch_materialize_s": mat_s,
+            "hidden_s": None,
+            "tail_s": None,
+            "b_arm_admitted": False,
+            "detail": "overlap gate not evaluable: missing " + ", ".join(missing),
+        }
+    tail = max(0.0, mat_s - llm_s)
+    if tail <= 0.0:
+        verdict, admitted = "hidden", True
+        detail = (f"snapshot+fork {mat_s:.1f}s hides entirely under the "
+                  f"{llm_s:.1f}s sampling wait")
+    elif tail <= OVERLAP_TAIL_RATIO * llm_s:
+        verdict, admitted = "partial", True
+        detail = (f"snapshot+fork {mat_s:.1f}s vs {llm_s:.1f}s sampling wait: "
+                  f"{tail:.1f}s per branch round is exposed and is charged to T")
+    else:
+        verdict, admitted = "exposed", False
+        detail = (f"snapshot+fork {mat_s:.1f}s vs {llm_s:.1f}s sampling wait: "
+                  f"{tail:.1f}s per branch round is exposed, more than the "
+                  f"{OVERLAP_TAIL_RATIO:g}x sampling wait the gate allows -- arm "
+                  "B would measure Farplane latency, not the arm")
+    return {
+        "verdict": verdict,
+        "median_llm_s": round(llm_s, 3),
+        "branch_materialize_s": round(mat_s, 3),
+        "hidden_s": round(min(llm_s, mat_s), 3),
+        "tail_s": round(tail, 3),
+        "b_arm_admitted": admitted,
+        "detail": detail,
+    }
 
 
 def peak_sandboxes(arm: str, K: int) -> int:
@@ -628,13 +920,26 @@ def size_pilot(
     K: int,
     safety_factor: float,
     budget_s: float = PILOT_WALL_BUDGET_S,
+    materialize_tail_s: float | None = None,
 ) -> dict[str, Any]:
-    """Largest ladder point whose estimated wall clock fits the pilot budget."""
+    """Largest ladder point whose estimated wall clock fits the pilot budget.
+
+    ``materialize_tail_s`` is the worst per-branch-round snapshot+fork tail the
+    admitted models could NOT hide under their sampling wait (see
+    ``overlap_gate``); it is real wall clock inside T, so it is charged into the
+    branch-round cost that decides how many rounds T buys. ``None`` means no
+    overlap evidence was supplied and the tail is reported as unknown.
+
+    Nothing fits => ``chosen`` is None and ``error`` says why. There is no
+    "cheapest infeasible" fallback: emitting min(ladder) as a frozen config
+    hands the pilot a point that was measured NOT to fit.
+    """
     run_cap = int(caps.get("run_cap", 6))
     max_sandboxes = int(caps.get("max_sandboxes", 24))
-    slowest = max(
-        (latency.get(mm, {}).get("median_step_s") or 0.0 for mm in models), default=0.0
-    )
+    steps = {mm: _positive(latency.get(mm, {}).get("median_step_s")) for mm in models}
+    unmeasured = sorted(mm for mm, v in steps.items() if v is None)
+    slowest = max((v for v in steps.values() if v is not None), default=0.0)
+    tail_s = _positive(materialize_tail_s) or 0.0
 
     def n_runs(n_tasks: int, replicates: int) -> int:
         base = len(models) * len([a for a in arms if a != "C"]) * n_tasks * replicates
@@ -662,9 +967,10 @@ def size_pilot(
         slot_seconds = peak_weighted(n_tasks, replicates) * per_run_s
         by_slots = slot_seconds / max(1, max_sandboxes)
         est = max(per_run_s, by_runs, by_slots) * safety_factor
-        rounds = (
-            math.floor(T / (m * slowest + probe_s)) if slowest > 0 else None
-        )
+        # A branch round is m agent steps, one direct probe, and whatever
+        # snapshot+fork the sampling wait could not hide.
+        round_s = m * slowest + probe_s + tail_s if slowest > 0 else None
+        rounds = math.floor(T / round_s) if round_s else None
         return {
             "T_s": T,
             "n_tasks": n_tasks,
@@ -675,8 +981,14 @@ def size_pilot(
             "bound_by_slots_s": round(by_slots, 1),
             "est_wall_s": round(est, 1),
             "est_wall_h": round(est / 3600.0, 2),
+            "branch_round_s": round(round_s, 1) if round_s else None,
+            "materialize_tail_s": round(tail_s, 1),
             "branch_rounds_slowest_model": rounds,
-            "fits": est <= budget_s and (rounds is None or rounds >= 2),
+            # Fail closed: an unmeasured step latency (rounds None) used to
+            # count as fitting, which passed the >=2-round requirement on no
+            # evidence at all.
+            "fits": (est <= budget_s and rounds is not None and rounds >= 2
+                     and not unmeasured),
         }
 
     ladder = [
@@ -688,9 +1000,8 @@ def size_pilot(
     feasible = [e for e in ladder if e["fits"]]
     # Pre-registered preference: task coverage, then replicates, then T.
     feasible.sort(key=lambda e: (-e["n_tasks"], -e["replicates"], -e["T_s"]))
-    chosen = feasible[0] if feasible else min(ladder, key=lambda e: e["est_wall_s"])
-    return {
-        "chosen": chosen,
+    out: dict[str, Any] = {
+        "chosen": feasible[0] if feasible else None,
         "feasible_points": len(feasible),
         "ladder": ladder,
         "inputs": {
@@ -703,6 +1014,10 @@ def size_pilot(
             "provision_s": provision_s,
             "teardown_s": teardown_s,
             "slowest_median_step_s": slowest,
+            "models_without_latency": unmeasured,
+            "materialize_tail_s": (
+                round(tail_s, 3) if materialize_tail_s is not None else None
+            ),
             "m": m,
             "safety_factor": safety_factor,
             "budget_s": budget_s,
@@ -710,6 +1025,23 @@ def size_pilot(
         },
         "budget_respected": bool(feasible),
     }
+    if not feasible:
+        cheapest = min(ladder, key=lambda e: e["est_wall_s"]) if ladder else None
+        if unmeasured:
+            why = ("no measured step latency for " + ", ".join(unmeasured)
+                   + ": branch rounds at T are unknown")
+        elif cheapest is not None and cheapest["est_wall_s"] > budget_s:
+            why = (f"cheapest ladder point still needs "
+                   f"{cheapest['est_wall_h']}h against a "
+                   f"{budget_s / 3600.0:.1f}h budget")
+        else:
+            why = (f"every ladder point buys fewer than 2 branch rounds at a "
+                   f"{m}-step round of "
+                   f"{(m * slowest + probe_s + tail_s):.0f}s "
+                   f"(tail {tail_s:.0f}s)")
+        out["error"] = f"no feasible pilot point: {why}"
+        out["cheapest_infeasible"] = cheapest
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +1064,8 @@ async def get_system_prompt(cfg: Tier05Config, substrate: Substrate) -> tuple[st
     try:
         node = await run.provision_main("sysprompt")
         return run.system_prompt, "bridge"
+    except asyncio.CancelledError:
+        raise
     except BaseException as exc:  # noqa: BLE001 - fall back, but record why
         journal.incident(kind="system_prompt_unavailable", detail=f"{exc}")
         return FALLBACK_SYSTEM_PROMPT, f"fallback ({type(exc).__name__}: {exc})"
@@ -742,9 +1076,53 @@ async def get_system_prompt(cfg: Tier05Config, substrate: Substrate) -> tuple[st
         journal.close()
 
 
+async def reset_loopback_bridge(cfg: Tier05Config, substrate: Substrate, *,
+                                model: str, journal: RunJournal) -> str:
+    """``/reset`` the one shared --live-url bridge before a model's trajectory.
+
+    On the loopback substrate every 'fork' resolves back to the SAME container,
+    so without this the second model starts on the first model's factory --
+    inheriting its entity count and therefore its /execute latency, which is
+    exactly the number this phase exists to measure. The first model is reset
+    too: the container may have been left dirty by a bake, a smoke run, or an
+    earlier invocation.
+
+    Returns "" on success, the failure detail otherwise.
+    """
+    bridge = substrate.bridge_factory(cfg.live_url)
+    t0 = time.monotonic()
+    try:
+        await asyncio.to_thread(bridge.reset)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - reported, never swallowed
+        detail = f"{type(exc).__name__}: {exc}"
+        journal.incident(kind="loopback_reset_failed", detail=detail, model=model)
+        return detail
+    else:
+        journal.event("loopback_reset", model=model,
+                      wall_s=round(time.monotonic() - t0, 2))
+        return ""
+    finally:
+        close = getattr(bridge, "close", None)
+        if callable(close):
+            close()
+
+
 async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
     os.makedirs(cfg.journal_dir, exist_ok=True)
     os.makedirs(cfg.results_dir, exist_ok=True)
+    journal = RunJournal(os.path.join(cfg.journal_dir, "t05-orchestrator.jsonl"),
+                         run_id="t05",
+                         meta={"phase": "orchestrator", "models": list(cfg.models),
+                               "phases": list(cfg.phases)})
+    try:
+        return await _run_tier05(cfg, journal)
+    finally:
+        journal.close()
+
+
+async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
     if cfg.dry:
         substrate = dry_substrate()
         substrate_kind = "dry"
@@ -760,8 +1138,9 @@ async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
     # The substrate owns the template id (the dry substrate bakes its own), so
     # every ArmConfig built below reads it from here.
     cfg.template_snap = substrate.template_snap
-    caps = load_tier0_caps(cfg)
+    caps = load_tier0_caps(cfg, journal=journal)
     probe_s = float(caps.get("probe_s", cfg.probe_s))
+    materialize_s = caps.get("branch_materialize_s")
 
     phases = list(cfg.phases)
     skipped: dict[str, str] = {}
@@ -806,6 +1185,8 @@ async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
                 payload["diversity"][model] = await measure_diversity(
                     cfg, model, system_prompt
                 )
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001 - verbatim error, continue
                 payload["diversity"][model] = {
                     "model": model, "verdict": "error",
@@ -815,10 +1196,25 @@ async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
     if "latency" in cfg.phases and substrate.template_snap:
         payload["phases_run"].append("latency")
         for model in cfg.models:
+            if substrate_kind == "loopback":
+                failure = await reset_loopback_bridge(cfg, substrate, model=model,
+                                                      journal=journal)
+                if failure:
+                    # Without a clean container this model's steps would be
+                    # timed on the previous model's factory. Refuse the
+                    # measurement rather than publish a contaminated one.
+                    payload["latency"][model] = {
+                        "model": model,
+                        "error": f"loopback /reset failed before the latency "
+                                 f"trajectory: {failure}",
+                    }
+                    continue
             try:
                 payload["latency"][model] = await measure_step_latency(
                     cfg, model, substrate
                 )
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001
                 payload["latency"][model] = {
                     "model": model, "error": f"{type(exc).__name__}: {exc}"
@@ -833,9 +1229,14 @@ async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
         async def _one(model: str, task: str) -> dict[str, Any]:
             try:
                 return await task_sanity(cfg, model, task, substrate)
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001
-                return {"model": model, "task": task, "best_throughput": 0.0,
-                        "quota": 0, "error": f"{type(exc).__name__}: {exc}"}
+                # NOT a zero: a failed sanity run is missing evidence, and
+                # select_tasks excludes it instead of reading it as a floor.
+                return {"model": model, "task": task, "status": "error",
+                        "best_throughput": None, "quota": None,
+                        "error": f"{type(exc).__name__}: {exc}"}
 
         for model in cfg.models:
             payload["tasks"].extend(
@@ -843,12 +1244,42 @@ async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
             )
 
     # -- verdicts ----------------------------------------------------------
+    # Admission needs all three measurements. A phase that never ran leaves no
+    # evidence, and "no evidence" is not "no objection": the model stays out.
+    task_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in payload["tasks"]:
+        task_rows.setdefault(str(row.get("model")), []).append(row)
+
     verdicts: dict[str, Any] = {}
     for model in cfg.models:
         div = payload["diversity"].get(model, {})
         lat = payload["latency"].get(model, {})
+        rows = task_rows.get(model, [])
+        usable_tasks = [r for r in rows if _sanity_measured(r)]
+        div_verdict = div.get("verdict", "not_measured")
+        overlap = overlap_gate(lat.get("median_llm_s"), materialize_s)
+
+        model_blockers: list[str] = []
+        if div_verdict == "fail":
+            model_blockers.append(
+                "diversity gate FAIL: K branches come back near-identical")
+        elif div_verdict not in ("pass", "pass_with_hints", "conditional"):
+            model_blockers.append(
+                f"no diversity evidence (verdict {div_verdict})"
+                + (f": {div.get('rationale')}" if div_verdict == "error" else "")
+            )
+        if _positive(lat.get("median_step_s")) is None:
+            model_blockers.append(
+                "no step-latency evidence"
+                + (f": {lat['error']}" if lat.get("error") else "")
+            )
+        if not usable_tasks:
+            model_blockers.append(
+                f"no usable task-sanity evidence ({len(rows)} row(s) recorded)")
+        admitted_model = not model_blockers
+
         verdicts[model] = {
-            "diversity_verdict": div.get("verdict", "not_measured"),
+            "diversity_verdict": div_verdict,
             "diversity_rate_plain": div.get("plain", {}).get("distinct_program_rate"),
             "diversity_rate_hinted": div.get("hinted", {}).get("distinct_program_rate"),
             "parsed_plain": div.get("plain", {}).get("parsed"),
@@ -857,54 +1288,168 @@ async def run_tier05(cfg: Tier05Config) -> dict[str, Any]:
             "median_llm_s": lat.get("median_llm_s"),
             "tokens_per_step": lat.get("tokens_per_step"),
             "provider_retry_rate": div.get("provider_retry_rate"),
-            "hints_required": div.get("verdict") in ("pass_with_hints", "conditional"),
-            "enters_tier1": div.get("verdict") in ("pass", "pass_with_hints",
-                                                   "conditional", "not_measured"),
+            "usable_task_measurements": len(usable_tasks),
+            "overlap_verdict": overlap["verdict"],
+            "overlap_tail_s": overlap["tail_s"],
+            "overlap_detail": overlap["detail"],
+            "b_arm_admitted": bool(admitted_model and overlap["b_arm_admitted"]),
+            "hints_required": div_verdict in ("pass_with_hints", "conditional"),
+            "enters_tier1": admitted_model,
+            "admission_blockers": model_blockers,
             "notes": div.get("rationale", ""),
         }
+        journal.event("model_admission", model=model, admitted=admitted_model,
+                      diversity_verdict=div_verdict,
+                      overlap_verdict=overlap["verdict"],
+                      b_arm_admitted=verdicts[model]["b_arm_admitted"],
+                      blockers=model_blockers)
     payload["verdicts"] = verdicts
 
     admitted = [m for m, v in verdicts.items() if v["enters_tier1"]]
-    sizing = size_pilot(
-        models=admitted or list(cfg.models),
-        arms=("A", "AxK", "B", "C"),
-        c_model=(admitted or list(cfg.models))[0] if (admitted or cfg.models) else None,
-        latency={m: payload["latency"].get(m, {}) for m in cfg.models},
-        caps=caps,
-        probe_s=probe_s,
-        provision_s=cfg.provision_s,
-        teardown_s=cfg.teardown_s,
-        m=cfg.m,
-        K=cfg.pilot_K,
-        safety_factor=cfg.safety_factor,
-    )
+    b_models = [m for m in admitted if verdicts[m]["b_arm_admitted"]]
+    b_tails = [verdicts[m]["overlap_tail_s"] for m in b_models
+               if verdicts[m]["overlap_tail_s"] is not None]
+    # The tail is a cost of arm B's branch rounds: charge the worst admitted
+    # one. With no B in the pilot there are no branch materialisations to hide.
+    tail_for_sizing = max(b_tails) if b_tails else (0.0 if admitted else None)
+    payload["overlap_gate"] = {
+        "branch_materialize_s": materialize_s,
+        "tail_ratio_allowed": OVERLAP_TAIL_RATIO,
+        "b_arm_models": b_models,
+        "charged_tail_s": tail_for_sizing,
+        "per_model": {m: {"verdict": v["overlap_verdict"], "tail_s": v["overlap_tail_s"],
+                          "detail": v["overlap_detail"]}
+                      for m, v in verdicts.items()},
+    }
+
+    if admitted:
+        arms = ["A", "AxK"] + (["B"] if b_models else []) + ["C"]
+        sizing = size_pilot(
+            models=admitted,
+            arms=tuple(arms),
+            c_model=admitted[0],
+            latency={m: payload["latency"].get(m, {}) for m in admitted},
+            caps=caps,
+            probe_s=probe_s,
+            provision_s=cfg.provision_s,
+            teardown_s=cfg.teardown_s,
+            m=cfg.m,
+            K=cfg.pilot_K,
+            safety_factor=cfg.safety_factor,
+            materialize_tail_s=tail_for_sizing,
+        )
+    else:
+        sizing = {
+            "chosen": None,
+            "feasible_points": 0,
+            "ladder": [],
+            "inputs": {
+                "models": [], "arms": [], "c_model": None,
+                "run_cap": int(caps.get("run_cap", cfg.run_cap)),
+                "max_sandboxes": int(caps.get("max_sandboxes", cfg.max_sandboxes)),
+                "probe_s": probe_s,
+                "provision_s": cfg.provision_s,
+                "teardown_s": cfg.teardown_s,
+                "slowest_median_step_s": 0.0,
+                "models_without_latency": list(cfg.models),
+                "materialize_tail_s": tail_for_sizing,
+                "m": cfg.m,
+                "safety_factor": cfg.safety_factor,
+                "budget_s": PILOT_WALL_BUDGET_S,
+                "peak_sandboxes_per_arm": {},
+            },
+            "budget_respected": False,
+            "error": ("no model cleared Tier 0.5 calibration, so there is "
+                      "nothing to size"),
+        }
     chosen = sizing["chosen"]
-    selection = select_tasks(payload["tasks"], want=int(chosen["n_tasks"])) if \
-        payload["tasks"] else {"selected": [], "want": int(chosen["n_tasks"]),
-                               "candidates": [], "shortfall": int(chosen["n_tasks"]),
-                               "criterion": "task phase not run"}
+    want = int(chosen["n_tasks"]) if chosen else max(TASKS_LADDER)
+    selection = select_tasks(payload["tasks"], want=want) if payload["tasks"] else {
+        "selected": [], "want": want, "candidates": [], "shortfall": want,
+        "criterion": "task phase not run", "excluded_measurements": 0,
+    }
     payload["task_selection"] = selection
     payload["pilot_sizing"] = sizing
-    payload["frozen_pilot_config"] = {
-        "arms": ["A", "AxK", "B", "C"],
-        "models": admitted,
-        "c_model": sizing["inputs"]["c_model"],
-        "tasks": selection["selected"],
-        "replicates": int(chosen["replicates"]),
-        "T_s": float(chosen["T_s"]),
-        "K": cfg.pilot_K,
-        "diversity_gate_K": cfg.K,
-        "m": cfg.m,
-        "run_cap": sizing["inputs"]["run_cap"],
-        "max_sandboxes": sizing["inputs"]["max_sandboxes"],
-        "hints_required_models": [
-            m for m, v in verdicts.items() if v["hints_required"]
-        ],
-        "est_wall_h": chosen["est_wall_h"],
-        "n_runs": chosen["n_runs"],
-        "pre_registered": True,
-        "labelled": "TIER-1 PILOT (reduced T/tasks/replicates), not the full matrix",
-    }
+
+    blockers: list[str] = []
+    if not admitted:
+        blockers.append(
+            "no model cleared calibration: admission needs step latency, a "
+            "diversity verdict and usable task-sanity evidence for the SAME model"
+        )
+    if chosen is None:
+        blockers.append(str(sizing.get("error")
+                            or "no ladder point fits the pilot wall-clock budget"))
+    if not selection["selected"]:
+        blockers.append(f"no task cleared sanity selection ({selection['criterion']})")
+
+    if blockers:
+        payload["frozen_pilot_config"] = {
+            "status": "REFUSED",
+            "executable": False,
+            "error": ("Tier 0.5 calibration is incomplete: refusing to emit an "
+                      "executable Tier-1 pilot config"),
+            "blockers": blockers,
+            "per_model_blockers": {
+                m: v["admission_blockers"] for m, v in verdicts.items()
+                if v["admission_blockers"]
+            },
+            # Nothing here is runnable; the keys stay present and EMPTY so a
+            # consumer that reads them cannot mistake a refusal for a config.
+            "arms": [],
+            "models": [],
+            "tasks": [],
+            "models_admitted": admitted,
+            "arm_b_models": b_models,
+            "candidate_tasks": selection["selected"],
+            "pre_registered": True,
+            "labelled": "TIER-1 PILOT (reduced T/tasks/replicates), not the full matrix",
+        }
+        journal.incident(kind="frozen_config_refused", detail=" | ".join(blockers))
+    else:
+        frozen = {
+            "status": "FROZEN",
+            "executable": True,
+            "arms": list(sizing["inputs"]["arms"]),
+            "models": admitted,
+            "c_model": sizing["inputs"]["c_model"],
+            "tasks": selection["selected"],
+            "replicates": int(chosen["replicates"]),
+            "T_s": float(chosen["T_s"]),
+            "K": cfg.pilot_K,
+            "diversity_gate_K": cfg.K,
+            "m": cfg.m,
+            "run_cap": sizing["inputs"]["run_cap"],
+            "max_sandboxes": sizing["inputs"]["max_sandboxes"],
+            "hints_required_models": [
+                m for m in admitted if verdicts[m]["hints_required"]
+            ],
+            "arm_b_models": b_models,
+            "overlap_verdicts": {m: verdicts[m]["overlap_verdict"] for m in admitted},
+            "materialize_tail_s": chosen["materialize_tail_s"],
+            "branch_rounds_slowest_model": chosen["branch_rounds_slowest_model"],
+            "est_wall_h": chosen["est_wall_h"],
+            "n_runs": chosen["n_runs"],
+            "pre_registered": True,
+            "labelled": "TIER-1 PILOT (reduced T/tasks/replicates), not the full matrix",
+        }
+        if not b_models:
+            frozen["warnings"] = [
+                "arm B is excluded for every admitted model by the Tier-0 "
+                "overlap gate; the B-vs-AxK contrast is NOT measurable in this "
+                "pilot: "
+                + "; ".join(f"{m}: {verdicts[m]['overlap_detail']}" for m in admitted)
+            ]
+        if selection["shortfall"]:
+            frozen.setdefault("warnings", []).append(
+                f"{selection['shortfall']} fewer eligible task(s) than the sized "
+                f"point wants ({want}); the pilot runs the eligible subset"
+            )
+        payload["frozen_pilot_config"] = frozen
+        journal.event("frozen_pilot_config", **{
+            k: frozen[k] for k in ("arms", "models", "tasks", "T_s", "replicates",
+                                   "est_wall_h", "n_runs", "arm_b_models")
+        })
     return payload
 
 
@@ -932,8 +1477,8 @@ def write_markdown(payload: dict[str, Any], path: str) -> str:
     lines.append("")
     lines.append("| model | diversity (plain) | diversity (hinted) | usable programs "
                  "(plain) | verdict | median step s | median LLM s | tokens/step | "
-                 "hints required |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+                 "hints required | overlap gate (arm B) | admitted |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for model, v in payload["verdicts"].items():
         usable = (
             f"{v['parsed_plain']}/{v['parsed_plain'] + v['unusable_samples']}"
@@ -941,16 +1486,25 @@ def write_markdown(payload: dict[str, Any], path: str) -> str:
             and v.get("unusable_samples") is not None
             else "-"
         )
+        overlap = str(v.get("overlap_verdict") or "-")
+        tail = v.get("overlap_tail_s")
+        if isinstance(tail, (int, float)) and tail > 0:
+            overlap += f" (tail {tail:.0f}s)"
         lines.append(
             f"| `{model}` | {v['diversity_rate_plain']} | {v['diversity_rate_hinted']} "
             f"| {usable} | **{v['diversity_verdict']}** | {v['median_step_s']} | "
             f"{v['median_llm_s']} | {v['tokens_per_step']} | "
-            f"{'yes' if v['hints_required'] else 'no'} |"
+            f"{'yes' if v['hints_required'] else 'no'} | {overlap} | "
+            f"{'yes' if v.get('enters_tier1') else '**NO**'} |"
         )
     lines.append("")
     for model, v in payload["verdicts"].items():
         if v["notes"]:
             lines.append(f"- `{model}`: {v['notes']}")
+    for model, v in payload["verdicts"].items():
+        if v.get("admission_blockers"):
+            lines.append(f"- `{model}` NOT ADMITTED: "
+                         + "; ".join(v["admission_blockers"]))
     lines.append("")
     lines.append("Gate thresholds (pre-registered, K=4): distinct-program rate "
                  f">= {DIVERSITY_PASS} passes; >= {DIVERSITY_CONDITIONAL} is "
@@ -959,21 +1513,42 @@ def write_markdown(payload: dict[str, Any], path: str) -> str:
                  "(Kimi: temperature must equal 1; Codex: temperature rejected), "
                  "so the hinted column is the operative one.")
     lines.append("")
+    gate = payload.get("overlap_gate")
+    if gate:
+        materialize = gate.get("branch_materialize_s")
+        lines.append(
+            "Tier-0 OVERLAP GATE (arm B): snapshot+fork materialisation "
+            + (f"{materialize:.1f}s (Tier-0 soak p50)" if isinstance(materialize, (int, float))
+               else "NOT MEASURED by Tier 0")
+            + " against each model's median LLM wait; the unhidden tail is "
+            f"charged to T. A tail above {OVERLAP_TAIL_RATIO:g}x the sampling "
+            "wait excludes arm B for that model. Admitted for B: "
+            + (", ".join(f"`{m}`" for m in gate.get("b_arm_models") or []) or "none")
+            + f"; tail charged into the branch round: {gate.get('charged_tail_s')}s."
+        )
+        lines.append("")
 
     lines.append("## Task sanity probe")
     lines.append("")
     if payload["tasks"]:
         lines.append("| task | quota | best throughput by model | non-zero models | "
                      "above quota (not disqualifying) | log10 distance from quota | "
-                     "sanity errors | eligible |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+                     "missing evidence | sanity errors | eligible |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for cand in payload["task_selection"]["candidates"]:
-            bests = ", ".join(f"{m}={v:g}" for m, v in cand["best_by_model"].items())
+            bests = ", ".join(
+                f"{m}={v:g}" for m, v in (cand.get("best_by_model") or {}).items()
+            ) or "-"
+            missing = ", ".join(
+                f"{m} ({why})"
+                for m, why in sorted((cand.get("missing_evidence") or {}).items())
+            ) or "-"
             lines.append(
                 f"| `{cand['task']}` | {cand['quota']} | {bests} | "
                 f"{cand['nonzero_models']} | "
                 f"{', '.join(cand.get('above_quota_models') or []) or '-'} | "
                 f"{cand.get('log10_distance_from_quota', '-')} | "
+                f"{missing} | "
                 f"{cand.get('sanity_errors', '-')} | "
                 f"{'yes' if cand['eligible'] else 'no: ' + '; '.join(cand['reasons'])} |"
             )
@@ -991,38 +1566,73 @@ def write_markdown(payload: dict[str, Any], path: str) -> str:
 
     lines.append("## Frozen pilot config")
     lines.append("")
+    if frozen.get("executable") is False:
+        lines.append(f"**REFUSED -- {frozen.get('error')}**")
+        lines.append("")
+        for blocker in frozen.get("blockers") or []:
+            lines.append(f"- {blocker}")
+        lines.append("")
+        lines.append("No executable pilot config is emitted: re-run the missing "
+                     "calibration phases (or fix the failing ones) and freeze again.")
+        lines.append("")
+    for warning in frozen.get("warnings") or []:
+        lines.append(f"**WARNING:** {warning}")
+        lines.append("")
     lines.append("```json")
     lines.append(json.dumps(frozen, indent=2))
     lines.append("```")
     lines.append("")
-    lines.append(
-        f"Sizing: {chosen['n_runs']} runs, {chosen['per_run_s']:.0f}s per run "
-        f"(T={chosen['T_s']:.0f}s + provisioning + teardown), run cap "
-        f"{payload['pilot_sizing']['inputs']['run_cap']}, sandbox slots "
-        f"{payload['pilot_sizing']['inputs']['max_sandboxes']}; binding bound "
-        f"{'run-count' if chosen['bound_by_runs_s'] >= chosen['bound_by_slots_s'] else 'sandbox-slot'}"
-        f", estimated wall clock **{chosen['est_wall_h']}h** against a 3h budget "
-        f"(safety factor {cfg['safety_factor']})."
-    )
-    lines.append("")
-    lines.append(
-        f"Branch rounds available at T for the slowest model: "
-        f"{chosen['branch_rounds_slowest_model']} (m={cfg['m']}, direct probe "
-        f"{payload['pilot_sizing']['inputs']['probe_s']:.0f}s). A pilot point is "
-        "only feasible with >= 2 branch rounds, otherwise arm B never converges "
-        "twice and the B-vs-A×K contrast is untestable."
-    )
+    inputs = payload["pilot_sizing"].get("inputs") or {}
+    if chosen is None:
+        lines.append(f"Sizing: no feasible ladder point. "
+                     f"{payload['pilot_sizing'].get('error', '')}")
+        cheapest = payload["pilot_sizing"].get("cheapest_infeasible")
+        if cheapest:
+            lines.append("")
+            lines.append(
+                f"Cheapest point searched: T={cheapest['T_s']:.0f}s, "
+                f"{cheapest['n_tasks']} task(s), {cheapest['replicates']} "
+                f"replicate(s) -> {cheapest['est_wall_h']}h and "
+                f"{cheapest['branch_rounds_slowest_model']} branch round(s). "
+                "Reported for diagnosis only; it is NOT frozen, because it was "
+                "measured not to fit."
+            )
+    else:
+        lines.append(
+            f"Sizing: {chosen['n_runs']} runs, {chosen['per_run_s']:.0f}s per run "
+            f"(T={chosen['T_s']:.0f}s + provisioning + teardown), run cap "
+            f"{inputs.get('run_cap')}, sandbox slots "
+            f"{inputs.get('max_sandboxes')}; binding bound "
+            f"{'run-count' if chosen['bound_by_runs_s'] >= chosen['bound_by_slots_s'] else 'sandbox-slot'}"
+            f", estimated wall clock **{chosen['est_wall_h']}h** against a 3h budget "
+            f"(safety factor {cfg['safety_factor']})."
+        )
+        lines.append("")
+        lines.append(
+            f"Branch rounds available at T for the slowest model: "
+            f"{chosen['branch_rounds_slowest_model']} (m={cfg['m']}, direct probe "
+            f"{float(inputs.get('probe_s') or 0.0):.0f}s, unhidden snapshot+fork "
+            f"tail {chosen.get('materialize_tail_s')}s -> branch round "
+            f"{chosen.get('branch_round_s')}s). A pilot point is only feasible "
+            "with >= 2 branch rounds, otherwise arm B never converges twice and "
+            "the B-vs-A×K contrast is untestable."
+        )
     lines.append("")
     lines.append("Ladder searched (pre-registered preference: task coverage, then "
                  "replicates, then T):")
     lines.append("")
-    lines.append("| T s | tasks | replicates | runs | est wall h | fits |")
-    lines.append("|---|---|---|---|---|---|")
-    for e in payload["pilot_sizing"]["ladder"]:
-        lines.append(
-            f"| {e['T_s']:.0f} | {e['n_tasks']} | {e['replicates']} | {e['n_runs']} | "
-            f"{e['est_wall_h']} | {'yes' if e['fits'] else 'no'} |"
-        )
+    if payload["pilot_sizing"]["ladder"]:
+        lines.append("| T s | tasks | replicates | runs | branch rounds | est wall h "
+                     "| fits |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for e in payload["pilot_sizing"]["ladder"]:
+            lines.append(
+                f"| {e['T_s']:.0f} | {e['n_tasks']} | {e['replicates']} | "
+                f"{e['n_runs']} | {e.get('branch_rounds_slowest_model')} | "
+                f"{e['est_wall_h']} | {'yes' if e['fits'] else 'no'} |"
+            )
+    else:
+        lines.append("Ladder not searched: nothing to size.")
     lines.append("")
     lines.append("## Standing deviations (v2.5)")
     lines.append("")
@@ -1060,13 +1670,20 @@ def write_markdown(payload: dict[str, Any], path: str) -> str:
 
 
 def _cli() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Tier 0.5 calibration")
+    ap = argparse.ArgumentParser(
+        description="Tier 0.5 calibration",
+        epilog="exit 0 = frozen pilot config emitted; exit 1 = config REFUSED "
+               "(incomplete/failed calibration, no eligible task, or no ladder "
+               "point that fits) -- the evidence is still written",
+    )
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS))
     ap.add_argument("--tasks", default=",".join(DEFAULT_TASK_POOL))
     ap.add_argument("--template-snap", default=os.environ.get("TEMPLATE_SNAP", ""))
     ap.add_argument("--live-url", default="",
                     help="base URL of one already-running bridge: enables the "
-                         "latency phase and the real system prompt without Farplane")
+                         "latency phase and the real system prompt without "
+                         "Farplane. The bridge is /reset before EVERY model's "
+                         "latency trajectory, since all 'forks' resolve to it")
     ap.add_argument("--allow-loopback-tasks", action="store_true",
                     help="run the task phase on the shared --live-url container "
                          "(state carries across tasks; selection is then unsound)")
@@ -1103,22 +1720,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         cfg.models = ("fake-model",)
         cfg.journal_dir = "bench/journal/tier05-dry"
     payload = asyncio.run(run_tier05(cfg))
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, default=str)
+    atomic_write_json(args.out, payload)
     write_markdown(payload, args.md)
+    frozen = payload["frozen_pilot_config"]
     print(json.dumps(
         {
             "phases_run": payload["phases_run"],
             "verdicts": payload["verdicts"],
             "task_selection": payload["task_selection"]["selected"],
-            "frozen_pilot_config": payload["frozen_pilot_config"],
+            "frozen_pilot_config": frozen,
             "json": args.out,
             "md": args.md,
         },
         indent=2, default=str,
     ))
-    return 0
+    # 1 = the calibration did not produce an executable frozen pilot config
+    # (missing/failed evidence, or no ladder point that fits). The evidence is
+    # still written; what is refused is the executable config.
+    return 0 if frozen.get("executable") else 1
 
 
 if __name__ == "__main__":  # pragma: no cover - operational entry point

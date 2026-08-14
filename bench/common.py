@@ -6,23 +6,49 @@ every tier script shares:
 * :class:`TimingBuckets` -- the fixed decomposition of run wall clock demanded
   by the design doc ("LLM wait vs itemized infra wait vs rollout vs scoring").
 * :class:`RunJournal` -- append-only JSONL evidence: every LLM call with tokens
-  and latency, every infra operation, every probe result.
+  and latency, every infra operation, every probe result. Re-runs append, so
+  records are grouped into sessions and read back with
+  :func:`load_journal_records`.
 * :class:`Budget` -- wall clock T is the SOLE stopping rule (design v2.3), so
   the deadline is an object that phases interrogate rather than an ad-hoc
   ``time.time()`` comparison scattered through the arm loops.
+
+Alongside them sit the two helpers every script has to agree on:
+:func:`resource_name` (Farplane's 60-char name budget, with prefix and role
+kept intact) and :func:`atomic_write_json` (every result artifact, so no
+reader ever sees a half-written file).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+
+__all__ = [
+    "BUCKETS",
+    "Budget",
+    "BudgetExhausted",
+    "Curve",
+    "Interval",
+    "JournalParseError",
+    "RunJournal",
+    "ScoreRecord",
+    "TimingBuckets",
+    "atomic_write_json",
+    "load_journal_records",
+    "new_run_id",
+    "resource_name",
+]
 
 # ---------------------------------------------------------------------------
 # Timing buckets
@@ -264,9 +290,20 @@ class RunJournal:
     """Append-only JSONL evidence file for one run (or one tier script).
 
     Every record carries ``ts`` (unix), ``mono`` (monotonic, comparable with
-    timing intervals), ``seq`` and ``run_id``. Writes are flushed immediately:
-    a run that dies mid-flight must still leave a readable journal, because
-    graceful partial results are a requirement of the orchestrator.
+    timing intervals), ``seq``, ``run_id`` and ``session``. Writes are flushed
+    immediately: a run that dies mid-flight must still leave a readable
+    journal, because graceful partial results are a requirement of the
+    orchestrator.
+
+    Consumer contract -- the file is opened in append mode, so re-running the
+    same run id (or invoking a tier script twice) adds a *new session* to the
+    same path rather than overwriting evidence. Each instance stamps its own
+    ``session`` id on every record, restarts ``seq`` at 1, and always writes a
+    ``journal_open`` event first. So ``seq`` orders records only *within* one
+    session, and the file as a whole is not a single evidence stream: summing
+    it blindly double-counts reruns. Readers MUST go through
+    :func:`load_journal_records`, which returns one session at a time and
+    defaults to the latest.
     """
 
     def __init__(self, path: str | os.PathLike[str], run_id: str | None = None,
@@ -274,12 +311,15 @@ class RunJournal:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id or self.path.stem
+        #: Tags the records this instance appends; see the class docstring.
+        self.session = uuid.uuid4().hex[:12]
         self._lock = threading.Lock()
         self._seq = 0
         self._fh = self.path.open("a", encoding="utf-8")
         self.counts: dict[str, int] = {}
-        if meta is not None:
-            self.event("journal_open", **meta)
+        # Unconditional: the session boundary is what keeps an appended journal
+        # readable, so it must not depend on the caller passing meta.
+        self.event("journal_open", **(meta or {}))
 
     # -- primitives --------------------------------------------------------
     def write(self, kind: str, **fields: Any) -> dict[str, Any]:
@@ -287,6 +327,7 @@ class RunJournal:
             self._seq += 1
             rec = {
                 "seq": self._seq,
+                "session": self.session,
                 "ts": time.time(),
                 "mono": time.monotonic(),
                 "run_id": self.run_id,
@@ -482,6 +523,124 @@ def _jsonable(obj: Any) -> Any:
     return repr(obj)
 
 
+class JournalParseError(ValueError):
+    """A run journal held lines that are not readable evidence.
+
+    Raised by :func:`load_journal_records` in strict mode. ``errors`` is the
+    full list of ``(lineno, message)`` pairs (1-based line numbers), so a
+    caller can report exactly which evidence is unreadable instead of quietly
+    averaging over a damaged file.
+    """
+
+    def __init__(self, path: str | os.PathLike[str],
+                 errors: Sequence[tuple[int, str]]) -> None:
+        self.path = Path(path)
+        self.errors: list[tuple[int, str]] = list(errors)
+        head = "; ".join(f"line {ln}: {msg}" for ln, msg in self.errors[:3])
+        more = "" if len(self.errors) <= 3 else f" (+{len(self.errors) - 3} more)"
+        super().__init__(
+            f"{self.path}: {len(self.errors)} unreadable journal line(s): {head}{more}"
+        )
+
+
+def _is_journal_open(rec: dict[str, Any]) -> bool:
+    return rec.get("kind") == "event" and rec.get("name") == "journal_open"
+
+
+def load_journal_records(
+    path: str | os.PathLike[str],
+    *,
+    session: str = "latest",
+    strict: bool = True,
+) -> list[dict[str, Any]]:
+    """Read a run journal, one session at a time.
+
+    A journal is an append stream that may hold several sessions (see
+    :class:`RunJournal`), so every consumer has to say which one it means:
+
+    * ``session="latest"`` (default) -- the records of the last
+      ``journal_open``. Records written before any ``journal_open`` are legacy
+      evidence and count as one implicit session, so a journal with no open
+      record at all yields every record it has.
+    * ``session="all"`` -- every record, in file order. Only for tools that
+      group by ``session`` themselves.
+    * anything else -- the records carrying that exact ``session`` id.
+
+    Failing closed is the point. A missing file raises
+    :class:`FileNotFoundError`; unreadable lines raise
+    :class:`JournalParseError` rather than silently shrinking the evidence.
+    The single tolerated corruption is an unterminated final line -- the torn
+    append of a process killed mid-write -- which is dropped with a warning.
+    With ``strict=False`` unreadable lines are skipped with a warning and the
+    caller owns the resulting ambiguity.
+    """
+    if not isinstance(session, str) or not session:
+        raise TypeError(f"session must be a non-empty str, got {session!r}")
+    p = Path(path)
+    records: list[dict[str, Any]] = []
+    errors: list[tuple[int, str]] = []
+    with p.open("rb") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            # Only the final line of a file can lack its newline, so this flag
+            # is exactly "torn write" and nothing else.
+            terminated = raw.endswith(b"\n")
+            problem: str | None = None
+            rec: Any = None
+            try:
+                text = raw.decode("utf-8").strip()
+            except UnicodeDecodeError as exc:
+                problem = f"invalid utf-8 ({exc.reason})"
+            else:
+                if not text:
+                    continue
+                try:
+                    rec = json.loads(text)
+                except ValueError as exc:
+                    problem = f"malformed json ({exc})"
+                else:
+                    if not isinstance(rec, dict):
+                        problem = f"expected a JSON object, got {type(rec).__name__}"
+            if problem is None:
+                records.append(rec)
+            elif not terminated:
+                warnings.warn(
+                    f"{p}: dropping torn final line {lineno}: {problem}",
+                    RuntimeWarning, stacklevel=2,
+                )
+            else:
+                errors.append((lineno, problem))
+    if errors:
+        if strict:
+            raise JournalParseError(p, errors)
+        warnings.warn(
+            f"{p}: skipping {len(errors)} unreadable journal line(s), first at "
+            f"line {errors[0][0]}: {errors[0][1]}",
+            RuntimeWarning, stacklevel=2,
+        )
+    if session == "all":
+        return records
+    if session == "latest":
+        opens = [i for i, rec in enumerate(records) if _is_journal_open(rec)]
+        if not opens:
+            return records  # legacy journal: the whole file is one session
+        start = opens[-1]
+        sid = records[start].get("session")
+        if isinstance(sid, str) and sid:
+            # Select by id, not by position: two writers appending to one path
+            # interleave their lines and only the id survives that.
+            return [rec for rec in records if rec.get("session") == sid]
+        return records[start:]  # legacy open record, no session id to match on
+    picked = [rec for rec in records if rec.get("session") == session]
+    if not picked:
+        if strict:
+            raise ValueError(f"{p}: no records for session {session!r}")
+        warnings.warn(
+            f"{p}: no records for session {session!r}",
+            RuntimeWarning, stacklevel=2,
+        )
+    return picked
+
+
 # ---------------------------------------------------------------------------
 # Wall clock budget (design v2.3: wall clock is the SOLE stopping rule)
 # ---------------------------------------------------------------------------
@@ -555,16 +714,91 @@ class Budget:
 # ---------------------------------------------------------------------------
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Make a rename itself durable; best effort, not every fs permits it."""
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:  # pragma: no cover - platform dependent
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - platform dependent
+        pass
+    finally:
+        os.close(fd)
+
+
+def atomic_write_json(path: str | os.PathLike[str], payload: Any, *,
+                      indent: int | None = 2) -> Path:
+    """Write ``payload`` as JSON so no reader ever sees a partial artifact.
+
+    Result artifacts are read by other scripts, and by humans, while runs are
+    still in flight; a crash halfway through ``json.dump`` would leave a file
+    that parses as nothing at all. So the payload goes to a temp file in the
+    *same* directory, is flushed and fsynced, and is then moved into place with
+    :func:`os.replace`, which is atomic on POSIX. Journals are exempt: they are
+    append streams by design (see :class:`RunJournal`).
+
+    Values that are not JSON-native take the same :func:`_jsonable` fallback
+    the journal uses, so a stray dataclass never costs a caller its artifact.
+    Returns the final path.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=indent, default=_jsonable)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    _fsync_dir(p.parent)
+    return p
+
+
 def new_run_id(arm: str, model: str, task: str, replicate: int) -> str:
     """Stable-ish, collision-free run id used for names, journals and tags."""
     safe_model = model.replace("/", "-").replace(":", "-")
     return f"{arm}-{safe_model}-{task}-r{replicate}-{uuid.uuid4().hex[:6]}"
 
 
+#: Farplane refuses longer resource names, so this is a hard budget, not taste.
+_NAME_MAX = 60
+#: Hex chars of digest spliced in when a name has to be shortened; 32 bits is
+#: ample to keep the run ids of one benchmark matrix apart.
+_NAME_HASH_CHARS = 8
+
+
 def resource_name(prefix: str, run_id: str, role: str) -> str:
-    """Farplane resource name; prefix is the reaper's contract."""
-    stem = f"{prefix}{run_id}-{role}"
-    return stem[:60].rstrip("-")
+    """Farplane resource name, at most 60 chars, prefix and role intact.
+
+    Both ends are load-bearing: ``prefix`` is the reaper's contract (it deletes
+    by prefix) and ``role`` is the only thing telling the eight concurrent
+    Hybrid seats of one run apart. Truncating the whole stem erased the role
+    and made those seats collide on a single name, so instead only the
+    ``run_id`` middle is cut, with an 8-char blake2b digest of the *full*
+    untruncated stem spliced in where the cut happened. Names stay
+    deterministic, and distinct ``(run_id, role)`` pairs keep distinct names.
+    """
+    stem = f"{prefix}{run_id}-{role}" if role else f"{prefix}{run_id}"
+    if len(stem) <= _NAME_MAX:
+        return stem.rstrip("-")
+    digest = hashlib.blake2b(
+        stem.encode("utf-8"), digest_size=_NAME_HASH_CHARS // 2
+    ).hexdigest()
+    tail = f"-{digest}-{role}" if role else f"-{digest}"
+    keep = _NAME_MAX - len(prefix) - len(tail)
+    if keep < 1:
+        raise ValueError(
+            f"resource name budget of {_NAME_MAX} chars leaves no room for a "
+            f"run id: prefix {prefix!r} plus role {role!r} already need "
+            f"{len(prefix) + len(tail)} chars"
+        )
+    return f"{prefix}{run_id[:keep].rstrip('-')}{tail}"
 
 
 @dataclass

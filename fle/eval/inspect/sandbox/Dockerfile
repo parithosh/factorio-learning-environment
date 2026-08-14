@@ -79,6 +79,12 @@ ENV FLE_NUM_AGENTS="1"
 # GameState capture). Empty = normal Inspect eval behaviour.
 ENV FLE_BENCH_MODE=""
 ENV FLE_BRIDGE_PORT="8730"
+# Bridge TCP authentication. FLE_BRIDGE_TOKEN set => every TCP request must carry
+# `Authorization: Bearer <token>` (the /tmp/fle_bridge.sock UDS listener is exempt).
+# Unset => the TCP listener is opened only when FLE_BRIDGE_ALLOW_INSECURE=1; otherwise
+# the bridge warns once and serves the UDS only. Inject the token at container start.
+ENV FLE_BRIDGE_TOKEN=""
+ENV FLE_BRIDGE_ALLOW_INSECURE=""
 
 # Bridge HTTP API (same handler as the /tmp/fle_bridge.sock UDS listener)
 EXPOSE 8730
