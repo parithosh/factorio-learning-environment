@@ -30,6 +30,13 @@ not support one -- no admitted model, no eligible task, or no ladder point that
 fits the budget with >= 2 branch rounds -- the config is REFUSED
 (``executable: false``, with the blockers) and the CLI exits 1 instead of
 emitting a runnable config the measurements do not back.
+
+Tier-0 CAPACITY is read with PRESENCE semantics: an explicitly null per-node
+run cap means "never measured" and blocks executable sizing (liftable only by
+an operator ``--node-cap``), a cap of 0 is a measurement that refuses the
+pilot outright, and only a MISSING key falls back to the configured default.
+An invalid or incomplete Tier-0 soak retracts every soak-derived number in
+BOTH Tier-0 artifacts, so a stale copy cannot re-supply what was retracted.
 """
 
 from __future__ import annotations
@@ -151,6 +158,10 @@ class Tier05Config:
     provision_s: float = 90.0
     teardown_s: float = 30.0
     run_cap: int = 6
+    #: Operator-declared per-node concurrent run cap (``--node-cap``). It lifts
+    #: an UNMEASURED (explicit-null or retracted) Tier-0 cap so sizing can
+    #: proceed on a declared number; it never overrides a MEASURED cap of 0.
+    node_cap_override: int | None = None
     max_sandboxes: int = 24
     dry: bool = False
     #: Base URL of a single already-running bridge. Enables the latency phase
@@ -579,10 +590,13 @@ def select_tasks(
         nonzero = [m for m, v in bests.items() if v > 0]
         above = [m for m, v in bests.items() if quota and v >= quota]
         ratios = [v / quota for v in bests.values() if quota and v > 0]
-        # Distance in orders of magnitude from the quota; 0 means the sanity
-        # probe landed exactly at quota, which is the most legible region.
+        # Mean ABSOLUTE distance in orders of magnitude from the quota; 0 means
+        # the sanity probe landed exactly at quota, which is the most legible
+        # region. Averaging SIGNED logs let opposite deviations cancel, so a
+        # task 100x above quota for one model and 100x below for another read
+        # as sitting exactly at quota.
         distance = (
-            round(abs(statistics.fmean([math.log10(r) for r in ratios])), 4)
+            round(statistics.fmean([abs(math.log10(r)) for r in ratios]), 4)
             if ratios else None
         )
         reasons: list[str] = []
@@ -640,8 +654,9 @@ def select_tasks(
             "continuous, so the quota is a normaliser and not a ceiling); "
             "failed or probe-less sanity runs are missing evidence and are "
             "excluded from the ranking rather than counted as zero; ranked by "
-            "model coverage, then by how few orders of magnitude the sanity "
-            "probe sat from the quota"
+            "model coverage, then by the MEAN ABSOLUTE number of orders of "
+            "magnitude the sanity probe sat from the quota (absolute, so "
+            "deviations in opposite directions cannot cancel out)"
         ),
         "shortfall": max(0, want - len(selected)),
         "excluded_measurements": sum(
@@ -674,18 +689,74 @@ def _stat_n(node: Any, key: str) -> int | None:
     return int(n) if isinstance(n, int) else None
 
 
+#: Cap keys Tier 0 publishes, in descending preference. Every one of them is
+#: derived from the soak stage -- including tier0.json's top-level copy -- so a
+#: retracted soak poisons all of them in BOTH artifacts (R2C2).
+TIER0_CAP_KEYS: tuple[str, ...] = ("recommended_run_cap", "per_node_run_cap",
+                                   "node_cap")
+
+
+def _cap_present(data: dict[str, Any], soak: dict[str, Any],
+                 key: str) -> tuple[bool, Any]:
+    """``(present, value)`` at ``key``: top level first, then the soak block.
+
+    PRESENCE, not truthiness. Tier 0 publishes an explicit ``null`` cap for a
+    node whose capacity was never measured and ``0`` for one measured to
+    sustain nothing; ``dict.get`` collapses both into "absent", which is how an
+    unmeasured node came to be sized on the configured default of 6.
+    """
+    if key in data:
+        return True, data[key]
+    if key in soak:
+        return True, soak[key]
+    return False, None
+
+
+def _cap_status(value: Any) -> str:
+    """R2C2 classification of one PRESENT cap value."""
+    if value is None:
+        return "unmeasured"
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "malformed"
+    if value >= 1:
+        return "measured"
+    return "zero" if value == 0 else "malformed"
+
+
 def load_tier0_caps(cfg: Tier05Config,
                     *, journal: RunJournal | None = None) -> dict[str, Any]:
     """Tier-0 evidence for pilot sizing: run cap, slots, materialisation, probe.
 
     Reads the REAL Tier-0 schema. The soak stage reports distributions, not
-    flat scalars (``latency.snapshot_s.p50``, ``latency.fork_total_s.p50``),
-    and the direct probe cost only exists in the full ``tier0.json`` under
-    ``probe.cycles[*].probe_s`` -- so both files are read and each measurement
-    is taken from the first file that actually carries it.
+    flat scalars, and it is spelled differently in each artifact
+    (``latency.snapshot_s.p50`` in the flat ``tier0_soak.json``,
+    ``soak.latency.snapshot_s.p50`` inside ``tier0.json``); the direct probe
+    cost only exists in the full ``tier0.json`` under ``probe.cycles[*].
+    probe_s``. So both files are read, each measurement is taken from the first
+    file that actually carries it, and the recorded evidence path is the one
+    that file really uses -- a citation nobody can resolve is not evidence.
+
+    CAPACITY (R2C2). The per-node run cap has four states and they are four
+    different statements:
+
+    * ``int >= 1``  measured capacity; sizing uses it.
+    * ``null``      PRESENT and unmeasured. Sizing on the configured default
+      would invent capacity Tier 0 explicitly refused to claim, so this is a
+      capacity BLOCKER, liftable only by an operator ``--node-cap``.
+    * ``0``         measured ZERO capacity. Refused outright: a flag does not
+      argue with a measurement.
+    * ABSENT        an artifact too old to carry the key. This is the only case
+      that falls back to the configured default, with a journalled warning.
+
+    A retracted soak (INVALID marker, ``valid: false``, ``complete: false`` or
+    ``conclusions_invalidated``) poisons soak-derived latency AND every cap read
+    in BOTH artifacts, so tier0.json's stale top-level copy cannot re-supply
+    what the marker just withdrew. Constants and probe evidence have
+    independent provenance and stay usable.
 
     Anything Tier 0 did not measure falls back to the configured default AND is
-    reported in ``warnings`` (journalled when a journal is given). The
+    reported in ``warnings`` (journalled when a journal is given); anything it
+    refused lands in ``blockers``, which refuses the frozen config. The
     snapshot+fork materialisation has no default at all: without it the arm-B
     overlap gate is ``unknown``, which is not the same as fast.
     """
@@ -696,9 +767,23 @@ def load_tier0_caps(cfg: Tier05Config,
         "max_sandboxes": cfg.max_sandboxes,
         "evidence": {},
         "warnings": [],
+        "blockers": [],
+        "cap_status": "absent",
+        "run_cap_backed": False,
+        "soak_invalid": False,
+        "soak_invalid_reasons": [],
+        "pilot_K": cfg.pilot_K,
     }
     evidence: dict[str, Any] = out["evidence"]
     warnings: list[str] = out["warnings"]
+    blockers: list[str] = out["blockers"]
+    #: First PRESENT cap claim, whatever it says. There is no cap shopping: a
+    #: null or 0 is an answer, and moving on to the next key or the next file
+    #: until something reads >= 1 is how a retracted soak got re-published as
+    #: capacity from tier0.json.
+    cap_seen: dict[str, Any] | None = None
+    #: Parsed artifacts in preference order: ``(name, data, soak, flat)``.
+    artifacts: list[tuple[str, dict[str, Any], dict[str, Any], bool]] = []
     for name in ("tier0_soak.json", "tier0.json"):
         path = os.path.join(cfg.results_dir, name)
         if not os.path.exists(path):
@@ -713,21 +798,88 @@ def load_tier0_caps(cfg: Tier05Config,
         if not isinstance(data, dict):
             warnings.append(f"{name}: not a JSON object")
             continue
-        if data.get("valid") is False:
-            # Tier 0 replaces the artifact with an INVALID marker when the soak
-            # failed or was never validated. Its "partial" block still holds
-            # old numbers; reading them would dress a failed soak as capacity.
-            warnings.append(
-                f"{name}: INVALID marker "
-                f"({data.get('invalid_reason') or 'no reason recorded'}); "
-                "Tier-0 evidence is ABSENT, not zero"
-            )
-            continue
         out["sources"].append(name)
         # tier0_soak.json IS the soak payload; tier0.json nests it under "soak".
-        soak = data.get("soak")
-        if not isinstance(soak, dict):
-            soak = data
+        nested = data.get("soak")
+        flat = not isinstance(nested, dict)
+        artifacts.append((name, data, data if flat else nested, flat))
+
+    # Tier 0 RETRACTS a soak it could not validate: the flat artifact is
+    # replaced by an INVALID marker, and an abnormal exit marks the nested block
+    # and files conclusions_invalidated. The stale "partial" numbers stay in
+    # place, so a retraction found in EITHER file poisons the soak-derived
+    # numbers in BOTH -- and it is settled BEFORE anything is read, so a stale
+    # sibling that still claims validity cannot win by being read first.
+    for name, data, soak, flat in artifacts:
+        retracted: list[str] = []
+        if data.get("valid") is False:
+            retracted.append(
+                f"{name}: INVALID marker "
+                f"({data.get('invalid_reason') or 'no reason recorded'})"
+            )
+        if not flat and soak.get("valid") is False:
+            retracted.append(f"{name}: soak block marked invalid")
+        if soak.get("complete") is False:
+            reasons = soak.get("incomplete_reasons") or []
+            retracted.append(
+                f"{name}: soak incomplete ("
+                + ("; ".join(str(r) for r in reasons) if reasons
+                   else "stage carries no completeness record")
+                + ")"
+            )
+        stale = data.get("conclusions_invalidated")
+        if isinstance(stale, dict):
+            retracted.append(
+                f"{name}: Tier 0 invalidated its own conclusions "
+                f"({stale.get('reason') or 'no reason recorded'})"
+            )
+        out["soak_invalid_reasons"].extend(retracted)
+        warnings.extend(
+            f"{reason}; soak-derived latency and capacity are ABSENT, not zero, "
+            "in every Tier-0 artifact" for reason in retracted
+        )
+    out["soak_invalid"] = bool(out["soak_invalid_reasons"])
+
+    for name, data, soak, flat in artifacts:
+        if cap_seen is None and not out["soak_invalid"]:
+            run_cap_block = data.get("run_cap")
+            if not isinstance(run_cap_block, dict):
+                run_cap_block = {}
+            if run_cap_block.get("valid") is False:
+                cap_seen = {
+                    "file": name, "path": "run_cap.valid", "value": None,
+                    "status": "invalidated",
+                    "detail": "; ".join(
+                        str(b) for b in (run_cap_block.get("blockers") or [])
+                    ),
+                }
+            else:
+                for key in TIER0_CAP_KEYS:
+                    present, value = _cap_present(data, soak, key)
+                    if not present:
+                        continue
+                    cap_seen = {"file": name, "path": key, "value": value,
+                                "status": _cap_status(value)}
+                    break
+        if "max_sandboxes" not in evidence:
+            for key in ("max_sandboxes", "total_slots", "warm_slots"):
+                if key in data:
+                    value = data[key]
+                elif key in soak:
+                    value = soak[key]
+                else:
+                    continue
+                # A slot ceiling that resolves out of the soak block (or out of
+                # the flat soak artifact) is soak-derived like every other
+                # number in it, so a retraction takes it too.
+                if (flat or key not in data) and out["soak_invalid"]:
+                    continue
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                    out["max_sandboxes"] = value
+                    evidence["max_sandboxes"] = {"file": name, "path": key,
+                                                 "value": value}
+                    break
+
         latency = soak.get("latency")
         if not isinstance(latency, dict):
             latency = {}
@@ -735,40 +887,32 @@ def load_tier0_caps(cfg: Tier05Config,
         const_stats = constants.get("stats") if isinstance(constants, dict) else {}
         if not isinstance(const_stats, dict):
             const_stats = {}
-
-        if "run_cap" not in evidence:
-            for key in ("recommended_run_cap", "per_node_run_cap", "node_cap"):
-                value = data.get(key, soak.get(key))
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-                    out.update(source=name, run_cap=value, cap_key=key)
-                    evidence["run_cap"] = {"file": name, "path": key, "value": value}
-                    break
-        if "max_sandboxes" not in evidence:
-            for key in ("max_sandboxes", "total_slots", "warm_slots"):
-                value = data.get(key, soak.get(key))
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-                    out["max_sandboxes"] = value
-                    evidence["max_sandboxes"] = {"file": name, "path": key,
-                                                 "value": value}
-                    break
+        # The evidence path is the one THIS file uses: the flat soak artifact
+        # has no "soak." prefix, and citing one made the evidence unresolvable.
+        soak_prefix = "latency." if flat else "soak.latency."
         # v2.6 keeps snapshot + fork for B's branch round (the probe itself no
         # longer forks). The soak p50 is the operative number; the constants
-        # stage is the fallback when the soak never ran.
-        for field, node, keys in (
-            ("t_snap_s", latency, ("snapshot_s", "p50")),
-            ("t_snap_s", const_stats, ("t_snap_s", "p50")),
-            ("t_fork_s", latency, ("fork_total_s", "p50")),
-            ("t_fork_s", const_stats, ("fork_total_s", "p50")),
-        ):
-            if field in evidence:
+        # stage is the fallback when the soak never ran -- and the only source
+        # left when the soak was retracted.
+        wanted: list[tuple[str, dict[str, Any], tuple[str, ...], str]] = []
+        if not out["soak_invalid"]:
+            wanted += [
+                ("t_snap_s", latency, ("snapshot_s", "p50"), soak_prefix),
+                ("t_fork_s", latency, ("fork_total_s", "p50"), soak_prefix),
+            ]
+        wanted += [
+            ("t_snap_s", const_stats, ("t_snap_s", "p50"), "constants.stats."),
+            ("t_fork_s", const_stats, ("fork_total_s", "p50"), "constants.stats."),
+        ]
+        for field_name, node, keys, prefix in wanted:
+            if field_name in evidence:
                 continue
             value = _stat(node, *keys)
             if value is not None:
-                out[field] = value
-                evidence[field] = {
+                out[field_name] = value
+                evidence[field_name] = {
                     "file": name,
-                    "path": ("soak.latency." if node is latency else "constants.stats.")
-                            + ".".join(keys),
+                    "path": prefix + ".".join(keys),
                     "value": value,
                     "n": _stat_n(node, keys[0]),
                 }
@@ -788,35 +932,172 @@ def load_tier0_caps(cfg: Tier05Config,
                                        "path": "probe.cycles[*].probe_s",
                                        "value": out["probe_s"], "n": len(values)}
 
-    for field, default, what in (
-        ("run_cap", cfg.run_cap, "per-node run cap"),
+    # -- capacity resolution (R2C2) ----------------------------------------
+    override = cfg.node_cap_override
+    if override is not None and _cap_status(override) != "measured":
+        warnings.append(
+            f"--node-cap {override!r} is not a positive integer: ignored")
+        override = None
+    if cap_seen is None and out["soak_invalid"]:
+        cap_seen = {"file": ", ".join(out["sources"]) or "none",
+                    "path": "retracted soak", "value": None,
+                    "status": "retracted"}
+    status = cap_seen["status"] if cap_seen else "absent"
+    out["cap_status"] = status
+    if cap_seen:
+        out["cap_key"] = cap_seen["path"]
+        out["cap_file"] = cap_seen["file"]
+    if status == "measured":
+        measured = int(cap_seen["value"])
+        out.update(source=cap_seen["file"], run_cap=measured, run_cap_backed=True)
+        evidence["run_cap"] = {"file": cap_seen["file"], "path": cap_seen["path"],
+                               "value": measured}
+        if override is not None and override != measured:
+            out.update(source="operator", run_cap=override)
+            evidence["run_cap"] = {
+                "file": "operator", "path": "--node-cap", "value": override,
+                "overrides": {"file": cap_seen["file"], "path": cap_seen["path"],
+                              "value": measured},
+            }
+            warnings.append(
+                f"--node-cap {override} overrides the Tier-0 MEASURED per-node "
+                f"run cap {measured} ({cap_seen['file']}:{cap_seen['path']}); "
+                "sizing is operator-declared from here on"
+            )
+    elif status == "zero":
+        # A MEASUREMENT, not a gap: Tier 0 timed this node and it sustains no
+        # concurrent Tier-1 run. No flag argues with a measurement.
+        blockers.append(
+            f"Tier 0 measured a per-node run cap of 0 ({cap_seen['file']}:"
+            f"{cap_seen['path']}): the node sustains no concurrent Tier-1 run, "
+            "so there is no executable pilot to size (--node-cap cannot "
+            "override a measurement: fix the node or re-run the Tier-0 soak)"
+        )
+        if override is not None:
+            warnings.append(
+                f"--node-cap {override} IGNORED: an operator declaration cannot "
+                "override a MEASURED zero capacity"
+            )
+        warnings.append(
+            f"per-node run cap: measured 0; the ladder below uses the configured "
+            f"default {out['run_cap']} for DIAGNOSIS only and the frozen config "
+            "is refused"
+        )
+    elif status in ("unmeasured", "retracted", "invalidated", "malformed"):
+        detail = {
+            "unmeasured": (
+                f"Tier 0 published an explicit null per-node run cap "
+                f"({cap_seen['file']}:{cap_seen['path']}): capacity was never "
+                "measured"
+            ),
+            "retracted": (
+                "Tier 0 retracted its soak, so every soak-derived per-node run "
+                "cap in both artifacts is withdrawn: "
+                + "; ".join(out["soak_invalid_reasons"])
+            ),
+            "malformed": (
+                f"Tier 0's per-node run cap is not an integer "
+                f"({cap_seen['file']}:{cap_seen['path']} = "
+                f"{cap_seen['value']!r})"
+            ),
+            "invalidated": (
+                f"Tier 0 marked its own run-cap derivation invalid "
+                f"({cap_seen['file']}:run_cap.valid = false"
+                + (f": {cap_seen.get('detail')}" if cap_seen.get("detail") else "")
+                + ")"
+            ),
+        }[status]
+        if override is not None:
+            out.update(source="operator", run_cap=override, run_cap_backed=True)
+            evidence["run_cap"] = {"file": "operator", "path": "--node-cap",
+                                   "value": override, "unmeasured": detail}
+            warnings.append(
+                f"{detail}; sizing proceeds on the OPERATOR-DECLARED cap "
+                f"--node-cap {override}, which is a declaration and not Tier-0 "
+                "evidence"
+            )
+        else:
+            blockers.append(
+                f"{detail}; refusing to size an executable pilot on the "
+                f"configured default {out['run_cap']} -- re-run the Tier-0 soak, "
+                "or declare the capacity with --node-cap N"
+            )
+    else:
+        # ABSENT: Tier 0 publishes an explicit cap on EVERY exit path it
+        # controls, so a missing key means the artifact predates that contract
+        # -- never that this run declined to answer (that is an explicit null).
+        # This is the ONE case the configured default may cover, and it is
+        # journalled.
+        warnings.append(
+            "per-node run cap: no cap key at all in "
+            f"{', '.join(out['sources']) or 'any Tier-0 artifact'} -- an "
+            "artifact predating Tier 0's explicit-cap contract; falling back to "
+            f"the configured default {out['run_cap']} (re-run Tier 0 for a "
+            "measured cap)"
+        )
+        if override is not None:
+            out.update(source="operator", run_cap=override, run_cap_backed=True)
+            evidence["run_cap"] = {"file": "operator", "path": "--node-cap",
+                                   "value": override}
+            warnings.append(
+                f"--node-cap {override} supplies the per-node run cap no Tier-0 "
+                "artifact carried"
+            )
+
+    for field_name, default, what in (
         ("max_sandboxes", cfg.max_sandboxes, "sandbox slot ceiling"),
         ("probe_s", cfg.probe_s, "direct /probe cost"),
     ):
-        if field not in evidence:
-            out.setdefault(field, default)
+        if field_name not in evidence:
+            out.setdefault(field_name, default)
             warnings.append(
                 f"{what}: not measured by Tier 0; falling back to the configured "
-                f"default {out[field]}"
+                f"default {out[field_name]}"
             )
-    if "t_snap_s" in evidence and "t_fork_s" in evidence:
-        out["branch_materialize_s"] = round(out["t_snap_s"] + out["t_fork_s"], 3)
+    # One arm-B branch round materialises a snapshot plus (pilot K - 1) forks.
+    # Charging a single fork understated the round by every extra branch the
+    # pilot actually opens, which flattered the overlap gate at K > 2.
+    n_forks = int(cfg.pilot_K) - 1
+    out["branch_materialize_forks"] = n_forks
+    if n_forks < 1:
+        out["branch_materialize_s"] = None
+        warnings.append(
+            f"snapshot+fork materialisation: pilot K={cfg.pilot_K} opens no "
+            "branch fork at all, so there is no arm-B branch round to charge; "
+            "the overlap gate stays unknown and arm B is not admitted"
+        )
+    elif "t_snap_s" in evidence and "t_fork_s" in evidence:
+        out["branch_materialize_s"] = round(
+            out["t_snap_s"] + n_forks * out["t_fork_s"], 3
+        )
+        out["branch_materialize_detail"] = (
+            f"snapshot {out['t_snap_s']:.3f}s + {n_forks} fork(s) x "
+            f"{out['t_fork_s']:.3f}s at pilot K={cfg.pilot_K}"
+        )
     else:
         # No default: a fabricated materialisation cost would silently pass the
         # arm-B overlap gate that exists precisely to measure it.
         out["branch_materialize_s"] = None
         warnings.append(
             "snapshot+fork materialisation: not measured by Tier 0 "
-            "(soak.latency.snapshot_s.p50 / soak.latency.fork_total_s.p50); the "
-            "arm-B overlap gate is unknown and no default is substituted"
+            "(latency.snapshot_s.p50 / latency.fork_total_s.p50 in "
+            "tier0_soak.json, soak.latency.* in tier0.json, or "
+            "constants.stats.*); the arm-B overlap gate is unknown and no "
+            "default is substituted"
         )
     if journal is not None:
         journal.event("tier0_caps", source=out["source"], sources=list(out["sources"]),
-                      run_cap=out["run_cap"], max_sandboxes=out["max_sandboxes"],
+                      run_cap=out["run_cap"], cap_status=out["cap_status"],
+                      run_cap_backed=out["run_cap_backed"],
+                      soak_invalid=out["soak_invalid"],
+                      max_sandboxes=out["max_sandboxes"],
                       branch_materialize_s=out["branch_materialize_s"],
+                      branch_materialize_forks=n_forks,
                       probe_s=out.get("probe_s"), evidence=evidence)
         for warning in warnings:
             journal.incident(kind="tier0_evidence_missing", detail=warning)
+        for blocker in blockers:
+            journal.incident(kind="tier0_capacity_blocker", detail=blocker)
     return out
 
 
@@ -890,6 +1171,30 @@ def overlap_gate(median_llm_s: Any, branch_materialize_s: Any) -> dict[str, Any]
         "b_arm_admitted": admitted,
         "detail": detail,
     }
+
+
+def pilot_cells(models: Sequence[str], arms: Sequence[str], *,
+                arm_b_models: Sequence[str], c_model: str | None) -> list[str]:
+    """``"model|arm"`` cells this pilot actually runs (R2C1 ``priority_cells``).
+
+    Mirrors :func:`size_pilot`'s arithmetic exactly: every admitted model runs
+    every non-C arm, arm B only for the models the Tier-0 overlap gate admitted
+    (a B cell for a blocked model would measure Farplane materialisation rather
+    than the arm), and arm C is the one within-model control, on ``c_model``.
+    A consumer counting planned cells has to get the same matrix the sizing was
+    charged for, so this is derived here and frozen into the config rather than
+    re-guessed downstream from arms x models.
+    """
+    b_ok = set(arm_b_models)
+    cells: list[str] = []
+    for model in models:
+        for arm in arms:
+            if arm == "B" and model not in b_ok:
+                continue
+            if arm == "C" and model != c_model:
+                continue
+            cells.append(f"{model}|{arm}")
+    return cells
 
 
 def peak_sandboxes(arm: str, K: int) -> int:
@@ -1294,7 +1599,14 @@ async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
             "overlap_detail": overlap["detail"],
             "b_arm_admitted": bool(admitted_model and overlap["b_arm_admitted"]),
             "hints_required": div_verdict in ("pass_with_hints", "conditional"),
+            # enters_pilot == enters_tier1 HERE: this producer's admission
+            # already folds the diversity, latency and task-sanity evidence, so
+            # there is no second pilot-only gate to disagree with. Both keys are
+            # emitted so a consumer never has to know which producer wrote the
+            # artifact (R2C1).
             "enters_tier1": admitted_model,
+            "enters_pilot": admitted_model,
+            "pilot_skip_reason": "; ".join(model_blockers),
             "admission_blockers": model_blockers,
             "notes": div.get("rationale", ""),
         }
@@ -1314,6 +1626,11 @@ async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
     tail_for_sizing = max(b_tails) if b_tails else (0.0 if admitted else None)
     payload["overlap_gate"] = {
         "branch_materialize_s": materialize_s,
+        # One branch round = snapshot + (pilot K - 1) forks, so the charge is
+        # K-dependent and the report has to say which K it was measured for.
+        "branch_materialize_forks": caps.get("branch_materialize_forks"),
+        "branch_materialize_detail": caps.get("branch_materialize_detail"),
+        "pilot_K": cfg.pilot_K,
         "tail_ratio_allowed": OVERLAP_TAIL_RATIO,
         "b_arm_models": b_models,
         "charged_tail_s": tail_for_sizing,
@@ -1382,6 +1699,10 @@ async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
                             or "no ladder point fits the pilot wall-clock budget"))
     if not selection["selected"]:
         blockers.append(f"no task cleared sanity selection ({selection['criterion']})")
+    # Tier-0 capacity refusals (explicit-null or measured-zero run cap, or a
+    # retracted soak) are calibration blockers like any other: the ladder above
+    # is diagnostic, but nothing executable may be frozen on top of them.
+    blockers.extend(caps.get("blockers") or [])
 
     if blockers:
         payload["frozen_pilot_config"] = {
@@ -1399,6 +1720,7 @@ async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
             "arms": [],
             "models": [],
             "tasks": [],
+            "priority_cells": [],
             "models_admitted": admitted,
             "arm_b_models": b_models,
             "candidate_tasks": selection["selected"],
@@ -1425,6 +1747,10 @@ async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
                 m for m in admitted if verdicts[m]["hints_required"]
             ],
             "arm_b_models": b_models,
+            "priority_cells": pilot_cells(
+                admitted, sizing["inputs"]["arms"],
+                arm_b_models=b_models, c_model=sizing["inputs"]["c_model"],
+            ),
             "overlap_verdicts": {m: verdicts[m]["overlap_verdict"] for m in admitted},
             "materialize_tail_s": chosen["materialize_tail_s"],
             "branch_rounds_slowest_model": chosen["branch_rounds_slowest_model"],
@@ -1448,7 +1774,8 @@ async def _run_tier05(cfg: Tier05Config, journal: RunJournal) -> dict[str, Any]:
         payload["frozen_pilot_config"] = frozen
         journal.event("frozen_pilot_config", **{
             k: frozen[k] for k in ("arms", "models", "tasks", "T_s", "replicates",
-                                   "est_wall_h", "n_runs", "arm_b_models")
+                                   "est_wall_h", "n_runs", "arm_b_models",
+                                   "priority_cells")
         })
     return payload
 
@@ -1518,7 +1845,9 @@ def write_markdown(payload: dict[str, Any], path: str) -> str:
         materialize = gate.get("branch_materialize_s")
         lines.append(
             "Tier-0 OVERLAP GATE (arm B): snapshot+fork materialisation "
-            + (f"{materialize:.1f}s (Tier-0 soak p50)" if isinstance(materialize, (int, float))
+            + (f"{materialize:.1f}s "
+               f"({gate.get('branch_materialize_detail') or 'Tier-0 soak p50'})"
+               if isinstance(materialize, (int, float))
                else "NOT MEASURED by Tier 0")
             + " against each model's median LLM wait; the unhidden tail is "
             f"charged to T. A tail above {OVERLAP_TAIL_RATIO:g}x the sampling "
@@ -1673,8 +2002,9 @@ def _cli() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Tier 0.5 calibration",
         epilog="exit 0 = frozen pilot config emitted; exit 1 = config REFUSED "
-               "(incomplete/failed calibration, no eligible task, or no ladder "
-               "point that fits) -- the evidence is still written",
+               "(incomplete/failed calibration, no eligible task, no ladder "
+               "point that fits, or no Tier-0 capacity evidence to size "
+               "against) -- the evidence is still written",
     )
     ap.add_argument("--models", default=",".join(DEFAULT_MODELS))
     ap.add_argument("--tasks", default=",".join(DEFAULT_TASK_POOL))
@@ -1696,6 +2026,11 @@ def _cli() -> argparse.ArgumentParser:
     ap.add_argument("--latency-steps", type=int, default=5)
     ap.add_argument("--task-steps", type=int, default=6)
     ap.add_argument("--run-cap", type=int, default=6)
+    ap.add_argument("--node-cap", type=int, default=None,
+                    help="operator-declared per-node concurrent run cap. Lifts an "
+                         "UNMEASURED Tier-0 cap (explicit null, or one retracted "
+                         "with the soak) so sizing can proceed on a declared "
+                         "number; it never overrides a MEASURED cap of 0")
     ap.add_argument("--max-sandboxes", type=int, default=24)
     ap.add_argument("--dry", action="store_true",
                     help="exercise all phases against the in-memory fakes")
@@ -1714,6 +2049,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         K=args.K, pilot_K=args.pilot_K, m=args.m, latency_steps=args.latency_steps,
         task_steps=args.task_steps, run_cap=args.run_cap,
         max_sandboxes=args.max_sandboxes, dry=args.dry,
+        node_cap_override=args.node_cap,
         live_url=args.live_url, allow_loopback_tasks=args.allow_loopback_tasks,
     )
     if cfg.dry:

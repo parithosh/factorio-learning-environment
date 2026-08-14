@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -180,18 +181,24 @@ def rebake_template(fp: Farplane, journal: RunJournal, out: dict[str, Any]) -> s
     out["template_stage"] = stage
     t0 = time.monotonic()
     sb = fp.create_from_template(tier0.TEMPLATE, "6h", name="tmplbake")
-    stage["sandbox"] = sb.id
-    stage["node"] = sb.node
-    stage["create_s"] = round(time.monotonic() - t0, 2)
-    journal.event("exp3_template_sandbox", sandbox=sb.id, node=sb.node,
-                  create_s=stage["create_s"])
-    _save(out)
+    create_s = round(time.monotonic() - t0, 2)
 
     # Everything past creation is scaffolding work on a warm slot, and this
     # deployment has ~1 warm slot per node -- a bootstrap/transfer/snapshot
     # failure that leaves the sandbox behind blocks the retry it forces. So the
     # teardown below covers the failure path too, not just the success path.
+    # The try opens on the line after creation succeeds, and the bookkeeping
+    # (journal event, artifact save) is INSIDE it: a journal or disk failure
+    # while recording the new sandbox must not be the one path that leaks a 6h
+    # template sandbox.
     try:
+        stage["sandbox"] = sb.id
+        stage["node"] = sb.node
+        stage["create_s"] = create_s
+        journal.event("exp3_template_sandbox", sandbox=sb.id, node=sb.node,
+                      create_s=create_s)
+        _save(out)
+
         tier0.guest_bootstrap(fp, sb)
         stage["transfer"] = tier0.install_image(fp, sb, IMAGE_TAR)
         stage["container"] = tier0.start_container(fp, sb)
@@ -225,14 +232,53 @@ def rebake_template(fp: Farplane, journal: RunJournal, out: dict[str, Any]) -> s
         # so holding it would compete with the run it exists to enable.
         try:
             fp.delete_sandbox(sb)
-            stage["sandbox_deleted"] = True
-            journal.event("exp3_template_teardown", sandbox=sb.id, outcome="deleted")
-        except Exception as exc:  # journal the leak; never mask the real error
+        except Exception as exc:
             stage["sandbox_deleted"] = False
             stage["cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            journal.event("exp3_template_teardown", sandbox=sb.id, outcome="failed",
-                          error=stage["cleanup_error"])
+            note: dict[str, Any] = {"outcome": "failed", "error": stage["cleanup_error"]}
+        else:
+            stage["sandbox_deleted"] = True
+            note = {"outcome": "deleted"}
+        # Deliberate best-effort teardown reporting: whether the warm slot came
+        # back is already recorded in the artifact, so a journal that is itself
+        # down must not mask the real error -- nor make a released slot read as
+        # a leak.
+        try:
+            journal.event("exp3_template_teardown", sandbox=sb.id, **note)
+        except Exception:
+            pass
         _save(out)
+
+
+def _append_journal(dest: Path, records: bytes) -> None:
+    """Append journal ``records`` to ``dest`` without overwriting or tearing it.
+
+    ``dest`` is append-only evidence read one line at a time, so a *mid-file*
+    line missing its newline is unrecoverable corruption -- only the last line
+    of a journal may be torn. An unterminated tail left behind by a killed
+    process is therefore quarantined to ``<dest>.torn`` and truncated first (the
+    same repair a journal open performs), and the incoming records get their own
+    trailing newline, before anything is appended. The append is fsynced because
+    the source file is unlinked once this returns.
+    """
+    if not records.endswith(b"\n"):
+        records += b"\n"
+    if dest.exists():
+        blob = dest.read_bytes()
+        if blob and not blob.endswith(b"\n"):
+            cut = blob.rfind(b"\n") + 1  # 0 when the whole file is one torn line
+            with Path(f"{dest}.torn").open("ab") as fh:
+                fh.write(blob[cut:] + b"\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            with dest.open("r+b") as fh:
+                fh.truncate(cut)
+                fh.flush()
+                os.fsync(fh.fileno())
+    with dest.open("ab") as fh:
+        fh.write(records)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 class _Exp3Bake(Exp1Runner):
@@ -250,11 +296,14 @@ async def _reap_bake_residue(runner: Exp1Runner, out: dict[str, Any], *,
     snapshot exists) and ``aclose`` closes journals without touching the
     substrate, so a bake that raises leaves a warm slot occupied on the very
     node the retry has to land on. The sweep is scoped to Exp 3's own prefix and
-    keeps every checkpoint worth keeping -- the fresh template, Exp 1's S2, any
-    S2B already secured and any snapshot the bake did manage to take -- so a
-    successful checkpoint is never collateral.
+    keeps every checkpoint worth keeping -- the fresh template, Exp 1's S2, the
+    S2B recorded by an EARLIER prep run (a rebake resets the checkpoint section,
+    so ``out`` alone no longer remembers it), any S2B already secured by this
+    run and any snapshot the bake did manage to take -- so a live checkpoint in
+    the shared prefix is never collateral of a failed rebake.
     """
     keep = [runner.cfg.template_snap, S2_SNAP, str(out.get("S2B") or ""),
+            str(out.get("prior_S2B") or ""),
             str((runner.state.get("s2") or {}).get("snapshot") or "")]
     record: dict[str, Any] = {"detail": detail, "kept": [k for k in keep if k]}
     out["bake_cleanup"] = record
@@ -307,12 +356,18 @@ async def rebake_checkpoint(template_snap: str, model: str,
     finally:
         await runner.aclose()
         # ``Exp1Runner`` hardcodes ``exp1.jsonl`` inside its journal dir. This
-        # bake is Exp 3's, so the file is renamed once it is flushed -- an
-        # ``exp1.jsonl`` under bench/journal/exp3/ would read as Exp-1 evidence.
+        # bake is Exp 3's, so its records are moved under Exp 3's own name once
+        # they are flushed -- an ``exp1.jsonl`` under bench/journal/exp3/ would
+        # read as Exp-1 evidence. The move is an APPEND, never a replace: a
+        # second rebake must add its session to the bake journal, not destroy
+        # the first bake's append-only record of what the checkpoint cost.
         stale = JOURNAL_DIR / "exp1.jsonl"
         bake_journal = JOURNAL_DIR / "exp3-bake.jsonl"
         if stale.exists():
-            stale.replace(bake_journal)
+            records = stale.read_bytes()
+            if records:
+                _append_journal(bake_journal, records)
+            stale.unlink()
         out["bake_journals"] = {
             "run": str(bake_journal),
             "farplane": str(runner.fp.journal_path),
@@ -471,9 +526,8 @@ def record_dry() -> dict[str, Any]:
     )
 
     arms_report = asyncio.run(dry_run())
-    gate_path = Path("bench/results/exp3_dry_gate.json")
-    gate_path.write_text(json.dumps(arms_report, indent=2, default=str) + "\n",
-                         encoding="utf-8")
+    gate_path = atomic_write_json(Path("bench/results/exp3_dry_gate.json"),
+                                  arms_report)
 
     def run_block(args: list[str]) -> tuple[str, dict[str, Any]]:
         buf = io.StringIO()
@@ -662,10 +716,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     fp = Farplane(str(JOURNAL_DIR / "exp3-prep-farplane.jsonl"), prefix=PREFIX)
 
-    prior = (_load_out().get("checkpoint") or {}) if (args.s2b or args.how == "verify") else {}
+    # The prior recorded checkpoint is read BEFORE ``out`` is reset: a rebake
+    # starts a fresh section, but the bake-residue sweep must still protect an
+    # S2B secured by an earlier run that is alive in the shared prefix.
+    prior_section = _load_out().get("checkpoint") or {}
+    prior = prior_section if (args.s2b or args.how == "verify") else {}
     out: dict[str, Any] = {**prior, "source_snapshot": S2_SNAP,
                            "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                         time.gmtime())}
+    # Falls back to the carried value when the last run recorded no checkpoint
+    # of its own, so a failed rebake does not drop the protection either.
+    prior_s2b = str(prior_section.get("S2B")
+                    or prior_section.get("prior_S2B") or "")
+    if prior_s2b:
+        out["prior_S2B"] = prior_s2b
     try:
         alive, state = snapshot_restorable(fp, S2_SNAP)
         out["s2_state"] = state

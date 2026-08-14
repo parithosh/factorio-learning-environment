@@ -213,6 +213,10 @@ class Digest:
         self.probes: list[dict] = []
         self.incidents: list[dict] = []
         self.hint_assignments: list[dict] = []
+        #: identity fields of the run's own run_finished record, kept whole:
+        #: run_id is stripped from the slim event copy but a consumer needs it
+        #: to bind a result row to this digest (bench/analyze_exp2.py).
+        self.run_finished: list[dict] = []
         self.step_trail: list[list] = []
         self.infra_raw: dict[tuple[str, str], list[float]] = defaultdict(list)
         self.infra_fail: Counter = Counter()
@@ -339,6 +343,17 @@ class Digest:
                 if isinstance(slim.get("label"), str):
                     slim.pop("label")
                 self.events.append(slim)
+            if nm == "run_finished":
+                self.run_finished.append({
+                    "ts": ts, "session": rec.get("session"),
+                    "journal_session": rec.get("journal_session"),
+                    "run_id": rec.get("run_id"),
+                    "arm": rec.get("arm"), "replicate": rec.get("replicate"),
+                    "status": rec.get("status"),
+                    "endpoint_throughput": rec.get("endpoint_throughput"),
+                    "endpoint_source": rec.get("endpoint_source"),
+                    "steps": rec.get("steps"),
+                })
             if nm == "T_start":
                 self.t_start_ts = ts
 
@@ -368,6 +383,7 @@ class Digest:
             "probes": self.probes,
             "incidents": self.incidents,
             "hint_assignments": self.hint_assignments,
+            "run_finished": self.run_finished,
             "infra": infra,
             "infra_ops": rows,
             "llm": {
@@ -503,6 +519,9 @@ def extract(path: Path, *, session: str | None = None) -> dict:
     out["sessions"] = [s if s is not None else "legacy" for s in segments]
     out["session"] = ("all" if sel == "all" else
                       (cur_sid if sel in ("strict", "latest") else sel) or "legacy")
+    # `all` sums several runs of the same cell into one record: an explicit flag
+    # so a consumer never has to infer mergedness from the selector.
+    out["merged_sessions"] = sel == "all" and len(segments) > 1
     out["parse_errors"] = errors
     out["scan"] = {
         "records": n_records,

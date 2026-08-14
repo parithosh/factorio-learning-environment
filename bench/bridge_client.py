@@ -9,9 +9,13 @@ TLS handshake off the hot path.
 Two rules the caller inherits from this module:
 
 * **Retries are idempotent-only.**  A GET may be replayed; ``POST /execute``,
-  ``/probe``, ``/reset`` and ``/state-restore`` mutate the game, so a failure
-  that happened once the request was already on the wire is reported as
-  :class:`BridgeError` with ``ambiguous=True`` instead of being replayed.
+  ``/probe``, ``/reset`` and ``/state-restore`` mutate the game, so anything
+  that could only have happened once the request reached the handler -- a
+  post-send transport failure, *any* 5xx (the handler can mutate the world and
+  *then* raise), an unreadable success body -- is reported as
+  :class:`BridgeError` with ``ambiguous=True`` instead of being replayed.  Only
+  a failure provably raised before the first byte left the socket, or a 4xx
+  (refused before the handler ran), is unambiguous.
 * **Auth.**  When ``FLE_BRIDGE_TOKEN`` is set in the environment (or ``token=``
   is passed explicitly) every request carries ``Authorization: Bearer
   <token>``; a bridge started with a token answers 401 to anything else on its
@@ -42,6 +46,9 @@ def _never_left_the_socket(exc: requests.RequestException) -> bool:
     closed: everything we cannot positively classify as pre-send -- a read
     timeout above all, which is exactly what a long ``/execute`` looks like
     when the ingress drops the connection -- counts as possibly executed.
+    ``InvalidHeader`` is deliberately absent below: Requests raises it both for
+    a header we refused to send *and* for a malformed header in the response,
+    i.e. after the bridge already acted.
     """
     if isinstance(
         exc,
@@ -51,7 +58,6 @@ def _never_left_the_socket(exc: requests.RequestException) -> bool:
             requests.exceptions.MissingSchema,
             requests.exceptions.InvalidSchema,
             requests.exceptions.InvalidURL,
-            requests.exceptions.InvalidHeader,
         ),
     ):
         return True
@@ -92,12 +98,13 @@ def _error_detail(response: requests.Response, *, limit: int = 1000) -> str:
 class BridgeError(RuntimeError):
     """The bridge answered with a non-2xx status or an unusable body.
 
-    ``ambiguous`` is true when a mutating request was already on the wire and
-    we never learned whether the bridge applied it.  Such a call must not be
-    replayed: the caller has to re-derive the world state (``/meta``,
-    ``/state-save``) or abandon the branch.  ``status`` is the HTTP status when
-    the bridge (or the ingress) answered at all, and ``None`` for a transport
-    failure.
+    ``ambiguous`` is true when a mutating request reached the handler -- or
+    might have -- and we never learned what it did to the world: a post-send
+    transport failure, any 5xx, or a 2xx whose body we could not parse.  Such a
+    call must not be replayed: the caller has to re-derive the world state
+    (``/meta``, ``/state-save``) or abandon the branch.  ``status`` is the HTTP
+    status when the bridge (or the ingress) answered at all, and ``None`` for a
+    transport failure.
     """
 
     def __init__(
@@ -160,11 +167,14 @@ class Bridge:
         gave up while the bridge was most likely still executing the request,
         so a retried ``POST /execute`` would run the program twice and a
         retried ``/probe`` would burn a second 60 s window.  ``idempotent=False``
-        therefore disables every retry path and converts a gateway status or a
-        post-send transport error into ``BridgeError(ambiguous=True)``, leaving
-        reconciliation to the caller, which is the only layer that knows what
-        the world should look like.  A 4xx from the bridge itself is a real
-        error and is raised immediately either way.
+        therefore disables every retry path and converts *any* 5xx -- ingress
+        gateway status or a bridge-side 500, which is raised by a handler that
+        may already have ticked the game -- along with every post-send transport
+        error and every unreadable 2xx body into
+        ``BridgeError(ambiguous=True)``, leaving reconciliation to the caller,
+        which is the only layer that knows what the world should look like.  A
+        4xx means the request was refused before the handler ran, so it is a
+        real, unambiguous error and is raised immediately either way.
         """
         url = f"{self.base_url}{path}"
         last: BridgeError | None = None
@@ -201,18 +211,42 @@ class Bridge:
                 raise gateway
             # The bridge itself only ever answers 401, and its body is the generic
             # {"error": "unauthorized"} -- so the diagnosis has to come from our own
-            # state.  A 403 can only be an ingress/proxy denial; same treatment.
-            if response.status_code in (401, 403):
+            # state.
+            if response.status_code == 401:
                 why = "no token sent" if not self.token else "token mismatch"
                 raise BridgeError(
-                    f"{method} {url} -> HTTP {response.status_code}: bridge rejected the "
-                    f"request ({why}); FLE_BRIDGE_TOKEN must match the value the sandbox "
-                    f"was started with -- every TCP path is gated, /health included",
+                    f"{method} {url} -> HTTP 401: bridge rejected the request ({why}); "
+                    f"FLE_BRIDGE_TOKEN must match the value the sandbox was started "
+                    f"with -- every TCP path is gated, /health included",
+                    status=401,
+                )
+            # A 403 cannot come from the bridge (it has no notion of forbidden): it is
+            # the ingress or an intermediate proxy refusing the route outright, so the
+            # token is not the suspect and re-checking it wastes the operator's time.
+            if response.status_code == 403:
+                raise BridgeError(
+                    f"{method} {url} -> HTTP 403: the ingress/proxy denied this route "
+                    f"before the bridge saw the request (sandbox stopped, route not "
+                    f"published, or egress policy) -- check the Farplane route, not "
+                    f"FLE_BRIDGE_TOKEN: {_error_detail(response, limit=200)}",
+                    status=403,
+                )
+            if response.status_code >= 500:
+                # A 500 carries a correlation id for a traceback that may have been
+                # raised *after* the handler mutated the game, so on a mutating call it
+                # leaves the world exactly as unresolved as a lost response.  Never
+                # retried either way: the bridge already decided it cannot serve this.
+                raise BridgeError(
+                    f"{method} {url} -> HTTP {response.status_code}: {_error_detail(response)}"
+                    + ("" if idempotent else " (server-side failure after dispatch,"
+                       " outcome unknown -- not retried)"),
+                    ambiguous=not idempotent,
                     status=response.status_code,
                 )
             if response.status_code >= 300:
-                # 400/408/411/413 are our bug (body too big, chunked encoding, ...) and
-                # 500 carries a correlation id; neither is ever retried.
+                # 3xx/4xx: refused before the handler ran (400/408/411/413 are our bug --
+                # body too big, chunked encoding -- and 404 is a bad route), so the game
+                # is untouched and the error is unambiguous.
                 raise BridgeError(
                     f"{method} {url} -> HTTP {response.status_code}: {_error_detail(response)}",
                     status=response.status_code,
@@ -222,8 +256,12 @@ class Bridge:
             try:
                 return response.json()
             except ValueError as exc:
+                # 2xx with a body we cannot read: on a mutating call the change landed
+                # but its result is lost, which is the caller's reconciliation case.
                 raise BridgeError(
-                    f"{method} {url}: non-JSON body {response.text[:500]!r}",
+                    f"{method} {url}: non-JSON body {response.text[:500]!r}"
+                    + ("" if idempotent else " (applied, result unknown)"),
+                    ambiguous=not idempotent,
                     status=response.status_code,
                 ) from exc
         raise last or BridgeError(f"{method} {url}: exhausted retries")
@@ -266,8 +304,9 @@ class Bridge:
         *after* the deadline has passed is a timeout, not a success -- callers
         size their next phase off the returned latency.
 
-        A 401/403 aborts the wait immediately: the token is wrong (``/health`` is
-        gated too), and no amount of polling fixes that.
+        A 401 or 403 aborts the wait immediately -- a wrong token (``/health`` is
+        gated too) or an ingress that will not route to this sandbox at all.
+        Neither is fixed by polling.
         """
         started = time.monotonic()
         deadline = started + max(0.0, float(deadline_s))
@@ -299,7 +338,8 @@ class Bridge:
         """Run one program in the REPL; gym-step semantics minus verify/quota.
 
         Mutating: never auto-retried.  A transport failure after the program was
-        sent raises ``BridgeError(ambiguous=True)`` -- it may have run.
+        sent, any 5xx, or an unreadable body raises
+        ``BridgeError(ambiguous=True)`` -- it may have run.
         """
         payload = self._request(
             "POST", "/execute", json_body={"code": code}, timeout=timeout, idempotent=False

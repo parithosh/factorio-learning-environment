@@ -97,7 +97,7 @@ fi
 echo "== starting codex block at $(date -u)"
 # fd 9 carries the lock across this exec and drops it when python exits, so the
 # cap is held for the whole block rather than just for this shell.
-exec .venv/bin/python -m bench.run_tier1 \
+exec "$PY" -m bench.run_tier1 \
   --arms A,AxK,B \
   --models codex/gpt-5.6-sol \
   --tasks iron_plate_throughput \

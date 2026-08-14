@@ -24,7 +24,9 @@ Six stages, each independently re-runnable via ``--stages``:
     cycles.  Reports capacity stalls, latency distributions, node placement.
 
 Everything we create is named ``flebench-*`` and journalled; the run ends with a
-reaper pass that keeps only TEMPLATE_SNAP and the bake sandbox.
+reaper pass that keeps only TEMPLATE_SNAP, the bake sandbox, and whatever a soak
+worker that outlived its stage still owns (deleting those under a live thread is
+how children get stranded).
 
 Bridge auth: the in-guest bridge opens its TCP listener only when it has a
 credential, and every exposed-port request is TCP, so export
@@ -236,11 +238,57 @@ class StageError(RuntimeError):
     something worth explaining), but its payload must never be mistaken for a
     valid stage result -- :func:`ok_stage` keys off the ``error`` field, so the
     partial lands beside it rather than instead of it.
+
+    ``live_resources`` is a callable a stage that failed with threads still
+    running hands to the runner: called at cleanup time it answers "what do my
+    live workers own *now*", which is what the failure reaper must not delete.
     """
 
-    def __init__(self, message: str, *, partial: dict[str, Any] | None = None) -> None:
+    def __init__(self, message: str, *, partial: dict[str, Any] | None = None,
+                 live_resources: Callable[[], dict[str, list[str]]] | None = None) -> None:
         super().__init__(message)
         self.partial = partial or {}
+        self.live_resources = live_resources
+
+
+class LiveResources:
+    """Which sandboxes and snapshots each worker thread owns at this instant.
+
+    A soak worker keeps forking off its source and deleting children as it goes,
+    so "what is live" is only knowable from the workers themselves.  Threads
+    register what they create and release what they delete; the failure reaper
+    asks, by thread name, what it must leave alone.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._held: dict[str, dict[str, set[str]]] = {}
+
+    def hold(self, kind: str, resource_id: str) -> None:
+        if not resource_id:
+            return
+        with self._lock:
+            owner = self._held.setdefault(threading.current_thread().name,
+                                          {"sandboxes": set(), "snapshots": set()})
+            owner.setdefault(kind, set()).add(resource_id)
+
+    def release(self, kind: str, resource_id: str) -> None:
+        if not resource_id:
+            return
+        with self._lock:
+            owner = self._held.get(threading.current_thread().name) or {}
+            owner.get(kind, set()).discard(resource_id)
+
+    def owned_by(self, names: list[str]) -> dict[str, list[str]]:
+        """Everything the named threads hold right now, as ``{kind: [ids]}``."""
+        sandboxes: set[str] = set()
+        snapshots: set[str] = set()
+        with self._lock:
+            for name in names:
+                owner = self._held.get(name) or {}
+                sandboxes |= owner.get("sandboxes", set())
+                snapshots |= owner.get("snapshots", set())
+        return {"sandboxes": sorted(sandboxes), "snapshots": sorted(snapshots)}
 
 
 def numeric_column(rows: list[dict[str, Any]], key: str) -> list[float]:
@@ -952,6 +1000,45 @@ def cycle_fork_parts(cycle: dict[str, Any]) -> dict[str, Any]:
     return {key[5:]: value for key, value in cycle.items() if key.startswith("fork_")}
 
 
+def release_cycle(
+    fp: Farplane,
+    cycle: dict[str, Any],
+    child: SB | None,
+    snap: str,
+    live: LiveResources | None,
+) -> list[str]:
+    """Delete a probe cycle's child, then its snapshot; report what survived.
+
+    A deliberate best-effort teardown: each delete is attempted even when the
+    other raises, because a child that outlives its cycle is a live sandbox
+    holding a warm slot, and a snapshot that outlives it fences the next fork.
+    Whatever could not be deleted comes back as a string so the caller can fail
+    loudly rather than loop on.
+    """
+    leaked: list[str] = []
+    if child is not None:
+        t0 = time.monotonic()
+        try:
+            fp.delete_sandbox(child)
+            cycle["delete_child_s"] = round(time.monotonic() - t0, 3)
+            if live:
+                live.release("sandboxes", child.id)
+        except Exception as exc:
+            cycle["delete_child_error"] = f"{type(exc).__name__}: {exc}"
+            leaked.append(f"probe child {child.id} survived its cycle: "
+                          f"{type(exc).__name__}: {exc}")
+    t0 = time.monotonic()
+    try:
+        fp.delete_snapshot(snap)
+        cycle["delete_snapshot_s"] = round(time.monotonic() - t0, 3)
+        if live:
+            live.release("snapshots", snap)
+    except Exception as exc:
+        cycle["delete_snapshot_error"] = f"{type(exc).__name__}: {exc}"
+        leaked.append(f"probe snapshot {snap} survived its cycle: {type(exc).__name__}: {exc}")
+    return leaked
+
+
 def probe_cycle(
     fp: Farplane,
     source: SB,
@@ -961,28 +1048,39 @@ def probe_cycle(
     ttl: str = "30m",
     deadline: float | None = None,
     queue_deadline: str = "5m",
+    live: LiveResources | None = None,
 ) -> dict[str, Any]:
-    """snapshot -> 1 fork -> health -> /probe -> delete child -> delete snapshot."""
+    """snapshot -> 1 fork -> health -> /probe -> delete child -> delete snapshot.
+
+    The child is held outside the ``try`` so the cleanup owns it from the moment
+    it exists: a /probe that raises -- or a delete that does -- must not leave a
+    live sandbox behind while the soak's probe worker loops straight into the
+    next cycle.  Both deletes run, child first, whatever the body did.  A
+    cleanup failure is raised only when the body itself succeeded, so it never
+    masks the error that caused it.
+    """
     cycle: dict[str, Any] = {"tag": tag}
     t_all = time.monotonic()
     t0 = time.monotonic()
     snap = fp.snapshot(source, ttl="1h", note=f"flebench-probe-{tag}")
     cycle["snapshot_s"] = round(time.monotonic() - t0, 3)
+    if live:
+        live.hold("snapshots", snap)
+    child: SB | None = None
     try:
         child, parts = fork_and_ready(fp, snap, ttl, f"probe-{tag}",
                                       deadline=deadline, queue_deadline=queue_deadline)
+        if live:
+            live.hold("sandboxes", child.id)
         cycle.update({f"fork_{k}": v for k, v in parts.items()})
         bridge = Bridge(parts["url"])
         t0 = time.monotonic()
         cycle["probe"] = bridge.probe(entity)
         cycle["probe_s"] = round(time.monotonic() - t0, 3)
-        t0 = time.monotonic()
-        fp.delete_sandbox(child)
-        cycle["delete_child_s"] = round(time.monotonic() - t0, 3)
     finally:
-        t0 = time.monotonic()
-        fp.delete_snapshot(snap)
-        cycle["delete_snapshot_s"] = round(time.monotonic() - t0, 3)
+        leaked = release_cycle(fp, cycle, child, snap, live)
+    if leaked:
+        raise StageError("probe cycle leaked resources: " + "; ".join(leaked), partial=cycle)
     cycle["t_probe_cycle_s"] = round(time.monotonic() - t_all, 3)
     return cycle
 
@@ -1042,12 +1140,16 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
     events_lock = threading.Lock()
     errors: list[str] = []
     stop = threading.Event()
+    # What each worker owns right now, so a failure that leaves threads running
+    # can tell the reaper exactly which resources are still in use.
+    live = LiveResources()
 
     def record(event: dict[str, Any]) -> None:
         with events_lock:
             events.append(event)
 
     def branch_worker(index: int, source: SB) -> None:
+        live.hold("sandboxes", source.id)
         for round_index in range(args.soak_rounds):
             # A round owns live children, so the stop flag is honoured at round
             # boundaries only -- never mid-round, where an abort would strand
@@ -1065,6 +1167,7 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
                     source, ttl="1h", note=f"flebench-soak-{index}-{round_index}"
                 )
                 snap_s = round(time.monotonic() - t0, 3)
+                live.hold("snapshots", round_snap)
                 fork_entries = []
                 for k in range(args.soak_width):
                     child, parts = fork_and_ready(
@@ -1074,16 +1177,19 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
                         queue_deadline=args.fork_queue_deadline,
                     )
                     children.append(child)
+                    live.hold("sandboxes", child.id)
                     fork_entries.append(parts)
                 delete_times = []
                 for child in children:
                     t0 = time.monotonic()
                     fp.delete_sandbox(child)
                     delete_times.append(round(time.monotonic() - t0, 3))
+                    live.release("sandboxes", child.id)
                 children = []
                 t0 = time.monotonic()
                 fp.delete_snapshot(round_snap)
                 snap_delete_s = round(time.monotonic() - t0, 3)
+                live.release("snapshots", round_snap)
                 record({
                     "kind": "branch_round",
                     "source": index,
@@ -1105,31 +1211,52 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
                 log(f"  [src{index}] round {round_index} FAILED: {type(exc).__name__}: {exc}")
                 # A failed round must not leak: drop whatever landed, then the
                 # snapshot, so the next round is not fenced by a live child.
+                # Deliberate best-effort teardown -- one undeletable child must
+                # not stop us dropping the rest.
                 for child in children:
                     try:
                         fp.delete_sandbox(child)
+                        live.release("sandboxes", child.id)
                     except Exception:
                         pass
                 if round_snap:
                     try:
                         fp.delete_snapshot(round_snap)
+                        live.release("snapshots", round_snap)
                     except Exception:
                         pass
 
     def probe_worker(source: SB) -> None:
+        live.hold("sandboxes", source.id)
         i = 0
+        consecutive = 0
+        # A cycle that keeps failing keeps paying for a snapshot and a fork, and
+        # each failure is one more chance to strand a child; three in a row means
+        # the path is broken, not flaky, so stop asking.
+        failure_limit = 3
         while not stop.is_set() and time.monotonic() < deadline:
             try:
                 cycle = probe_cycle(fp, source, args.probe_entity, f"soak{i}",
                                     deadline=args.fork_deadline_s,
-                                    queue_deadline=args.fork_queue_deadline)
+                                    queue_deadline=args.fork_queue_deadline,
+                                    live=live)
                 cycle["kind"] = "probe_cycle"
                 record(cycle)
+                consecutive = 0
                 log(f"  [probe] cycle {i} in {cycle['t_probe_cycle_s']}s")
             except Exception as exc:
+                consecutive += 1
                 errors.append(f"probe{i}: {type(exc).__name__}: {exc}")
-                record({"kind": "probe_error", "i": i, "error": f"{type(exc).__name__}: {exc}"})
+                record({"kind": "probe_error", "i": i, "consecutive_failures": consecutive,
+                        "error": f"{type(exc).__name__}: {exc}"})
                 log(f"  [probe] cycle {i} FAILED: {type(exc).__name__}: {exc}")
+                if consecutive >= failure_limit:
+                    errors.append(f"probe worker gave up after {consecutive} consecutive "
+                                  f"cycle failures")
+                    record({"kind": "probe_stop", "i": i,
+                            "reason": f"{consecutive} consecutive cycle failures"})
+                    log(f"  [probe] giving up after {consecutive} consecutive failures")
+                    return
             i += 1
             if i >= args.soak_rounds * 2:
                 return
@@ -1166,7 +1293,9 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
     # fail against a vanished parent and its children would be stranded on the
     # node with nothing owning them.
     if stuck:
-        log(f"  NOT deleting soak sources: {', '.join(stuck)} still running")
+        held = live.owned_by(stuck)
+        log(f"  NOT deleting soak sources: {', '.join(stuck)} still running and holding "
+            f"sandboxes {held['sandboxes'] or 'none'} / snapshots {held['snapshots'] or 'none'}")
     else:
         for sb in sources:
             try:
@@ -1244,6 +1373,9 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
         "complete": not incomplete,
         "incomplete_reasons": incomplete,
         "stuck_workers": stuck,
+        # What the stuck workers still own, so the failure reaper can keep its
+        # hands off resources a live thread is forking from.
+        "live_worker_resources": live.owned_by(stuck),
         "sources_deleted": not stuck,
         "config": {
             "soak_sources": args.soak_sources,
@@ -1262,6 +1394,10 @@ def stage_soak(fp: Farplane, args: argparse.Namespace, state: dict[str, Any]) ->
             f"still owns children off them -- reap once the control plane releases the "
             f"operations, then rerun the soak",
             partial=summary,
+            # Asked again at cleanup time: a stuck worker keeps creating and
+            # deleting while the runner unwinds, so the list in `summary` is
+            # only the picture as of this instant.
+            live_resources=lambda: live.owned_by(stuck),
         )
     return summary
 
@@ -1373,6 +1509,7 @@ def recommended_run_cap(soak: dict[str, Any] | None, args: argparse.Namespace) -
     if blockers:
         return {
             "cap": None,
+            "valid": False,
             "fork_rate_per_min": None,
             "forks_per_run_per_window": args.K,
             "window_s": window_s,
@@ -1398,6 +1535,7 @@ def recommended_run_cap(soak: dict[str, Any] | None, args: argparse.Namespace) -
         )
     return {
         "cap": cap,
+        "valid": True,
         "fork_rate_per_min": rate_per_min,
         "forks_per_run_per_window": args.K,
         "window_s": window_s,
@@ -1405,6 +1543,29 @@ def recommended_run_cap(soak: dict[str, Any] | None, args: argparse.Namespace) -
         "blockers": [],
         "basis": basis,
     }
+
+
+def soak_validity(soak: dict[str, Any] | None, cap: dict[str, Any]) -> tuple[bool, str]:
+    """Is a soak stage publishable as capacity evidence, and if not, why not?
+
+    Two things at once, because either alone lies: the stage must say it ran to
+    completion (every branch round, at least one parity probe cycle, no worker
+    errors, nothing stuck), and it must have yielded a cap that is a real
+    measurement.  A measured 0 is one -- it says no B run fits on this node at
+    this K/m -- but a null cap is the absence of a measurement, and Tier 1 must
+    size itself on neither an unfinished stage nor a missing number.
+    """
+    if not soak:
+        return False, "no valid soak stage in the results"
+    if not soak.get("complete", False):
+        reasons = [str(r) for r in (soak.get("incomplete_reasons") or [])]
+        return False, ("soak incomplete: "
+                       + ("; ".join(reasons) or "stage carries no completeness record"))
+    if cap.get("cap") is None:
+        blockers = [str(b) for b in (cap.get("blockers") or [])]
+        return False, ("no usable run cap: "
+                       + ("; ".join(blockers) or str(cap.get("basis") or "the cap is null")))
+    return True, ""
 
 
 def _all_fork_parts(stage: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -1801,10 +1962,17 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
         reasons = soak.get("incomplete_reasons") or ["stage carries no completeness record"]
         gaps.append("soak incomplete: " + "; ".join(str(r) for r in reasons))
     run_cap = results.get("run_cap")
-    if isinstance(run_cap, dict) and run_cap.get("cap") is None:
+    cap_value = run_cap.get("cap") if isinstance(run_cap, dict) else None
+    cap_refuses = ""
+    if isinstance(run_cap, dict) and cap_value is None:
         # A node whose sustainable width could not be measured cannot be said to
         # fit the fan-out, whatever the percentiles look like.
         gaps.append("no per-node run cap established: " + str(run_cap.get("basis")))
+    elif isinstance(cap_value, int) and not isinstance(cap_value, bool) and cap_value <= 0:
+        # A measured zero is evidence, not a hole in it: the node affords no B
+        # run at all at this K/m, so the gate FAILs on it.  INCOMPLETE stays
+        # reserved for the null cap, where nothing was measured.
+        cap_refuses = "measured per-node run cap is 0: " + str(run_cap.get("basis"))
     provenance = results.get("stage_provenance") or {}
     for name in provenance.get("unfingerprinted") or []:
         if name in ("constants", "fidelity", "probe", "soak"):
@@ -1856,6 +2024,8 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
 
     if gaps or critical is None:
         verdict = "INCOMPLETE"
+    elif cap_refuses:
+        verdict = "FAIL"
     else:
         verdict = "PASS" if critical <= llm_round else "FAIL"
 
@@ -1881,9 +2051,13 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
         )
     else:
         analysis = results.get("fork_op_analysis") or {}
+        overrun = (f"the branch round overruns one sampling round by "
+                   f"{critical - llm_round:.0f}s. " if critical > llm_round else "")
+        capped = (f"{cap_refuses} -- not one B run fits on this node at K={args.K}, m={args.m}, "
+                  f"whatever a single round costs. " if cap_refuses else "")
         rationale = (
-            f"the branch round overruns one sampling round by {critical - llm_round:.0f}s. The "
-            f"binding primitive is **{binding[0]}** at p95 {binding[1]}s"
+            capped + overrun
+            + f"The binding primitive is **{binding[0]}** at p95 {binding[1]}s"
             + (
                 f", and the control plane names its own cause: "
                 f"{analysis['preclaim_miss_rate'] * 100:.0f}% of forks hit "
@@ -1891,8 +2065,14 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
                 f"retried (attempts up to {analysis['op_attempts'].get('max')})"
                 if analysis.get("preclaim_miss_count") else ""
             )
-            + f". Report infra-bound with fork serialisation named; raising m to "
-              f"{max(1, int(critical / llm_round) + 1)} or dropping K would be the levers."
+            + (
+                f". Report infra-bound with fork serialisation named; raising m to "
+                f"{max(1, int(critical / llm_round) + 1)} or dropping K would be the levers."
+                if overrun else
+                ". Report infra-bound: it is the node's measured fork throughput, not one "
+                "round's latency, that refuses the fan-out; more nodes or a smaller K are the "
+                "levers."
+            )
         )
     if notes:
         rationale += " Note: " + "; ".join(notes) + "."
@@ -1901,6 +2081,7 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
         "m": args.m,
         "llm_round_s": llm_round,
         "llm_round_basis": args.llm_round_basis,
+        "per_node_run_cap": cap_value,
         "critical_path_p95_s": round(critical, 2) if critical is not None else None,
         "critical_path_basis": basis,
         "branch_path_p95_s": round(branch_path, 2) if branch_path is not None else None,
@@ -1921,19 +2102,74 @@ def evaluate_gate(results: dict[str, Any], args: argparse.Namespace) -> dict[str
 STAGE_NAMES: tuple[str, ...] = ("bake", "constants", "cooldown", "fidelity", "probe", "soak")
 
 
+def fixture_identity(args: argparse.Namespace) -> dict[str, Any]:
+    """What the fidelity / soak-probe factory actually is, by content.
+
+    The path is not the fixture: the file behind it can be regenerated between
+    runs, and a probe scored against a different factory is a different
+    experiment.  A missing or unreadable file hashes to ``None`` -- the stages
+    fall back to PLANT_PROGRAM there, which is hashed too.
+    """
+    def digest(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()[:16]
+
+    path = Path(args.plant_state) if args.plant_state else FIXTURE_STATE
+    entry: dict[str, Any] = {"path": str(path), "sha256": None,
+                             "program": "builtin", "program_sha256": digest(
+                                 PLANT_PROGRAM.encode())}
+    try:
+        entry["sha256"] = digest(path.read_bytes())
+    except OSError:
+        pass  # recorded as an unhashed fixture, which is not equal to a hashed one
+    if args.plant_program:
+        program = Path(args.plant_program)
+        entry["program"] = str(program)
+        entry["program_sha256"] = None
+        try:
+            entry["program_sha256"] = digest(program.read_bytes())
+        except OSError:
+            pass
+    return entry
+
+
+#: Bumped whenever :func:`stage_inputs` gains a key.  A fingerprint written by
+#: an older version cannot be compared key-for-key against this one, so it
+#: counts as no fingerprint at all rather than as agreement.
+STAGE_INPUTS_VERSION = 2
+
+
 def stage_inputs(name: str, args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]:
     """The inputs a stage's numbers are only valid for.
 
     Stages persist independently and are recombined by the run cap, the gate and
     the report on later invocations, so each records what it was measured
     against: the sandbox or snapshot it forked from, the fan-out width K it was
-    shaped for, and the soak width that shape was realised at.
+    shaped for, the soak width that shape was realised at and -- because
+    fidelity and both probe paths score a factory against a tolerance -- the
+    entity probed, the tolerance it was scored at, how many children were
+    compared, and the fixture itself by content.
     """
     return {
+        "fingerprint_version": STAGE_INPUTS_VERSION,
         "source": state.get("template_snap") if name == "soak" else state.get("bake_sandbox"),
         "K": args.K,
         "soak_width": args.soak_width,
+        "probe_entity": args.probe_entity,
+        "probe_tolerance": args.probe_tolerance,
+        "fidelity_children": args.fidelity_children,
+        "fixture": fixture_identity(args),
     }
+
+
+#: The fingerprint keys whose change invalidates each stage's numbers.
+COMPARED_INPUTS: dict[str, tuple[str, ...]] = {
+    "bake": ("source",),
+    "constants": ("source",),
+    "cooldown": ("source",),
+    "fidelity": ("source", "probe_entity", "probe_tolerance", "fidelity_children", "fixture"),
+    "probe": ("source", "probe_entity"),
+    "soak": ("source", "soak_width", "probe_entity", "fixture"),
+}
 
 
 def check_stage_provenance(
@@ -1941,14 +2177,18 @@ def check_stage_provenance(
 ) -> dict[str, Any]:
     """Refuse to recombine stages that were measured against different inputs.
 
-    Only the keys that actually invalidate a stage are compared: ``source``
-    everywhere (a different bake sandbox or TEMPLATE_SNAP is a different
-    experiment) and ``soak_width`` for the soak.  ``K`` is recorded but not
-    compared -- it is applied at gate time, and the gate already refuses a soak
-    whose width is not K-1.
+    Only the keys that actually invalidate a stage are compared, per stage
+    (:data:`COMPARED_INPUTS`): ``source`` everywhere (a different bake sandbox or
+    TEMPLATE_SNAP is a different experiment), ``soak_width`` for the soak, and --
+    for the stages that score a factory -- the probed entity, the spread
+    tolerance, the number of children compared and the fixture's content hash.
+    ``K`` is recorded but not compared: it is applied at gate time, and the gate
+    already refuses a soak whose width is not K-1.
+
+    A fingerprint from an older version of this file cannot be compared
+    key-for-key with this one, so it counts as unfingerprinted -- which the gate
+    turns into INCOMPLETE, never into a false "same inputs".
     """
-    compared = {name: ("source", "soak_width") if name == "soak" else ("source",)
-                for name in STAGE_NAMES}
     stale: list[tuple[str, dict[str, tuple[Any, Any]]]] = []
     unfingerprinted: list[str] = []
     checked: list[str] = []
@@ -1956,12 +2196,14 @@ def check_stage_provenance(
         if not ok_stage(results, name):
             continue
         recorded = (results[name] or {}).get("inputs")
-        if not isinstance(recorded, dict):
+        if (not isinstance(recorded, dict)
+                or recorded.get("fingerprint_version") != STAGE_INPUTS_VERSION):
             unfingerprinted.append(name)
             continue
         want = stage_inputs(name, args, state)
         diff = {key: (recorded.get(key), want[key])
-                for key in compared[name] if recorded.get(key) != want[key]}
+                for key in COMPARED_INPUTS.get(name, ("source",))
+                if recorded.get(key) != want[key]}
         if diff:
             stale.append((name, diff))
         else:
@@ -1979,8 +2221,8 @@ def check_stage_provenance(
             f"{JSON_PATH.name} aside."
         )
     if unfingerprinted:
-        log(f"stages without an input fingerprint (rerun to make them gateable): "
-            f"{', '.join(unfingerprinted)}")
+        log(f"stages with no input fingerprint or one from an older fingerprint version "
+            f"(rerun to make them gateable): {', '.join(unfingerprinted)}")
     return {
         "expected": stage_inputs("constants", args, state),
         "expected_soak": stage_inputs("soak", args, state),
@@ -2068,6 +2310,18 @@ def main(argv: list[str] | None = None) -> int:
     }
     requested = [] if args.report_only else [s.strip() for s in args.stages.split(",") if s.strip()]
 
+    # C4 auth is a precondition of every stage that talks to the guest bridge
+    # over an exposed port, and all of them do.  Validating it here -- before a
+    # bake sandbox is created, an image uploaded or any TCP stage mutates
+    # anything -- turns a missing credential into an argument error instead of a
+    # half-built sandbox and a five-minute health-check timeout.
+    if requested:
+        preflight_env = bridge_guest_env()
+        preflight_token = preflight_env.get("FLE_BRIDGE_TOKEN") or ""
+        preflight_mode = (f"token {auth_fingerprint(preflight_token)}" if preflight_token
+                          else "insecure opt-in (no token)")
+        log(f"bridge auth preflight ok: {preflight_mode}")
+
     def flush() -> None:
         results["finished"] = now_iso()
         results["state"] = state
@@ -2075,11 +2329,63 @@ def main(argv: list[str] | None = None) -> int:
             results["timing_summary"] = fp.timing_summary()
         atomic_write_json(JSON_PATH, results)
 
-    def reaper_pass(context: str) -> None:
-        """Best-effort reap that never raises and never drops the keep-list."""
+    #: Callables a failed stage handed over that answer "what do my still-running
+    #: workers own right now".  Consulted at cleanup time, not at failure time.
+    live_probes: list[Callable[[], dict[str, list[str]]]] = []
+
+    def live_worker_holdings() -> tuple[list[str], list[str]]:
+        """(worker names, resource ids) a soak worker that outlived the stage owns.
+
+        stage_soak refuses to delete its sources under a still-running worker;
+        the reaper is the second half of that promise, and these are the ids it
+        must leave alone.  The recorded ids are the picture as of the failure; a
+        live probe adds whatever the worker has created since, which is the whole
+        reason for asking again here.
+        """
+        workers: list[str] = []
+        ids: set[str] = set()
+        soak = results.get("soak")
+        if isinstance(soak, dict):
+            for block in (soak, soak.get("partial")):
+                if not isinstance(block, dict) or not block.get("stuck_workers"):
+                    continue
+                workers = [str(w) for w in block["stuck_workers"]]
+                held = block.get("live_worker_resources")
+                held = held if isinstance(held, dict) else {}
+                ids.update(str(i) for i in (held.get("sandboxes") or []))
+                ids.update(str(i) for i in (held.get("snapshots") or []))
+                break
+        for probe in live_probes:
+            try:
+                fresh = probe()
+            except Exception as exc:  # a broken probe must not stop the cleanup
+                log(f"live-resource probe failed: {type(exc).__name__}: {exc}")
+                continue
+            if not isinstance(fresh, dict):
+                continue
+            ids.update(str(i) for i in (fresh.get("sandboxes") or []))
+            ids.update(str(i) for i in (fresh.get("snapshots") or []))
+        return workers, sorted(ids)
+
+    def reaper_pass(context: str, *, protected: list[str] | tuple[str, ...] = (),
+                    live_workers: list[str] | tuple[str, ...] = ()) -> None:
+        """Best-effort reap that never raises and never drops the keep-list.
+
+        ``protected`` are ids a soak worker still running in this process owns.
+        They are kept, loudly: that thread is forking off them right now, and a
+        source deleted under it strands the children it has already created --
+        exactly the leak stage_soak declined to cause when it left them behind.
+        """
         if args.report_only:
             return
         keep = [k for k in (state.get("bake_sandbox"), state.get("template_snap")) if k]
+        keep += [k for k in protected if k and k not in keep]
+        if protected or live_workers:
+            log(f"  !! NOT reaping {len(protected)} resource(s) owned by live soak worker(s) "
+                f"{', '.join(live_workers) or '?'}: "
+                f"{', '.join(protected) or 'none were registered'} -- reap them by hand once "
+                f"the control plane releases their operations, then rerun the soak")
+            results["reaper_protected"] = {"workers": list(live_workers), "ids": list(protected)}
         log(f"reaper pass ({context}; keeping {keep})")
         try:
             deleted = fp.reaper(keep=keep)
@@ -2100,16 +2406,27 @@ def main(argv: list[str] | None = None) -> int:
         fails closed instead of quietly using stale percentiles; the numbers
         themselves are kept under ``partial`` and in tier0.json.
 
+        Publishing takes more than a stage that did not raise: :func:`soak_validity`
+        also demands that the stage says it completed and that the cap is an
+        actual measurement (a measured 0 counts, a null one does not).
+
         ``publish=False`` is the abnormal-exit path: the soak was never checked
         against the rest of the run (no provenance check, no cap, no gate), so
-        even a valid-looking stage is not published.  ``--report-only`` republishes
-        it once the run completes.
+        even a valid-looking stage is not published.  ``--report-only``
+        republishes it once the run completes.
         """
         soak_stage = ok_stage(results, "soak")
         recorded = results.get("soak")
-        if soak_stage and publish:
-            payload = dict(soak_stage)
+        valid, invalid_reason = soak_validity(soak_stage, cap)
+        if isinstance(recorded, dict):
+            # tier0.json's own copy of the stage carries the same verdict as the
+            # artifact, so a consumer reading either file reaches it.
+            recorded["valid"] = bool(valid and publish)
+            recorded.setdefault("complete", False)
+        if valid and publish:
+            payload = dict(soak_stage or {})
             payload["valid"] = True
+            payload["complete"] = True
             payload["generated"] = now_iso()
             payload["recommended_run_cap"] = cap["cap"]
             payload["per_node_run_cap"] = cap["cap"]
@@ -2123,10 +2440,12 @@ def main(argv: list[str] | None = None) -> int:
             return  # this invocation has nothing to say about the soak
         reason = str(
             (recorded or {}).get("error")
+            or invalid_reason
             or "the run did not complete, so this soak was never validated against it"
         )
         atomic_write_json(SOAK_PATH, {
             "valid": False,
+            "complete": bool((soak_stage or {}).get("complete", False)),
             "invalid_reason": reason,
             "generated": now_iso(),
             "recommended_run_cap": None,
@@ -2136,6 +2455,28 @@ def main(argv: list[str] | None = None) -> int:
             "partial": (recorded or {}).get("partial") or soak_stage or {},
         })
         log(f"marked {SOAK_PATH} INVALID: {reason}")
+
+    def invalidate_conclusions(reason: str) -> None:
+        """Unmake tier0.json's whole-run conclusions.
+
+        ``recommended_run_cap``, ``run_cap`` and ``gate`` are statements about a
+        finished run.  After an abnormal exit they are either this run's
+        half-formed answers or -- worse -- the previous invocation's, reloaded
+        from tier0.json at startup and never recomputed, which would size Tier 1
+        on a run that did not happen.  They are replaced with explicit nulls and
+        an INCOMPLETE gate; the stale values stay as evidence.  Per-stage
+        payloads are untouched (constants and probe carry their own provenance),
+        and --report-only recomputes all three.
+        """
+        stale = {key: results[key] for key in ("recommended_run_cap", "run_cap", "gate")
+                 if key in results}
+        results["recommended_run_cap"] = None
+        results["run_cap"] = {"cap": None, "valid": False, "blockers": [reason],
+                              "basis": reason}
+        results["gate"] = {"verdict": "INCOMPLETE", "valid": False,
+                           "evidence_gaps": [reason], "rationale": reason}
+        results["conclusions_invalidated"] = {"reason": reason, "at": now_iso(), "stale": stale}
+        log(f"tier0.json cap/gate marked INVALID: {reason}")
 
     try:
         for name in requested:
@@ -2154,6 +2495,11 @@ def main(argv: list[str] | None = None) -> int:
                     # Evidence beside the error, never instead of it: ok_stage()
                     # still refuses the stage because "error" is set.
                     results[name]["partial"] = partial
+                probe = getattr(exc, "live_resources", None)
+                if callable(probe):
+                    # This stage left threads running: the reaper has to ask them
+                    # what they own before it deletes anything.
+                    live_probes.append(probe)
                 results[name]["inputs"] = stage_inputs(name, args, state)
                 flush()
                 if not args.keep_going:
@@ -2169,16 +2515,26 @@ def main(argv: list[str] | None = None) -> int:
         cap = recommended_run_cap(soak, args)
         results["run_cap"] = cap
         results["recommended_run_cap"] = cap["cap"]
-        results["fork_op_analysis"] = analyze_fork_ops(fp.journal_path.parent)
+        # Bounded to this result set: the journal accumulates across runs, and
+        # attributing an older run's fork failures to this one would misname the
+        # cause the gate reports.
+        results["fork_op_analysis"] = analyze_fork_ops(
+            fp.journal_path.parent, since=str(results.get("started") or ""))
         results["gate"] = evaluate_gate(results, args)
     except BaseException:
         # A stage that raised leaves children, snapshots and possibly a stale
         # soak artifact behind; both are cleaned up before the traceback leaves
-        # main, and neither is allowed to mask the original failure.
+        # main, and neither is allowed to mask the original failure.  The cap and
+        # the gate go with them: they are conclusions about a run that did not
+        # finish.
+        stuck_workers, protected_ids = live_worker_holdings()
         for step in (
+            lambda: invalidate_conclusions(
+                "tier0 exited abnormally; this run never established a cap or a gate"),
             lambda: finalize_soak_artifact(
                 recommended_run_cap(ok_stage(results, "soak"), args), publish=False),
-            lambda: reaper_pass("after failure"),
+            lambda: reaper_pass("after failure", protected=protected_ids,
+                                live_workers=stuck_workers),
             flush,
         ):
             try:

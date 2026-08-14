@@ -16,10 +16,15 @@ Responsibilities that belong here and nowhere else:
   start from a baked checkpoint. A×K-from-S is A×K with
   ``template_snap=<checkpoint>`` and no other difference.
 * Exit codes -- the block's contract with any wrapper script: 0 ONLY for a
-  complete matrix, 2 when a provider died mid-block (partial results written,
-  every affected cell on ``needs_rerun``), 1 for anything else incomplete --
-  failed cells, cells the graceful stop never admitted, an interrupt, or an
-  exception no cell accounted for.
+  complete matrix of fully-ok runs, 2 when a provider died mid-block (partial
+  results written, every affected cell on ``needs_rerun``), 1 for anything else
+  incomplete -- failed cells, cells the graceful stop never admitted, an
+  interrupt, an exception no cell accounted for, a run whose final status is not
+  ``ok`` (``invalid_dose``/``invalid_width``/``partial`` live in ``runs``, not
+  in ``failures``), or any non-provider ``needs_rerun`` entry.
+* Merge, never replace: a PARTIAL pass -- ``--cells`` recovery or a ``--round``
+  gate -- loads the cells it is not running from the results file it is about to
+  rewrite, under a measurement-config fingerprint.
 
 It never invents its own endpoint: the number per run is the terminal fixed
 60s-window probe produced by :mod:`bench.arms`.
@@ -125,12 +130,37 @@ EXP3_LADDER = ("Control", "AxK-S", "Hybrid")
 #: reported with per-seat distributions, never as a significance claim.
 EXP3_T_S = 2 * EXP3_P_S
 
+
+def cell_peak_sandboxes(arm: str, K: int) -> int:
+    """Sandboxes ONE cell of ``arm`` can hold at once -- FAILURE PATH INCLUDED.
+
+    :func:`bench.tier05.peak_sandboxes` sizes a Hybrid cell at K because its
+    refork wave starts only after the K-1 losers are deleted. That holds only
+    while the deletes SUCCEED, and they are best-effort by construction: the arm
+    releases the losers, journals whatever the release could not delete, and
+    forks the K-1 children regardless -- so a wave that meets one dead delete
+    holds the winner + up to K-1 undeleted losers + K-1 children = 2K-1 live
+    sandboxes on the node. Making a successful release a PRECONDITION of the
+    wave is the arm's call to make (``bench.arms`` owns the release and the
+    fork), and this scheduler cannot observe either, so the one thing the
+    scheduler does own -- the reservation -- covers the failure path.
+    Over-reserving only idles slots inside our own pool; under-reserving breaks
+    the node cap the pool exists to enforce, and the node is not ours to
+    over-admit.
+    """
+    if arm == "Hybrid":
+        return max(2, 2 * K - 1)
+    return peak_sandboxes(arm, K)
+
+
 # --- parallel-round mode (pre-registered option) ----------------------------
-#: Peak concurrent sandboxes when a whole round runs at once: A×K-S 8 + Hybrid 8
-#: (its refork wave starts only after the 7 losers are deleted, so 8 is its
-#: peak) + Control 1. The slot pool is sized for exactly this; anything smaller
-#: would serialise the round it is meant to parallelise.
-EXP3_PARALLEL_SLOTS = 2 * EXP3_K + 1
+#: Peak concurrent sandboxes when a whole round runs at once: the sum of the
+#: ladder's per-cell reservations -- Control 1 + A×K-S K + Hybrid's failure-path
+#: 2K-1 (:func:`cell_peak_sandboxes`). The slot pool is sized for exactly this;
+#: anything smaller would serialise the round it is meant to parallelise, and
+#: anything sized off the happy path would over-admit the node the first time a
+#: loser delete failed.
+EXP3_PARALLEL_SLOTS = sum(cell_peak_sandboxes(arm, EXP3_K) for arm in EXP3_LADDER)
 #: In-flight codex calls the 16 fan-out seats SHARE in parallel mode: the level
 #: Exp 2 sustained (8 seats, one call each). It is a cap on the provider, not on
 #: an arm, so both fan-out arms are throttled identically and the within-round
@@ -179,6 +209,47 @@ def exp3_ttl_s(t_total_s: float, *, margin_s: float = EXP3_TTL_MARGIN_S) -> int:
     return int(t_total_s + margin_s)
 
 
+def exp3_label(mode: str) -> str:
+    """Exp 3's block label, with the launch MODE spelled out inside it."""
+    return (
+        "EXPERIMENT 3 -- three-arm ladder in rounds: Control (1 seat, no "
+        "persona) -> A×K-S (8 persona seats, never converged) -> Hybrid (one "
+        f"halftime regroup), one checkpoint + codex, K={EXP3_K}, "
+        f"P={EXP3_P_S:.0f}s, T=2P={EXP3_T_S:.0f}s build-time-matched, width "
+        f"floor {EXP3_WIDTH_FLOOR}; DIRECTIONAL, 2 rounds, round 2 on "
+        f"explicit go; {mode}"
+    )
+
+
+def exp3_parallel_mode(cfg: Tier1Config) -> str:
+    """Switch ``cfg`` into PARALLEL-ROUND mode; returns the mode text.
+
+    Applied AFTER the config is fully loaded -- block preset, ``--config`` file,
+    ``--from-tier05`` and every explicit flag -- because ``--parallel-round``
+    used to be read only INSIDE the ``--exp3-block`` preset: a config file that
+    already carried ``exp3_block: true`` took the flag, silently ignored it, and
+    ran the round sequentially at cap 1 (three rungs back to back, ~7.7h instead
+    of ~2.7h, and none of the throttling the mode pre-registers).
+    """
+    cfg.parallel_round = True
+    cfg.run_cap = 3
+    cfg.max_sandboxes = EXP3_PARALLEL_SLOTS
+    # The probe-cadence stagger exists to keep concurrent fork waves apart and
+    # only one arm forks here; the PROVISIONING stagger is what a parallel round
+    # needs, because simultaneous creates are what starved round 1's last seat.
+    cfg.stagger_s = 0.0
+    cfg.provision_stagger_s = EXP3_PROVISION_STAGGER_S
+    return (
+        f"PARALLEL round (3 cells at once, {EXP3_PARALLEL_SLOTS} slots, "
+        f"creates staggered {EXP3_PROVISION_STAGGER_S:.0f}s per rung in "
+        f"ladder order, {EXP3_PROVIDER_CONCURRENCY}-in-flight shared "
+        f"codex cap, {'/'.join(EXP3_PROVIDER_EXEMPT_ARMS)} exempt -> "
+        "fan-out seats step ~2x slower, which DEFLATES the "
+        "Control->A×K-S gap: conservative for the fork-value claim, and "
+        "read as such)"
+    )
+
+
 #: Exp 3's checkpoint, secured by ``bench.exp3_prep`` (see
 #: ``bench/results/exp3_prep.json``). Exp 1's S2 and TEMPLATE_SNAP both lapsed
 #: at their 24h leases (``state: deleted``; warm boot returns HTTP 409 "not
@@ -210,6 +281,11 @@ class Tier1Config:
     arms: tuple[str, ...] = DEFAULT_ARMS
     #: C runs on ONE mid model only: B-vs-C is about infra, not capability.
     c_model: str = ""
+    #: Models arm B is ADMITTED for (Tier 0.5's ``arm_b_models``): B's branch
+    #: round only measures what it means to measure on a model whose sampling
+    #: wait can hide the materialise tail. Empty = no restriction; a non-empty
+    #: list RESTRICTS B's cells to those models and nothing else.
+    b_models: tuple[str, ...] = ()
     tasks: tuple[str, ...] = ("iron_plate_throughput",)
     replicates: int = 1
     T_s: float = 1800.0
@@ -261,7 +337,9 @@ class Tier1Config:
     #: Exp-3 round gate: run ONLY this round's rung (``--round 1`` -> the three
     #: r1 cells). 0 = every round in the manifest. The rounds are reviewed
     #: between launches by design, so this is the normal way to run the block --
-    #: equivalent to ``--cells Hybrid:N,AxK-S:N,Control:N``.
+    #: equivalent to ``--cells Hybrid:N,AxK-S:N,Control:N``, and like ``cells``
+    #: it MERGES into whatever ``out`` already holds of the manifest instead of
+    #: replacing it (see :meth:`Tier1Runner.load_merge_base`).
     round: int = 0
     #: PARALLEL-ROUND mode (pre-registered option): run the selected round's
     #: three cells CONCURRENTLY (~2.7h instead of ~7.7h). Raises the run cap to
@@ -332,8 +410,9 @@ def expand_cells(cfg: Tier1Config) -> list[Cell]:
     """The cells this invocation runs, in the order it runs them.
 
     Either a pre-registered manifest (``exp2_block`` / ``exp3_block``) or one
-    cell per (arm, model, task, replicate) with C only for ``c_model``, ordered
-    so that every arm of a given (task, replicate, model) block is adjacent.
+    cell per (arm, model, task, replicate) with C only for ``c_model`` and B only
+    for ``b_models`` when Tier 0.5 restricted it, ordered so that every arm of a
+    given (task, replicate, model) block is adjacent.
     ``round`` then keeps only that round's rung (Exp 3 launches one round at a
     time, by design), and ``cells`` narrows further to the named
     (arm, replicate) pairs -- the per-cell recovery path. Neither filter ever
@@ -359,6 +438,14 @@ def expand_cells(cfg: Tier1Config) -> list[Cell]:
                 for model in models:
                     for arm in arms:
                         if arm == "C":
+                            continue
+                        if (arm == "B" and cfg.b_models
+                                and model not in cfg.b_models):
+                            # Tier 0.5 admitted B for a SUBSET of the models
+                            # (its overlap gate excludes a model whose sampling
+                            # wait cannot hide the branch tail). Expanding B
+                            # over the rest would run the arm on exactly the
+                            # models it was refused for.
                             continue
                         cells.append(
                             Cell(arm=arm, model=model, task=task, replicate=replicate)
@@ -398,24 +485,58 @@ def config_from_tier05(path: str) -> Tier1Config:
 
     Tier 0.5 may REFUSE to freeze a config (missing or errored calibration
     evidence, no ladder point that fits the budget); its payload then carries
-    ``executable: false`` and the reasons. That is not a config with defaults --
-    it is the absence of one, so it is an error here rather than a silent
-    fallback to DEFAULT_ARMS with no models.
+    ``status: "REFUSED"`` / ``executable: false`` and the reasons. That is not a
+    config with defaults -- it is the absence of one, so it is an error here
+    rather than a silent fallback to DEFAULT_ARMS with no models. An artifact
+    carrying NEITHER stamp predates the frozen-config schema and cannot prove
+    that anything was ever frozen, so it is refused for the same reason.
+
+    ``arm_b_models`` (older spelling: ``b_arm_models``) is the set of models arm
+    B was ADMITTED for -- Tier 0.5's overlap gate excludes a model whose
+    sampling wait cannot hide the branch-materialise tail. It RESTRICTS B's
+    cells: expanding B over every admitted model would run the arm on the very
+    models Tier 0.5 refused it for.
     """
     with open(path, encoding="utf-8") as fh:
         payload = json.load(fh)
-    frozen = payload["frozen_pilot_config"]
-    if frozen.get("executable") is False or frozen.get("status") == "REFUSED":
-        reasons = frozen.get("reasons") or []
+    frozen = payload.get("frozen_pilot_config")
+    if not isinstance(frozen, dict):
+        raise ValueError(
+            f"{path} carries no frozen_pilot_config object, so there is no "
+            "Tier-1 config in it -- re-run Tier 0.5"
+        )
+    status, executable = frozen.get("status"), frozen.get("executable")
+    if executable is False or status == "REFUSED":
+        reasons = frozen.get("reasons") or frozen.get("blockers") or []
         raise ValueError(
             f"{path}: Tier 0.5 REFUSED to freeze a pilot config "
             f"({frozen.get('error') or 'no error given'})"
             + (f"; reasons: {'; '.join(str(r) for r in reasons)}" if reasons else "")
             + " -- re-run Tier 0.5 instead of launching on defaults"
         )
+    if status != "FROZEN" or executable is not True:
+        raise ValueError(
+            f"{path}: frozen_pilot_config is not stamped FROZEN and executable "
+            f"(status={status!r}, executable={executable!r}). Tier 0.5 stamps "
+            "both on every config it freezes, so an artifact without them cannot "
+            "prove one was frozen at all -- re-run Tier 0.5 rather than launching "
+            "a pilot on an unverifiable config"
+        )
+    arms = tuple(frozen.get("arms") or DEFAULT_ARMS)
+    b_models = frozen.get("arm_b_models")
+    if b_models is None:
+        b_models = frozen.get("b_arm_models")  # pre-R2C1 spelling
+    if "B" in arms and b_models is None:
+        raise ValueError(
+            f"{path}: the frozen config runs arm B but names no arm_b_models, so "
+            "there is no evidence which models B's branch tail was admitted for; "
+            "expanding B over every admitted model would run it on the models "
+            "Tier 0.5 excluded -- re-run Tier 0.5"
+        )
     return Tier1Config(
         models=tuple(frozen.get("models") or ()),
-        arms=tuple(frozen.get("arms") or DEFAULT_ARMS),
+        arms=arms,
+        b_models=tuple(b_models or ()),
         c_model=frozen.get("c_model") or "",
         tasks=tuple(frozen.get("tasks") or ()),
         replicates=int(frozen.get("replicates", 1)),
@@ -427,16 +548,22 @@ def config_from_tier05(path: str) -> Tier1Config:
     )
 
 
-#: Config fields that DEFINE the measurement. ``--cells`` recovery rewrites the
-#: same results file, so the cells it preserves must have measured the same
-#: thing: a cell re-run at another T/K/m, from another checkpoint or under
-#: another template is not the same cell, and silently mixing the two would put
-#: two experiments in one paired contrast. Scheduling knobs (caps, staggers,
-#: prefixes, keep list, out paths) are deliberately absent -- they change how a
-#: cell is admitted, never what it measures.
+#: Config fields that DEFINE the measurement. A partial pass (``--cells``
+#: recovery, a ``--round`` gate) rewrites the same results file, so the cells it
+#: preserves must have measured the same thing: a cell re-run at another T/K/m,
+#: from another checkpoint, under another template, over another arm/model set,
+#: against another provider cap or in another mode is not the same cell, and
+#: silently mixing the two would put two experiments in one paired contrast.
+#: ``provider_concurrency`` and ``parallel_round`` are in here because they set
+#: the rate the endpoint was measured at (a shared 8-in-flight gate roughly
+#: halves a fan-out seat's step rate), and ``dry`` because a fake endpoint is
+#: not a measurement at all. Purely SCHEDULING knobs (node cap, staggers,
+#: prefixes, keep list, out paths) stay absent -- they change how a cell is
+#: admitted, never what it measures.
 MERGE_FINGERPRINT_FIELDS = (
-    "exp2_block", "exp3_block", "models", "tasks", "T_s", "leg_s", "K", "m",
-    "template_snap", "template_snap_id",
+    "exp2_block", "exp3_block", "arms", "models", "b_models", "c_model", "tasks",
+    "replicates", "T_s", "leg_s", "K", "m", "template_snap", "template_snap_id",
+    "provider_concurrency", "parallel_round", "dry",
 )
 
 
@@ -883,13 +1010,23 @@ class Tier1Runner:
                 ids.append(k)
         return ids
 
-    # -- per-cell recovery -------------------------------------------------
-    def load_merge_base(self) -> None:
-        """``--cells``: seed the results with the cells this pass is NOT re-running.
+    # -- partial passes (per-cell recovery, round gate) --------------------
+    def selected_cells(self) -> tuple[list[Cell], list[Cell]]:
+        """``(the cells this pass runs, every cell of the manifest)``."""
+        return (expand_cells(self.cfg),
+                expand_cells(replace(self.cfg, cells=(), round=0)))
 
-        Every later :meth:`write_partial` then rewrites the SAME file with the
-        preserved cells plus the fresh ones, so re-running one lost pair from S2
-        costs one pair, not the block.
+    def load_merge_base(self) -> None:
+        """Seed the results with the cells this pass is NOT re-running.
+
+        BOTH partial selectors are merge bases: ``--cells`` recovery and the
+        ``--round`` gate. Every :meth:`write_partial` rewrites the WHOLE ``out``
+        file, so for a partial pass a missing merge base is not a missing
+        optimisation -- it is a REPLACEMENT. ``--round 2`` used to load nothing
+        (``cfg.cells`` was the only trigger) and atomically drop round 1's
+        endpoints on its first completion, and that file is exactly what the
+        between-round review reads. A pass covering the whole manifest owns its
+        file outright and merges nothing.
 
         The prior file is only a merge base if it measured the SAME thing: its
         stored config is fingerprinted (:data:`MERGE_FINGERPRINT_FIELDS`) against
@@ -897,32 +1034,72 @@ class Tier1Runner:
         all cannot prove compatibility, so it is refused too -- silently blending
         a 4200s endpoint with a 1800s one is the worst outcome available here.
         """
-        path = self.cfg.out
-        if not self.cfg.cells or not os.path.exists(path):
+        cfg = self.cfg
+        path = cfg.out
+        if not (cfg.cells or cfg.round):
+            return
+        selected, whole = self.selected_cells()
+        rerun = {c.key for c in selected}
+        if rerun >= {c.key for c in whole}:
+            # The selection covers the manifest: nothing of it is preserved.
+            return
+        rounds = sorted({c.replicate for c in whole})
+        if not os.path.exists(path):
+            # ``main`` refuses an operator's --cells recovery that has no base to
+            # merge into (that is a typo in --out, not a run). Here it is
+            # journaled instead: the manifest's FIRST round legitimately creates
+            # the file, and the dry gates build partial passes against fresh
+            # paths on purpose.
+            self.master.event("merge_base_absent", path=path,
+                              cells=list(cfg.cells), round=cfg.round or None,
+                              manifest_rounds=rounds)
+            if cfg.round and rounds and cfg.round != rounds[0]:
+                print(
+                    f"[tier1] --round {cfg.round} starts a FRESH {path}: round(s) "
+                    f"{[r for r in rounds if r < cfg.round]} are NOT in this file, "
+                    "and the ladder is read ACROSS rounds",
+                    flush=True,
+                )
             return
         with open(path, encoding="utf-8") as fh:
             prior = json.load(fh)
-        prior_config = prior.get("config")
-        if not isinstance(prior_config, dict):
-            raise ValueError(
-                f"{path} carries no config block, so --cells cannot verify that "
-                "its preserved cells measured what this pass measures; point "
-                "--out at a fresh file or re-run the whole block"
-            )
         mine = merge_fingerprint(self.cfg.to_dict())
-        theirs = merge_fingerprint(prior_config)
-        drift = {k: (theirs[k], mine[k]) for k in mine if theirs[k] != mine[k]}
-        if drift:
-            raise ValueError(
-                f"refusing to merge into {path}: it was written under a "
-                "different measurement config ("
-                + "; ".join(f"{k} {was!r} -> {now!r}"
-                            for k, (was, now) in sorted(drift.items()))
-                + ") -- a cell re-run at a different T/K/m, from a different "
-                "checkpoint or under a different template is not the same cell; "
-                "use a fresh --out"
+        prior_config = prior.get("config")
+        drift: dict[str, tuple[Any, Any]] = {}
+        problem = ""
+        if not isinstance(prior_config, dict):
+            problem = (
+                "it carries no config block, so a partial pass cannot verify that "
+                "its preserved cells measured what this pass measures"
             )
-        rerun = {c.key for c in expand_cells(self.cfg)}
+        else:
+            theirs = merge_fingerprint(prior_config)
+            drift = {k: (theirs[k], mine[k]) for k in mine if theirs[k] != mine[k]}
+            if drift:
+                problem = (
+                    "it was written under a different measurement config ("
+                    + "; ".join(f"{k} {was!r} -> {now!r}"
+                                for k, (was, now) in sorted(drift.items()))
+                    + ")"
+                )
+        if problem:
+            if cfg.dry:
+                # A dry file holds FAKE endpoints, so there is nothing in it to
+                # preserve and nothing to lose by replacing it: the dry gates run
+                # the same block in several modes through ONE out path, and a
+                # refusal there would only block the gate that proves the merge.
+                # A REAL block refuses -- keeping cells that measured something
+                # else is the exact failure this check exists for.
+                self.master.event("merge_base_discarded", path=path, reason=problem,
+                                  drift={k: list(v) for k, v in drift.items()},
+                                  dry=True)
+                return
+            raise ValueError(
+                f"refusing to merge into {path}: {problem} -- a cell re-run at a "
+                "different T/K/m, from a different checkpoint, under a different "
+                "template or in a different mode is not the same cell; use a "
+                "fresh --out"
+            )
         self.results = [r for r in prior.get("runs", []) if r.get("cell") not in rerun]
         self.failures = [
             f for f in prior.get("failures", []) if f.get("cell") not in rerun
@@ -938,6 +1115,7 @@ class Tier1Runner:
             "path": path,
             "preserved_runs": [r.get("cell") for r in self.results],
             "rerun_cells": sorted(rerun),
+            "selection": {"cells": list(cfg.cells), "round": cfg.round or None},
             "fingerprint": mine,
         }
         self.master.event("merge_base_loaded", **self.merged_from)
@@ -1115,7 +1293,7 @@ class Tier1Runner:
         if self.stop.is_set():
             self.record_skipped(cell, reason="graceful stop before admission")
             return
-        peak = peak_sandboxes(cell.arm, cfg.K)
+        peak = cell_peak_sandboxes(cell.arm, cfg.K)
         async with self.run_sem:
             if self.stop.is_set():
                 self.record_skipped(cell, reason="graceful stop in the run-slot queue")
@@ -1396,9 +1574,9 @@ class Tier1Runner:
         """
         pool = self.slots.total
         over = {
-            cell.arm: peak_sandboxes(cell.arm, self.cfg.K)
+            cell.arm: cell_peak_sandboxes(cell.arm, self.cfg.K)
             for cell in cells
-            if peak_sandboxes(cell.arm, self.cfg.K) > pool
+            if cell_peak_sandboxes(cell.arm, self.cfg.K) > pool
         }
         if not over:
             return
@@ -1676,7 +1854,8 @@ def _cli() -> argparse.ArgumentParser:
                     help="run ONLY this round of a rounds-based manifest "
                          "(--exp3-block: --round 1 = Hybrid r1, AxK-S r1, "
                          "Control r1; equivalent to --cells "
-                         "Hybrid:1,AxK-S:1,Control:1)")
+                         "Hybrid:1,AxK-S:1,Control:1). Merges into the existing "
+                         "--out file, preserving the other rounds' cells")
     ap.add_argument("--parallel-round", action="store_true",
                     help="run the SELECTED round's three cells concurrently "
                          f"(run cap 3, slot pool {EXP3_PARALLEL_SLOTS}, "
@@ -1756,37 +1935,16 @@ def build_config(args: argparse.Namespace) -> Tier1Config:
         # 409 four cells deep instead of an error at argument-parse time.
         cfg.template_snap = EXP3_S2B
         cfg.keep = tuple(dict.fromkeys(cfg.keep + (EXP3_TEMPLATE_SNAP, EXP3_S2B)))
-        mode = "sequential"
-        if args.parallel_round:
-            # PARALLEL ROUND: the three rungs of one round at once. Cap 3 runs, a
-            # pool sized for the round's real peak, no probe-cadence stagger (it
-            # exists to keep concurrent fork waves apart, and only ONE arm forks
-            # here) -- but a PROVISIONING stagger in ladder order, because 17
-            # simultaneous creates is what starved round 1's last seat.
-            cfg.parallel_round = True
-            cfg.run_cap = 3
-            cfg.max_sandboxes = EXP3_PARALLEL_SLOTS
-            cfg.stagger_s = 0.0
-            cfg.provision_stagger_s = EXP3_PROVISION_STAGGER_S
-            mode = (
-                f"PARALLEL round (3 cells at once, {EXP3_PARALLEL_SLOTS} slots, "
-                f"creates staggered {EXP3_PROVISION_STAGGER_S:.0f}s per rung in "
-                f"ladder order, {EXP3_PROVIDER_CONCURRENCY}-in-flight shared "
-                f"codex cap, {'/'.join(EXP3_PROVIDER_EXEMPT_ARMS)} exempt -> "
-                "fan-out seats step ~2x slower, which DEFLATES the "
-                "Control->A×K-S gap: conservative for the fork-value claim, and "
-                "read as such)"
-            )
-        cfg.label = (
-            "EXPERIMENT 3 -- three-arm ladder in rounds: Control (1 seat, no "
-            "persona) -> A×K-S (8 persona seats, never converged) -> Hybrid (one "
-            f"halftime regroup), one checkpoint + codex, K={EXP3_K}, "
-            f"P={EXP3_P_S:.0f}s, T=2P={EXP3_T_S:.0f}s build-time-matched, width "
-            f"floor {EXP3_WIDTH_FLOOR}; DIRECTIONAL, 2 rounds, round 2 on "
-            f"explicit go; {mode}"
-        )
+        cfg.label = exp3_label("sequential")
     if args.arms:
-        cfg.arms = tuple(a for a in args.arms.split(",") if a)
+        arms = tuple(dict.fromkeys(
+            a.strip() for a in args.arms.split(",") if a.strip()
+        ))
+        if not arms:
+            raise SystemExit(
+                f"refusing to run: --arms {args.arms!r} parsed to no arm at all"
+            )
+        cfg.arms = arms
     if args.models:
         cfg.models = tuple(m for m in args.models.split(",") if m)
     if args.c_model:
@@ -1794,6 +1952,11 @@ def build_config(args: argparse.Namespace) -> Tier1Config:
     if args.tasks:
         cfg.tasks = tuple(t for t in args.tasks.split(",") if t)
     if args.replicates:
+        if args.replicates < 1:
+            raise SystemExit(
+                f"refusing to run: --replicates {args.replicates} is not a "
+                "matrix -- a cell needs at least one replicate"
+            )
         cfg.replicates = args.replicates
     if args.T:
         cfg.T_s = args.T
@@ -1845,6 +2008,26 @@ def build_config(args: argparse.Namespace) -> Tier1Config:
             f"pre-registered T={EXP3_T_S:.0f}s -- the results carry the override.",
             flush=True,
         )
+    if args.parallel_round:
+        # Consumed HERE, not inside the --exp3-block preset: the flag has to
+        # reach a config that arrived through --config or --from-tier05 too, and
+        # it must never be silently dropped for one that did.
+        if not cfg.exp3_block:
+            raise SystemExit(
+                "refusing to run: --parallel-round is Exp 3's ladder mode (the "
+                "three rungs of ONE round at once, on the pre-registered shared "
+                "provider cap); it needs --exp3-block or a config with "
+                "exp3_block set"
+            )
+        mode = exp3_parallel_mode(cfg)
+        # Explicit flags were applied above and still outrank the mode's
+        # presets, exactly as they did when it lived inside the block preset.
+        if args.node_cap:
+            cfg.run_cap = args.node_cap
+        if args.max_sandboxes:
+            cfg.max_sandboxes = args.max_sandboxes
+        cfg.label = (exp3_label(mode) if args.exp3_block
+                     else f"{cfg.label}; {mode}")
     return cfg
 
 
@@ -2091,8 +2274,12 @@ async def _dry_validate(
         f"Control is not strict: K={rung_cfgs['Control'].K} "
         f"diversify={rung_cfgs['Control'].diversify!r}"
     )
-    assert peak_sandboxes("Control", live3_cfg.K) == 1, (
+    assert cell_peak_sandboxes("Control", live3_cfg.K) == 1, (
         "the scheduler reserves K slots for the one-agent control"
+    )
+    assert cell_peak_sandboxes("Hybrid", live3_cfg.K) == 2 * live3_cfg.K - 1, (
+        "a Hybrid cell must reserve its FAILURE-PATH peak: a loser delete that "
+        "fails leaves the winner + K-1 losers + K-1 refork children live at once"
     )
     assert all(rung_cfgs[a].K == EXP3_K for a in ("Hybrid", "AxK-S")), (
         "a wide rung lost its width"
@@ -2103,13 +2290,11 @@ async def _dry_validate(
     )
     assert par_cfg.parallel_round and par_cfg.round == 1
     assert par_cfg.run_cap == 3, f"parallel run cap {par_cfg.run_cap}, expected 3"
-    assert par_cfg.max_sandboxes == EXP3_PARALLEL_SLOTS == 17, (
-        f"parallel slot pool {par_cfg.max_sandboxes}, expected "
-        f"{EXP3_PARALLEL_SLOTS} (8 + 8 + 1)"
+    ladder_peak = sum(cell_peak_sandboxes(arm, EXP3_K) for arm in EXP3_LADDER)
+    assert par_cfg.max_sandboxes == EXP3_PARALLEL_SLOTS == ladder_peak, (
+        f"parallel slot pool {par_cfg.max_sandboxes}, expected {ladder_peak} "
+        f"(Control 1 + AxK-S {EXP3_K} + Hybrid's failure-path {2 * EXP3_K - 1})"
     )
-    assert par_cfg.max_sandboxes == sum(
-        peak_sandboxes(arm, EXP3_K) for arm in EXP3_LADDER
-    ), "the pool is not the sum of the round's per-arm peaks"
     assert par_cfg.stagger_s == 0.0, (
         "a parallel round must start together; the stagger only exists to keep "
         "concurrent fork waves apart, and only one arm forks here"
@@ -2173,7 +2358,7 @@ async def _dry_validate(
         "width_floor": EXP3_WIDTH_FLOOR,
         "control_K": rung_cfgs["Control"].K,
         "control_diversify": rung_cfgs["Control"].diversify,
-        "control_peak_sandboxes": peak_sandboxes("Control", live3_cfg.K),
+        "control_peak_sandboxes": cell_peak_sandboxes("Control", live3_cfg.K),
         "provider_concurrency": live3_cfg.provider_concurrency,
         "ttl_s": live3_cfg.ttl_s,
         "ttl_margin_s": EXP3_TTL_MARGIN_S,
@@ -2576,6 +2761,87 @@ async def _dry_validate(
         "runs_after_merge": len(after["runs"]),
     }
 
+    # -- (c1) a ROUND selection MERGES instead of REPLACING -----------------
+    # The other partial pass. --round rewrites the same out file the earlier
+    # rounds live in, and it used to load no merge base at all (only --cells
+    # did): round 2's first completion atomically replaced round 1's endpoints
+    # with its own, in the one file the between-round review reads.
+    round_out = os.path.join(workdir, "round_block_dry.json")
+    round_cfg = replace(
+        merge_cfg, out=round_out, round=1,
+        journal_dir=os.path.join(journal_root, "round"),
+        label="dry-validate round merge",
+    )
+    await Tier1Runner(round_cfg).run()
+    with open(round_out, encoding="utf-8") as fh:
+        r1 = json.load(fh)
+    r1_cells = {c.key for c in expand_cells(round_cfg)}
+    assert {r["cell"] for r in r1["runs"]} == r1_cells, (
+        f"round 1 wrote {sorted(r['cell'] for r in r1['runs'])}, expected "
+        f"{sorted(r1_cells)}"
+    )
+    assert r1["merged_from"] is None, "the first round invented a merge base"
+    r2_cfg = replace(round_cfg, round=2)
+    await Tier1Runner(r2_cfg).run()
+    with open(round_out, encoding="utf-8") as fh:
+        r2 = json.load(fh)
+    r2_cells = {c.key for c in expand_cells(r2_cfg)}
+    assert r1_cells and r2_cells and not (r1_cells & r2_cells), (
+        f"the round gate did not partition the manifest: {sorted(r1_cells)} vs "
+        f"{sorted(r2_cells)}"
+    )
+    assert {r["cell"] for r in r2["runs"]} == r1_cells | r2_cells, (
+        f"after round 2 the file holds {sorted(r['cell'] for r in r2['runs'])}: "
+        f"round 1's {sorted(r1_cells)} were REPLACED instead of merged"
+    )
+    for row in r1["runs"]:
+        kept = next(r for r in r2["runs"] if r["cell"] == row["cell"])
+        assert kept == row, f"round 2 rewrote round 1's {row['cell']}"
+    assert r2["merged_from"]["rerun_cells"] == sorted(r2_cells)
+    assert sorted(r2["merged_from"]["preserved_runs"]) == sorted(r1_cells)
+    assert r2["merged_from"]["selection"]["round"] == 2
+    # A --cells RECOVERY with no base at all is a typo in --out, not a run: it
+    # would write a file holding two cells that looks like a whole block.
+    try:
+        main(["--exp2-block", "--dry", "--cells", "B:2", "--out",
+              os.path.join(workdir, "no_such_base.json")])
+    except SystemExit as exc:
+        assert "merge" in str(exc).lower(), f"unexpected refusal: {exc}"
+    else:  # pragma: no cover - the guard must exist
+        raise AssertionError("--cells recovery with no merge base was accepted")
+    # --parallel-round is consumed AFTER the config is loaded, so a config file
+    # that carries exp3_block gets the mode instead of silently losing it.
+    loaded_path = os.path.join(workdir, "exp3_loaded_config.json")
+    with open(loaded_path, "w", encoding="utf-8") as fh:
+        json.dump({"exp3_block": True, "models": ["codex/gpt-5.6-sol"],
+                   "tasks": ["iron_plate_throughput"], "replicates": 2,
+                   "arms": list(EXP3_LADDER), "K": EXP3_K, "T_s": EXP3_T_S,
+                   "leg_s": EXP3_P_S}, fh)
+    loaded = build_config(_cli().parse_args(
+        ["--config", loaded_path, "--round", "1", "--parallel-round"]
+    ))
+    assert (loaded.parallel_round and loaded.run_cap == 3
+            and loaded.max_sandboxes == EXP3_PARALLEL_SLOTS
+            and loaded.stagger_s == 0.0
+            and loaded.provision_stagger_s == EXP3_PROVISION_STAGGER_S), (
+        "--parallel-round was dropped for a config-loaded Exp-3 block: "
+        f"run_cap={loaded.run_cap} slots={loaded.max_sandboxes} "
+        f"stagger={loaded.provision_stagger_s}"
+    )
+    try:
+        build_config(_cli().parse_args(["--round", "1", "--parallel-round"]))
+    except SystemExit as exc:
+        assert "exp3" in str(exc).lower(), f"unexpected refusal: {exc}"
+    else:  # pragma: no cover - the guard must exist
+        raise AssertionError("--parallel-round outside Exp 3 was accepted")
+    report["round_merge"] = {
+        "out": round_out,
+        "round1": sorted(r1_cells),
+        "round2": sorted(r2_cells),
+        "runs_after_round2": len(r2["runs"]),
+        "parallel_round_from_config": loaded.max_sandboxes,
+    }
+
     # -- (d) a dead cell is reaped before the next cell starts -------------
     fail_out = os.path.join(workdir, "fail_block_dry.json")
     fail_journal = os.path.join(journal_root, "fail")
@@ -2711,7 +2977,11 @@ async def _dry_validate(
         "exp3_control_is_one_seat_no_persona_one_slot": True,
         "exp3_middle_rung_reads_AxK_S_everywhere": True,
         "exp3_parallel_round_requires_a_round": True,
-        "exp3_parallel_round_caps_are_3_runs_and_17_slots": True,
+        "exp3_parallel_round_caps_are_3_runs_and_the_ladder_peak": True,
+        "exp3_hybrid_reserves_its_failure_path_peak_2K_minus_1": True,
+        "round_selector_merges_instead_of_replacing": True,
+        "cells_recovery_without_a_merge_base_is_refused": True,
+        "parallel_round_reaches_a_config_loaded_exp3_block": True,
         "exp3_parallel_fanout_cells_share_one_provider_gate": True,
         "exp3_parallel_control_holds_a_private_gate_of_1": True,
         "exp3_parallel_shared_cap_held_live": True,
@@ -2767,16 +3037,25 @@ def assert_exp3_dry_block(payload: dict[str, Any], *, round_only: int = 0) -> st
     assert expected, f"round {round_only} selects no cell of EXP3_BLOCK"
     assert not payload["failures"], f"cells failed: {payload['failures']}"
     actual = [r["cell"] for r in payload["runs"]]
+    # A partial pass (a --round gate) MERGES the cells it is not running back in
+    # from the prior file, so the rows this invocation produced are the ones the
+    # merge base did not hand over. The gate asserts on those; the preserved rows
+    # belong to the pass that measured them.
+    preserved = set((payload.get("merged_from") or {}).get("preserved_runs") or [])
+    fresh = [c for c in actual if c not in preserved]
+    manifest = {f"{arm}|{model}|{task}|r{rep}" for arm, rep in EXP3_BLOCK}
+    stray = sorted(preserved - manifest)
+    assert not stray, f"the merge base carried cells outside the manifest: {stray}"
     if payload.get("parallel_round"):
         # A parallel round completes out of manifest order by construction, so
         # only the SET is pinned here; the ORDER assertion belongs to the
         # manifest gate in :func:`_dry_validate`.
-        assert sorted(actual) == sorted(expected), (
-            f"the dry parallel round ran {actual}, expected {expected}"
+        assert sorted(fresh) == sorted(expected), (
+            f"the dry parallel round ran {fresh}, expected {expected}"
         )
     else:
-        assert actual == expected, (
-            f"the dry block ran {actual}, expected {expected}"
+        assert fresh == expected, (
+            f"the dry block ran {fresh}, expected {expected}"
         )
     # The renamed rung must be what the results file SAYS, not just what the
     # code calls it: no artifact may still read "AxK2P".
@@ -3148,6 +3427,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Recovery: re-ran {rec['rerun']} into {rec['out']}, preserved "
             f"{len(rec['preserved'])} completed cells untouched."
         )
+        rnd = report["round_merge"]
+        print(
+            f"Round merge: --round 2 merged {len(rnd['round2'])} cell(s) into "
+            f"{rnd['out']} and preserved round 1's {len(rnd['round1'])} "
+            f"({rnd['runs_after_round2']} cells in the file)."
+        )
         print(
             f"Hygiene: {hyg['dead_cell']} died in provisioning, "
             f"{len(hyg['swept'])} resource(s) reaped before {hyg['next_cell']} "
@@ -3239,11 +3524,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"refusing to run: --cells {','.join(cfg.cells)} selected no "
                 f"cell of this block ({whole})"
             )
+        if not os.path.exists(cfg.out):
+            raise SystemExit(
+                f"refusing to run: --cells {','.join(cfg.cells)} is the RECOVERY "
+                f"path and there is no merge base at {cfg.out}, so the cells this "
+                "pass does NOT run would be missing from a file that still looks "
+                "like a whole block -- re-run the block, or point --out at the "
+                "file the lost cells belong to"
+            )
     if cfg.round and not _expand_or_exit(cfg):
         whole = [c.key for c in _expand_or_exit(replace(cfg, round=0))]
         raise SystemExit(
             f"refusing to run: --round {cfg.round} selected no cell of this "
             f"block ({whole})"
+        )
+    if not _expand_or_exit(cfg):
+        raise SystemExit(
+            "refusing to run: the expanded matrix is EMPTY (arms "
+            f"{list(cfg.arms)}, models {list(cfg.models)}, tasks "
+            f"{list(cfg.tasks)}, replicates {cfg.replicates}"
+            + (f", B restricted to {list(cfg.b_models)}" if cfg.b_models else "")
+            + ") -- there is no cell to run"
         )
 
     if args.print_cells:
@@ -3299,10 +3600,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if cfg.exp3_block and cfg.dry:
         print(assert_exp3_dry_block(payload, round_only=cfg.round))
-    # Exit codes (C7): 0 means a COMPLETE matrix. A wrapper that reads 0 as "the
-    # block ran" must never see it for a block that lost a cell -- failed cells,
-    # cells the graceful stop never admitted, an interrupt, or an exception no
-    # cell accounted for are each incomplete, and each exits 1.
+    # Exit codes (C7): 0 means a COMPLETE, fully-ok matrix. A wrapper that reads
+    # 0 as "the block ran" must never see it for a block that lost a cell OR for
+    # one whose endpoints are not decision-grade -- failed cells, cells the
+    # graceful stop never admitted, an interrupt, an exception no cell accounted
+    # for, a run whose final payload status is not 'ok' (invalid_dose,
+    # invalid_width, partial: those live in ``runs``, never in ``failures``) and
+    # any non-provider needs_rerun entry are each incomplete, and each exits 1.
+    # Provider death already returned 2 above and owns its own cells.
     problems: list[str] = []
     if payload["failures"]:
         problems.append(f"{len(payload['failures'])} failed cell(s)")
@@ -3315,6 +3620,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         problems.append(
             f"{len(payload['unaccounted'])} unaccounted exception(s) -- a bug in "
             "the per-cell recording scope"
+        )
+    bad_runs = [r for r in payload["runs"] if str(r.get("status") or "") != "ok"]
+    if bad_runs:
+        problems.append(
+            f"{len(bad_runs)} run(s) not ok: "
+            + ", ".join(f"{r.get('cell')} {r.get('status') or 'no status'}"
+                        for r in bad_runs)
+        )
+    rerun_left = [n for n in payload["needs_rerun"]
+                  if n.get("status") != "invalid_provider"]
+    if rerun_left:
+        problems.append(
+            f"{len(rerun_left)} cell(s) need a rerun: "
+            + ", ".join(f"{n.get('cell')} ({n.get('selector')})"
+                        for n in rerun_left)
         )
     if problems:
         print(f"\nINCOMPLETE: {'; '.join(problems)}; results in {cfg.out}",

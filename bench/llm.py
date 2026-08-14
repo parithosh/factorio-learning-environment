@@ -36,7 +36,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from bench.common import RunJournal, TimingBuckets
+from bench.common import RunJournal, TimingBuckets, atomic_write_json
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -1850,8 +1850,5 @@ if __name__ == "__main__":  # pragma: no cover - operational entry point
         },
         "results": res,
     }
-    # ``--out llm_smoke.json`` has no directory part: makedirs("") raises.
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
+    atomic_write_json(args.out, payload, indent=2)
     print(json.dumps(payload, indent=2))

@@ -16,6 +16,9 @@ input is validated, hashed and listed in the report's provenance section
   verdicts and the calibration the deviation/not-run tables are read against.
 * ``--ledger-root`` -- farplane journal tree(s) replayed for the independent
   create/delete ledger behind the residual claim (default ``bench/journal``).
+  Every cell's ``<run_id>-farplane.jsonl`` must be inside the replayed trees:
+  an empty or partial ledger makes the audit INCOMPLETE instead of letting an
+  absence of evidence read as zero residual.
 * ``--bake`` / ``--keep`` -- declared substrate ids that are allowed to outlive
   the sweep (the bake sandbox, TEMPLATE_SNAP). Anything else left outstanding
   in the ledger blocks the zero-residual claim.
@@ -301,10 +304,20 @@ def probe_stats(recs: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "max": round(max(values), 3),
         }
 
+    cold_agg = agg(cold)
+    warm_agg = agg(warm)
+    # The pilot-level cold-page verdict pools the INDIVIDUAL probes of every
+    # cell (see the cold-vs-warm section of :func:`render`), so the samples
+    # travel with the per-cell aggregate. A median of per-cell medians weights
+    # a one-probe cell like a twenty-probe one while the reported n counts
+    # individual probes -- statistic and count must describe the same thing.
+    cold_agg["samples"] = [round(v, 3) for v in cold]
+    warm_agg["samples"] = [round(v, 3) for v in warm]
+
     return {
         "n_probes": len(probes),
-        "cold": agg(cold),
-        "warm": agg(warm),
+        "cold": cold_agg,
+        "warm": warm_agg,
         "in_game_window_wall_s": agg(game),
         "measurement_forks": 0,
     }
@@ -912,21 +925,27 @@ def render(payload: dict[str, Any]) -> str:
         "pages in. The bridge normalises throughput by the ACTUAL tick delta, so "
         "a slow guest stretches `wall_s` instead of shortening the window.")
     add("")
-    colds = [c["probe"]["cold"].get("median") for c in cells
-             if c["probe"]["cold"].get("n")]
-    warms = [c["probe"]["warm"].get("median") for c in cells
-             if c["probe"]["warm"].get("n")]
-    cold_n = sum(c["probe"]["cold"].get("n", 0) for c in cells)
-    warm_n = sum(c["probe"]["warm"].get("n", 0) for c in cells)
-    if colds and warms:
-        cold_med = statistics.median(colds)
-        warm_med = statistics.median(warms)
+    # Both the statistic and the n are pooled over INDIVIDUAL probes: a median
+    # of per-cell medians gives a cell with one probe the same weight as a cell
+    # with twenty while the reported n counts probes, so the two halves of the
+    # sentence would describe different populations.
+    cold_all = [float(v) for c in cells
+                for v in (c["probe"]["cold"].get("samples") or [])]
+    warm_all = [float(v) for c in cells
+                for v in (c["probe"]["warm"].get("samples") or [])]
+    cold_n = len(cold_all)
+    warm_n = len(warm_all)
+    if cold_all and warm_all:
+        cold_med = statistics.median(cold_all)
+        warm_med = statistics.median(warm_all)
         delta_ms = (cold_med - warm_med) * 1000.0
         threshold_pct = COLD_PAGE_MATERIAL_S / NOMINAL_PROBE_WINDOW_S * 100.0
         measured = (
             f"Median cold probe {cold_med:.3f}s (n={cold_n}) vs median warm probe "
-            f"{warm_med:.3f}s (n={warm_n}) -- a {delta_ms:+.0f}ms difference "
-            f"against a {NOMINAL_PROBE_WINDOW_S:.3f}s nominal window (3600 ticks "
+            f"{warm_med:.3f}s (n={warm_n}) -- both medians pooled over every "
+            f"cell's individual probes, not averaged per cell -- a "
+            f"{delta_ms:+.0f}ms difference against a "
+            f"{NOMINAL_PROBE_WINDOW_S:.3f}s nominal window (3600 ticks "
             f"at game speed 10)."
         )
         if cold_n < COLD_PAGE_MIN_PROBES or warm_n < COLD_PAGE_MIN_PROBES:
@@ -957,9 +976,9 @@ def render(payload: dict[str, Any]) -> str:
         add("")
     else:
         add(
-            f"**Cold-page tax: NOT DETERMINED.** No cell has both a cold and a "
-            f"warm probe median (cold n={cold_n}, warm n={warm_n}), so the v2.6 "
-            f"cold-page read cannot be taken from this pilot."
+            f"**Cold-page tax: NOT DETERMINED.** The pilot has no pooled cold "
+            f"and warm probe pair (cold n={cold_n}, warm n={warm_n}), so the "
+            f"v2.6 cold-page read cannot be taken from this pilot."
         )
         add("")
 
@@ -1138,11 +1157,9 @@ def render(payload: dict[str, Any]) -> str:
     if not audit["complete"]:
         add("")
         add(
-            f"**Ledger audit INCOMPLETE:** {len(audit['unreadable_files'])} journal "
-            f"file(s) could not be replayed, so the counts above are a lower bound "
-            f"and no zero-residual claim is made -- "
-            + ", ".join(f"`{f['path']}`" for f in audit["unreadable_files"][:5])
-            + "."
+            "**Ledger audit INCOMPLETE**, so the counts above are a lower bound "
+            "and no zero-residual claim is made: "
+            + "; ".join(audit["incomplete_reasons"]) + "."
         )
     add("")
     for note in payload.get("infra_notes", []):
@@ -1263,8 +1280,35 @@ def combine(paths: Sequence[str]) -> dict[str, Any]:
     return merged
 
 
+# Farplane writes both spellings for ids it normalises (``_RESULT_ID_ALIASES``),
+# but journals written before that normalisation say ``snapshotId``/``sandboxId``
+# only, and a fork's *child* id never appears in the ``fork`` result at all --
+# it is journalled by the following ``fork_child_ready`` record. These key sets
+# mirror :meth:`bench.farplane.Farplane.journal_ledger` exactly, so the audit and
+# the reaper's own ledger see the same resources.
+_LEDGER_SANDBOX_RESULT_KEYS = ("sandbox_id", "sandboxId")
+_LEDGER_SANDBOX_ARG_KEYS = ("sandbox", "sandbox_id", "sandboxId")
+_LEDGER_SNAPSHOT_RESULT_KEYS = ("snapshot_id", "snapshotId")
+_LEDGER_SNAPSHOT_ARG_KEYS = ("snapshot", "snapshot_id", "snapshotId")
+_LEDGER_CHILD_KEYS = ("child", "child_id", "childId",
+                      "sandbox_id", "sandboxId", "sandbox")
+
+
+def _ledger_id(keys: Sequence[str], *sources: Any) -> str:
+    """First non-empty string id under any of ``keys``, across ``sources``."""
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
 def ledger_audit(journal_roots: Sequence[str],
-                 keep: Iterable[str] = ()) -> dict[str, Any]:
+                 keep: Iterable[str] = (),
+                 require: Sequence[str] = ()) -> dict[str, Any]:
     """Replay every farplane journal and list what was created but never deleted.
 
     This is the independent check behind the "zero residual" claim: the reaper
@@ -1273,15 +1317,21 @@ def ledger_audit(journal_roots: Sequence[str],
     *supposed* to outlive the sweep (TEMPLATE_SNAP, the bake sandbox); anything
     else still outstanding is undeclared residue.
 
-    A journal that cannot be replayed leaves the audit INCOMPLETE. An audit that
-    could not read all of its evidence never counts as "found nothing".
+    ``require`` names the journal files this audit MUST have replayed -- the
+    run-specific farplane journals of the pilot. An audit is COMPLETE only when
+    every journal it found could be replayed, every required journal was among
+    them, and it actually saw create/delete evidence: an empty ledger tree is
+    the absence of evidence, not evidence of a clean substrate, and must never
+    read as "created nothing, deleted nothing, zero residual".
     """
     created_snap: set[str] = set()
     deleted_snap: set[str] = set()
     created_sb: set[str] = set()
     deleted_sb: set[str] = set()
     files: list[str] = []
+    replayed: set[str] = set()
     unreadable: list[dict[str, str]] = []
+    ledger_records = 0
     for root in journal_roots:
         if not os.path.isdir(root):
             raise AnalysisError(f"ledger root does not exist: {root}")
@@ -1293,28 +1343,79 @@ def ledger_audit(journal_roots: Sequence[str],
             except (JournalParseError, OSError) as exc:
                 unreadable.append({"path": path, "error": str(exc)})
                 continue
+            replayed.add(os.path.realpath(path))
             for rec in recs:
                 if rec.get("outcome") != "ok":
                     continue
                 op = rec.get("op")
                 args = rec.get("args") or {}
                 res = rec.get("result") or {}
-                if op == "snapshot" and res.get("snapshot_id"):
-                    created_snap.add(res["snapshot_id"])
-                elif op == "delete_snapshot" and args.get("snapshot"):
-                    deleted_snap.add(args["snapshot"])
+                if op == "snapshot":
+                    ident = _ledger_id(_LEDGER_SNAPSHOT_RESULT_KEYS, res)
+                    if ident:
+                        created_snap.add(ident)
+                elif op == "delete_snapshot":
+                    ident = _ledger_id(_LEDGER_SNAPSHOT_ARG_KEYS, args, res)
+                    if ident:
+                        deleted_snap.add(ident)
                 elif op in ("create_from_snapshot", "create_from_template", "fork"):
-                    if res.get("sandbox_id"):
-                        created_sb.add(res["sandbox_id"])
-                elif op == "delete_sandbox" and args.get("sandbox"):
-                    deleted_sb.add(args["sandbox"])
+                    # A `fork` result carries the FORK id, so the child arrives
+                    # with fork_child_ready below; the create ops answer the
+                    # sandbox id directly (either spelling).
+                    ident = (_ledger_id(_LEDGER_SANDBOX_RESULT_KEYS, res)
+                             or _ledger_id(("sandbox",), args))
+                    if ident:
+                        created_sb.add(ident)
+                elif op == "fork_child_ready":
+                    ident = _ledger_id(_LEDGER_CHILD_KEYS, args, res, rec)
+                    if ident:
+                        created_sb.add(ident)
+                elif op == "delete_sandbox":
+                    ident = _ledger_id(_LEDGER_SANDBOX_ARG_KEYS, args, res)
+                    if ident:
+                        deleted_sb.add(ident)
+                else:
+                    continue
+                if ident:
+                    ledger_records += 1
     keep_ids = {k for k in keep if k}
     outstanding = (created_snap - deleted_snap) | (created_sb - deleted_sb)
+    required = sorted({p for p in require if p})
+    missing_required = [p for p in required
+                        if os.path.realpath(p) not in replayed]
+    incomplete: list[str] = []
+    if unreadable:
+        incomplete.append(
+            f"{len(unreadable)} journal file(s) could not be replayed "
+            f"({', '.join(f['path'] for f in unreadable[:3])})"
+        )
+    if not files:
+        incomplete.append(
+            "the ledger root(s) "
+            f"{', '.join(journal_roots)} hold no journal file at all, so there "
+            "is no create/delete ledger to audit"
+        )
+    elif not ledger_records:
+        incomplete.append(
+            f"the {len(files)} journal file(s) replayed hold no successful "
+            "create or delete record, so the ledger carries no evidence either "
+            "way"
+        )
+    if missing_required:
+        incomplete.append(
+            f"{len(missing_required)} run-specific farplane journal(s) were not "
+            f"replayed ({', '.join(missing_required[:3])}), so the runs they "
+            "belong to are outside the audited ledger"
+        )
     return {
         "journal_roots": list(journal_roots),
         "journal_files": len(files),
+        "ledger_records": ledger_records,
         "unreadable_files": unreadable,
-        "complete": not unreadable,
+        "required_journals": required,
+        "missing_required_journals": missing_required,
+        "incomplete_reasons": incomplete,
+        "complete": not incomplete,
         "keep": sorted(keep_ids),
         "snapshots_created": len(created_snap),
         "snapshots_deleted": len(created_snap & deleted_snap),
@@ -1342,10 +1443,9 @@ def residual_summary(residual: Sequence[dict[str, Any]],
         )
     if not audit["complete"]:
         return (
-            "UNVERIFIED -- the sweep reported no failures, but the ledger audit "
-            f"could not replay {len(audit['unreadable_files'])} journal file(s) "
-            f"({', '.join(f['path'] for f in audit['unreadable_files'][:3])}), so "
-            "the create/delete ledger cannot back a zero-residual claim"
+            "UNVERIFIED -- the sweep reported no failures, but the create/delete "
+            "ledger cannot back a zero-residual claim: "
+            + "; ".join(audit["incomplete_reasons"])
         )
     undeclared = audit["outstanding_undeclared"]
     if undeclared:
@@ -1358,7 +1458,8 @@ def residual_summary(residual: Sequence[dict[str, Any]],
     return (
         "zero -- every sandbox and snapshot this pilot created was deleted, and "
         f"the independent ledger audit over {audit['journal_files']} journal "
-        "file(s) agrees; the only surviving flebench resources are the declared "
+        f"file(s) ({audit['ledger_records']} create/delete record(s)) agrees; "
+        "the only surviving flebench resources are the declared "
         f"substrate {survivors or '(none outstanding at all)'}"
     )
 
@@ -1386,6 +1487,122 @@ def infra_notes(payload: dict[str, Any]) -> list[str]:
     for row in payload.get("not_run", []):
         notes.append(f"**{row['kind']}** `{row['cell']}`: {row['reason']}")
     return notes
+
+
+def validate_tier05(t05: Any, path: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(frozen_pilot_config, verdicts)`` of a well-formed, FROZEN Tier-0.5 gate.
+
+    Both producers (``bench/tier05.py`` and ``bench/tier05_merge.py``) always
+    write both sections, the REFUSED path included. Anything else is the wrong
+    file or a truncated one: a list would raise ``AttributeError`` deep inside
+    the derivation and an empty object would silently produce a gate table with
+    no planned cells and no admission reasons, i.e. a report that claims the
+    pilot ran exactly what was frozen because it knows nothing about either.
+
+    A REFUSED / non-executable gate is rejected by name rather than read as a
+    plan with nothing in it: tier05_merge's refusal marker carries empty
+    ``arms``/``models``/``priority_cells`` and ``verdicts == {}``, against which
+    every cell that actually ran would be reported as an unplanned ADDITION.
+    """
+    if not isinstance(t05, dict):
+        raise AnalysisError(
+            f"tier05_gate input {path} is not a JSON object: "
+            f"got {type(t05).__name__}"
+        )
+    sections: list[dict[str, Any]] = []
+    for key in ("frozen_pilot_config", "verdicts"):
+        if key not in t05:
+            raise AnalysisError(
+                f"tier05_gate input {path} has no {key!r} section, so the pilot "
+                "cannot be read against the frozen gate; point --tier05 at the "
+                "artifact written by bench/tier05.py or bench/tier05_merge.py"
+            )
+        value = t05[key]
+        if not isinstance(value, dict):
+            raise AnalysisError(
+                f"tier05_gate input {path}: {key!r} must be an object, got "
+                f"{type(value).__name__}"
+            )
+        sections.append(value)
+    frozen, verdicts = sections[0], sections[1]
+    status = str(frozen.get("status") or "")
+    if status.upper() == "REFUSED" or frozen.get("executable") is False:
+        detail = str(frozen.get("error") or frozen.get("reason") or "").strip()
+        if not detail:
+            for key in ("reasons", "blockers", "incomplete", "warnings"):
+                rows = frozen.get(key)
+                if isinstance(rows, list) and rows:
+                    detail = "; ".join(str(r) for r in rows)
+                    break
+        raise AnalysisError(
+            f"tier05_gate input {path} froze nothing (status "
+            f"{status or 'unset'!r}, executable {frozen.get('executable')!r}), "
+            "so there is no plan to read the pilot against"
+            + (f": {detail}" if detail else "")
+        )
+    for key, value in (("frozen_pilot_config", frozen), ("verdicts", verdicts)):
+        if not value:
+            raise AnalysisError(
+                f"tier05_gate input {path}: {key!r} is empty, so there is no "
+                "frozen gate to read the pilot against"
+            )
+    for model, verdict in verdicts.items():
+        if not isinstance(verdict, dict):
+            raise AnalysisError(
+                f"tier05_gate input {path}: verdict for model {model!r} must be "
+                f"an object, got {type(verdict).__name__}"
+            )
+    return frozen, verdicts
+
+
+def admission(verdict: dict[str, Any]) -> tuple[bool, str]:
+    """``(admitted, skip_reason)`` out of one Tier-0.5 model verdict (R2C1).
+
+    ``enters_pilot``/``pilot_skip_reason`` are the canonical keys. Artifacts
+    written before they existed carry ``enters_tier1`` and the raw
+    ``admission_blockers`` list, and reading only the canonical pair there makes
+    every admitted model look skipped.
+    """
+    if "enters_pilot" in verdict:
+        admitted = bool(verdict.get("enters_pilot"))
+    else:
+        admitted = bool(verdict.get("enters_tier1"))
+    reason = str(verdict.get("pilot_skip_reason") or "").strip()
+    if not reason:
+        blockers = verdict.get("admission_blockers") or []
+        if isinstance(blockers, str):
+            blockers = [blockers]
+        reason = "; ".join(str(b).strip() for b in blockers if str(b).strip())
+    return admitted, reason
+
+
+def frozen_priority_cells(frozen: dict[str, Any]) -> set[str]:
+    """The planned ``"model|arm"`` cells of the frozen config (R2C1).
+
+    ``priority_cells`` is the canonical key both producers emit. Older artifacts
+    only listed ``arms`` and ``models``, and the cross product of those is wrong
+    for arm B: B runs only for the models whose B arm was admitted
+    (``arm_b_models``, spelled ``b_arm_models`` by pre-R2C1 tier05_merge). When
+    neither spelling is present the plan simply does not say, so B is left
+    unrestricted rather than reported as an unplanned addition.
+    """
+    cells = frozen.get("priority_cells")
+    if isinstance(cells, list) and cells:
+        return {str(c).strip() for c in cells if str(c).strip()}
+    arms = [str(a) for a in (frozen.get("arms") or []) if a]
+    models = [str(m) for m in (frozen.get("models") or []) if m]
+    b_models = frozen.get("arm_b_models")
+    if not isinstance(b_models, list):
+        b_models = frozen.get("b_arm_models")
+    restrict_b = isinstance(b_models, list)
+    b_allowed = {str(m) for m in (b_models or []) if m}
+    planned: set[str] = set()
+    for model in models:
+        for arm in arms:
+            if restrict_b and arm in ("B", "Bonce") and model not in b_allowed:
+                continue
+            planned.add(f"{model}|{arm}")
+    return planned
 
 
 def build(results_paths: Sequence[str], journal_dir: str,
@@ -1449,20 +1666,23 @@ def build(results_paths: Sequence[str], journal_dir: str,
     # submitted: they must be named with their measured reason, not silently
     # absent. The reason lives in the Tier-0.5 admission gate.
     t05 = read_json(tier05_path, role="tier05_gate")
-    frozen: dict[str, Any] = t05.get("frozen_pilot_config") or {}
-    verdicts: dict[str, Any] = t05.get("verdicts") or {}
+    frozen, verdicts = validate_tier05(t05, tier05_path)
     ran = {(c["arm"], c["model"]) for c in cells}
+    ran_models = {c["model"] for c in cells}
     for model, v in verdicts.items():
-        if v.get("enters_pilot") or model in {c["model"] for c in cells}:
+        admitted, skip_reason = admission(v)
+        if admitted or model in ran_models:
             continue
         for arm in ("A", "B"):
             not_run.append({
                 "kind": "SKIPPED (Tier-0.5 admission gate)",
                 "cell": f"{arm}|{model}|{', '.join(frozen.get('tasks') or [])}|r1",
-                "reason": v.get("pilot_skip_reason", "not admitted"),
+                "reason": skip_reason or (
+                    "not admitted by the Tier-0.5 gate, which recorded no reason"
+                ),
             })
     deviations: list[str] = []
-    planned = set(frozen.get("priority_cells") or [])
+    planned = frozen_priority_cells(frozen)
     for arm, model in sorted(ran):
         if planned and f"{model}|{arm}" not in planned:
             deviations.append(
@@ -1479,13 +1699,31 @@ def build(results_paths: Sequence[str], journal_dir: str,
     reaper = results.get("reaper") or []
     residual = [r for r in reaper if r.get("outcome") not in ("deleted", "ok")]
     # The ledger audit is the evidence behind the residual claim, so it is
-    # computed BEFORE the claim is worded and the claim reads it.
-    audit = ledger_audit(ledger_roots, keep=keep_ids)
+    # computed BEFORE the claim is worded and the claim reads it. Each cell's
+    # farplane journal (``<run_id>-farplane.jsonl``, written by run_tier1's
+    # per-cell Farplane) is REQUIRED evidence: without it the replay has no
+    # record of that run's creates and would answer "nothing outstanding"
+    # because it looked nowhere.
+    required_ledgers = [
+        os.path.join(journal_dir, f"{c['run_id']}-farplane.jsonl")
+        for c in enriched if c.get("run_id")
+    ]
+    audit = ledger_audit(ledger_roots, keep=keep_ids, require=required_ledgers)
     evidence_errors = [c["journal_error"] for c in unusable]
     evidence_errors += [
         f"ledger journal `{f['path']}` could not be replayed: {f['error']}"
         for f in audit["unreadable_files"]
     ]
+    evidence_errors += [
+        f"required farplane ledger `{p}` was not replayed by the residual audit"
+        for p in audit["missing_required_journals"]
+    ]
+    if not audit["ledger_records"]:
+        evidence_errors.append(
+            "the farplane ledger audit found no successful create/delete record "
+            f"under {', '.join(ledger_roots)}, so nothing backs the residual "
+            "claim -- an empty ledger is not a clean one"
+        )
     preamble = (
         f"Arms {', '.join(cfg.get('arms', []))} at K={cfg.get('K')}, "
         f"m={cfg.get('m')}, T={cfg.get('T_s')}s, run cap "

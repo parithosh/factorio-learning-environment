@@ -38,8 +38,9 @@ dependencies = [
     "tomli",
     "numpy>=2.2.3",
     "gym",
-    # a2a-sdk 1.x removed a2a.types.TextPart/Part/Message, which
-    # fle/env/tools/agent/send_message/client.py imports at tool-load time.
+    # a2a-sdk 1.x removed a2a.types.TextPart and changed the message API,
+    # which fle/env/tools/agent/send_message/client.py relies on at
+    # tool-load time.
     "a2a-sdk<1.0",
     "tenacity>=9.0.0",
     "aiohttp>=3.8.0",

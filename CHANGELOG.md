@@ -111,6 +111,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleans up template/bake sandboxes on failure, and the blog renderer no
   longer unpickles namespace blobs from state files.
 
+**Bench review hardening, round 2 (cross-module contract fixes)**
+
+- Unified the frozen Tier-0.5 config schema across producers and consumers:
+  both `tier05.py` and `tier05_merge.py` emit `arm_b_models`, `priority_cells`,
+  `status`/`executable`, and per-model `enters_pilot`/`pilot_skip_reason`;
+  `run_tier1` restricts arm-B cells to `arm_b_models` and refuses
+  non-executable/REFUSED configs; `analyze_tier1` consumes the same fields.
+  A refused merge now atomically replaces stale FROZEN artifacts with a
+  non-executable refusal marker.
+- Tier-0 capacity semantics honored end to end: incomplete soaks publish
+  `valid=false`, abnormal exits invalidate the stale cap/gate inside
+  `tier0.json`, a measured `cap=0` fails the gate, and Tier-0.5 treats a
+  present null/zero cap as a fail-closed blocker (explicit `--node-cap`
+  operator override; measured zero cannot be overridden). Invalid soak
+  markers poison soak-derived reads from both artifacts.
+- Verdict evidence is session-bound: arm results carry `journal_session`,
+  and the exp-2 analyzer binds every result row to its journal digest
+  (merged `--session all` digests rejected for verdicts); the exp-2
+  INCONCLUSIVE path no longer crashes on invalid cells and the final
+  recommendation is derived from the three-state verdict.
+- Bridge ambiguity end to end: any 5xx on a mutating request (and
+  response-side header failures) is `BridgeError(ambiguous=True)`; the arm
+  loops quarantine the node on ambiguous mutations instead of retrying, and
+  a timed-out `/execute` that settles late is committed into trajectory
+  bookkeeping (or the line stops) instead of silently mutating the world.
+  Missing selection probes are unscorable; all-unscorable rounds adopt a
+  branch or end the line partial; ProviderDead propagates from branch
+  rollouts; live-smoke results get per-invocation output paths.
+- `run_tier1` exits nonzero for any non-ok run or pending rerun, merges
+  `--round` selections into existing artifacts instead of replacing them,
+  fingerprints all measurement-defining config for `--cells` recovery,
+  reserves Hybrid's failure-path peak (2K-1), and honors `--parallel-round`
+  with config-loaded Exp-3 blocks.
+- `RunJournal` quarantines a torn tail to a `.torn` sidecar (under flock)
+  before opening a new session, so a crashed writer can no longer corrupt
+  strict session loading; `atomic_write_json`'s serialization fallback is
+  genuinely non-throwing (guarded attribute/repr access, cycles, keys).
+- Exp-1's release barrier fails closed on unverified restored worlds and
+  unreadable ticks; resumes require the full measurement fingerprint
+  (including `waves`); aborted wave attempts are preserved. Exp-3 keeps
+  previously secured S2B snapshots out of the failed-bake sweep, appends
+  bake journal sessions instead of replacing the file, and tears down the
+  template sandbox even when bookkeeping writes fail.
+- `analyze_tier1`'s ledger audit replays `fork_child_ready` (fork children
+  can no longer vanish from the residual claim), rejects empty ledger
+  trees, pools cold-page probe samples, and validates the Tier-0.5 JSON
+  shape. `_t05_gates.sh` authenticates its `/reset` against the secured
+  bridge; `_pilot_codex.sh` launches with its validated interpreter.
+- Solver branching: `restore()` prunes namespace attributes created after
+  the snapshot, so helpers from discarded timelines no longer leak into the
+  restored branch.
+
 ### Fixed
 
 - `solver.py` and `sandbox_solver.py` no longer pass the OpenRouter-only

@@ -255,6 +255,39 @@ def factorio_controlled_solver():
                 _snapshots = {}
                 _snap_counter = [0]
 
+                def _public_ns_names(_ns):
+                    # Agent-visible attribute names, excluding the injected
+                    # branching callables (_inject_branching re-adds those on
+                    # every snapshot/restore) and private/internal names.
+                    return {
+                        _n
+                        for _n in dir(_ns)
+                        if not _n.startswith("_")
+                        and _n not in ("snapshot", "restore")
+                    }
+
+                def _capture_ns_baseline():
+                    # Positional per namespace; _instance.namespaces is stable
+                    # across reset().
+                    return [_public_ns_names(_ns) for _ns in _instance.namespaces]
+
+                def _prune_to_ns_baseline(baseline):
+                    # FactorioNamespace.reset() only clears *non-callable*
+                    # public attributes, and the agent's eval globals are
+                    # rebuilt from dir(namespace). Without this, helper
+                    # functions (and any callable) defined after the snapshot
+                    # survive restore, leaking from a discarded branch into the
+                    # restored timeline. Drop every public name that did not
+                    # exist when the snapshot was taken.
+                    for _ns, _names in zip(_instance.namespaces, baseline):
+                        for _name in _public_ns_names(_ns) - _names:
+                            try:
+                                delattr(_ns, _name)
+                            except AttributeError:
+                                # Class-level tool/static attribute: there is
+                                # no instance-level binding to remove.
+                                pass
+
                 def _strip_branching():
                     # Keep closures out of the namespace during state capture
                     # so namespace serialization never sees them (only
@@ -283,6 +316,7 @@ def factorio_controlled_solver():
                             "Reuse an existing id with restore(); available: "
                             f"{sorted(_snapshots)}"
                         )
+                    _ns_baseline = _capture_ns_baseline()
                     _strip_branching()
                     try:
                         state_copy = _BranchGameState.from_instance(_instance)
@@ -290,7 +324,11 @@ def factorio_controlled_solver():
                         _inject_branching()
                     _snap_counter[0] += 1
                     sid = f"snap_{_snap_counter[0]}"
-                    _snapshots[sid] = (state_copy, _instance.initial_score)
+                    _snapshots[sid] = (
+                        state_copy,
+                        _instance.initial_score,
+                        _ns_baseline,
+                    )
                     branching_stats["snapshots"] += 1
                     return sid
 
@@ -300,8 +338,13 @@ def factorio_controlled_solver():
                             f"Unknown snapshot id {snapshot_id!r}; "
                             f"available: {sorted(_snapshots)}"
                         )
-                    saved_state, saved_initial_score = _snapshots[snapshot_id]
+                    saved_state, saved_initial_score, saved_ns_baseline = _snapshots[
+                        snapshot_id
+                    ]
                     _instance.reset(saved_state)
+                    # reset() leaves agent-defined callables behind; strip the
+                    # ones that post-date the snapshot.
+                    _prune_to_ns_baseline(saved_ns_baseline)
                     # instance.reset() recomputes initial_score from the
                     # restored world; pin it back so the production-score
                     # baseline matches the snapshot's timeline.

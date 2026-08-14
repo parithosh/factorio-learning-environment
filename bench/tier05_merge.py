@@ -14,14 +14,19 @@ freezes T from the measured numbers under two pre-registered constraints (see
 :func:`choose_T`). Every merged block carries the file it came from in
 ``sources`` so each number in the report stays traceable.
 
-The merge fails closed. A requested track that is missing, a gate measured at a
-different K, two contradictory rows for the same (phase, model), a journal that
-cannot account for every requested sample, or a T that no ladder point can
-justify all stop the merge (exit 2, no artifact) instead of quietly producing a
-number. Evidence that is merely PARTIAL -- a secondary model with no rows, a
-latency track that died after one step -- is merged and labelled: ``status`` is
+The merge fails closed. A requested track that is missing, a track or journal
+that cannot be parsed, a gate measured at a different K, two contradictory rows
+for the same (phase, model), a journal that cannot account for every requested
+sample, or a T that no ladder point can justify all stop the merge (exit 2)
+instead of quietly producing a number. A refusal still REPLACES the designated
+outputs, with a marker carrying ``status: refused`` and a non-executable frozen
+config: writing nothing would leave a previous run's FROZEN artifact on disk for
+``run_tier1 --from-tier05`` to consume as though this merge had blessed it.
+Evidence that is merely PARTIAL -- a secondary model with no rows, a latency
+track that died after one step -- is merged and labelled: ``status`` is
 ``incomplete``, every gap is listed in ``incomplete``, the frozen config is
-marked non-executable and the exit code is 1.
+REFUSED and non-executable (an open gap is a gap in the config, not a footnote
+beside it) and the exit code is 1.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import math
 import os
 import statistics
 import sys
+import tempfile
 import time
 from typing import Any, Sequence
 
@@ -99,8 +105,26 @@ class InfeasiblePilot(MergeError):
 
 
 def _load(path: str) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
+    """Parse one input artifact, as a MergeError when it cannot be read.
+
+    A malformed track is an input this merge cannot reconcile, exactly like a
+    contradictory one, so it is a REFUSAL: the bare ``JSONDecodeError`` this
+    used to raise left the process exiting 1, the code that promises an
+    artifact was written and merely incomplete.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise MergeError(
+            f"{path}: cannot be read as JSON ({type(exc).__name__}: {exc})"
+        ) from exc
+    if not isinstance(data, dict):
+        raise MergeError(
+            f"{path}: holds a JSON {type(data).__name__} and not an object, so "
+            "it is not a measurement artifact"
+        )
+    return data
 
 
 def materialize_from_tier0(path: str) -> tuple[float | None, str]:
@@ -135,7 +159,15 @@ def _journal(path: str) -> list[dict[str, Any]]:
     :func:`bench.common.load_journal_records`) and a session boundary inside
     that slice is an error rather than a guess.
     """
-    records = load_journal_records(path, session="latest")
+    try:
+        records = load_journal_records(path, session="latest")
+    except (OSError, ValueError) as exc:
+        # Unreadable evidence is a refusal, not an incomplete artifact: the
+        # JournalParseError (a ValueError) that strict decoding raises would
+        # otherwise escape main and exit 1.
+        raise GateReconstructionError(
+            f"{path}: cannot be replayed ({type(exc).__name__}: {exc})"
+        ) from exc
     sessions = {r.get("session") for r in records}
     if len(sessions) > 1:
         raise GateReconstructionError(
@@ -263,6 +295,77 @@ def _require_response_text(
         )
 
 
+def _step_index(rec: dict[str, Any]) -> int | None:
+    """The step a journal record belongs to, or ``None`` when it names none."""
+    step = rec.get("step")
+    if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+        return None
+    return step
+
+
+def _llm_walls_by_step(
+    records: Sequence[dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """Price each step's LLM request from the journal's monotonic boundaries.
+
+    Two things a positional walk over the attempt list cannot do:
+
+    * charge retry BACKOFF. ``latency_s`` is ONE attempt's provider round trip,
+      so summing it over a retried request omits every sleep the harness took
+      between the attempts -- wall clock the pilot pays and the sizing has to
+      see. Every record carries ``mono``, stamped when the record was
+      journalled, so the distance between two consecutive attempts of the same
+      request is backoff + attempt. The first attempt of a request has no such
+      boundary of its own (what precedes it is provisioning or the previous
+      step, not this request), so it costs its ``latency_s``. A boundary shorter
+      than the attempt it brackets is not evidence of a cheaper request, so the
+      larger of the two is taken: this never prices a step below its cost.
+    * group by the ``step`` the records journalled, instead of by position. A
+      completed response that carried no program journals an llm_call and no
+      step record, and positional pairing then charged it the next step's
+      execution and shifted every later step.
+
+    Returns per-step accounting keyed by step number, plus the attempts that
+    journalled no step number -- never dropped silently, the caller reports them.
+    """
+    by_step: dict[int, dict[str, Any]] = {}
+    unattributed: list[dict[str, Any]] = []
+    last_mono: dict[int, float] = {}
+    for rec in records:
+        if rec.get("kind") != "llm_call":
+            continue
+        idx = _step_index(rec)
+        if idx is None:
+            unattributed.append(rec)
+            continue
+        latency_s = float(rec.get("latency_s") or 0.0)
+        mono = rec.get("mono")
+        mono_s = (
+            float(mono)
+            if isinstance(mono, (int, float)) and not isinstance(mono, bool)
+            else None
+        )
+        prev = last_mono.get(idx)
+        wall_s, backoff_s, spanned = latency_s, 0.0, False
+        if prev is not None and mono_s is not None and mono_s - prev > latency_s:
+            wall_s = mono_s - prev
+            backoff_s = wall_s - latency_s
+            spanned = True
+        acct = by_step.setdefault(idx, {
+            "step": idx, "attempts": 0, "ok": 0, "latency_s": 0.0,
+            "backoff_s": 0.0, "wall_s": 0.0, "mono_spans": 0,
+        })
+        acct["attempts"] += 1
+        acct["ok"] += 1 if rec.get("outcome") == "ok" else 0
+        acct["latency_s"] = round(acct["latency_s"] + latency_s, 6)
+        acct["backoff_s"] = round(acct["backoff_s"] + backoff_s, 6)
+        acct["wall_s"] = round(acct["wall_s"] + wall_s, 6)
+        acct["mono_spans"] += 1 if spanned else 0
+        if mono_s is not None:
+            last_mono[idx] = mono_s
+    return by_step, unattributed
+
+
 def gate_from_journal(
     model: str, journal_dir: str, *, gate_K: int, lat_steps: int
 ) -> dict[str, Any]:
@@ -379,18 +482,56 @@ def gate_from_journal(
     lat_ok = [c for c in lat_calls if c.get("outcome") == "ok"]
     lat_fail = [c for c in lat_calls if c.get("outcome") != "ok"]
     steps = [r for r in lat if r.get("kind") == "step"]
-    # A step costs every attempt it took, not just the one that answered.
-    step_walls: list[float] = []
-    spent = 0.0
-    for call in lat_calls:
-        spent += float(call.get("latency_s") or 0.0)
-        if call.get("outcome") == "ok":
-            step_walls.append(round(spent, 3))
-            spent = 0.0
+    llm_by_step, unattributed = _llm_walls_by_step(lat)
+    exec_by_step: dict[int, float] = {}
+    unnumbered_exec = 0
+    for rec in steps:
+        idx = _step_index(rec)
+        if idx is None:
+            unnumbered_exec += 1
+            continue
+        exec_by_step[idx] = (
+            exec_by_step.get(idx, 0.0) + float(rec.get("exec_s") or 0.0)
+        )
+    # One wall per step the journal can NAME, not per position in the attempt
+    # list. A completed response that carried no program journals an llm_call
+    # and no step record: pairing exec times positionally charged it the NEXT
+    # step's execution and shifted every later step. Here it costs its request
+    # wall and zero exec time, which is what it actually spent.
+    step_rows = [
+        {
+            "step": idx,
+            "wall_s": round(
+                float(llm_by_step.get(idx, {}).get("wall_s") or 0.0)
+                + exec_by_step.get(idx, 0.0), 3
+            ),
+            "llm_wall_s": round(
+                float(llm_by_step.get(idx, {}).get("wall_s") or 0.0), 3
+            ),
+            "llm_latency_s": round(
+                float(llm_by_step.get(idx, {}).get("latency_s") or 0.0), 3
+            ),
+            "retry_backoff_s": round(
+                float(llm_by_step.get(idx, {}).get("backoff_s") or 0.0), 3
+            ),
+            "exec_s": round(exec_by_step.get(idx, 0.0), 3),
+            "attempts": int(llm_by_step.get(idx, {}).get("attempts") or 0),
+            "executed": idx in exec_by_step,
+        }
+        for idx in sorted(
+            {i for i, acct in llm_by_step.items() if acct["ok"]} | set(exec_by_step)
+        )
+    ]
+    step_walls = [row["wall_s"] for row in step_rows]
     exec_walls = [float(s.get("exec_s") or 0.0) for s in steps]
-    for i, wall in enumerate(step_walls):
-        if i < len(exec_walls):
-            step_walls[i] = round(wall + exec_walls[i], 3)
+    if unattributed or unnumbered_exec:
+        # Wall clock nobody can attribute to a step is not quietly folded into
+        # the step that happened to be next: it is a gap in the evidence.
+        incomplete.append(
+            f"{model}: {len(unattributed)} request attempt(s) and "
+            f"{unnumbered_exec} execution(s) in {lat_path} journalled no step "
+            "number, so their wall clock is not attributed to any step"
+        )
     if not lat_reason and len(steps) < lat_steps:
         lat_reason = (
             f"{len(steps)} of {lat_steps} requested steps completed before the "
@@ -415,6 +556,21 @@ def gate_from_journal(
             "hinted_seats_usable": hinted_sum["parsed"],
             "hinted_seats_dead": hinted_sum["failed_seats"],
             "seat_errors": plain_sum["errors"] + hinted_sum["errors"],
+            "latency_steps_reconstructed": len(step_rows),
+            "latency_attempts": sum(
+                int(acct["attempts"]) for acct in llm_by_step.values()
+            ),
+            "latency_attempts_unattributed": len(unattributed),
+            "latency_executions_unattributed": unnumbered_exec,
+            # Wall clock the provider retries slept, recovered from the journal's
+            # monotonic record boundaries: summing per-attempt latency_s alone
+            # would price the pilot's steps below what they cost.
+            "latency_retry_backoff_s": round(
+                sum(float(acct["backoff_s"]) for acct in llm_by_step.values()), 3
+            ),
+            "latency_mono_spans": sum(
+                int(acct["mono_spans"]) for acct in llm_by_step.values()
+            ),
         },
         "diversity": {
             "model": model,
@@ -436,9 +592,7 @@ def gate_from_journal(
         "latency": {
             "model": model,
             "measured": bool(step_walls),
-            "steps": [
-                {"step": i + 1, "wall_s": w} for i, w in enumerate(step_walls)
-            ],
+            "steps": step_rows,
             "median_step_s": (
                 round(statistics.median(step_walls), 3) if step_walls else None
             ),
@@ -631,6 +785,12 @@ def _canonical(row: dict[str, Any]) -> str:
     return json.dumps(row, sort_keys=True, default=str)
 
 
+#: Prefix that marks a substrate the artifact could not settle: two tracks
+#: attested different substrates for the same measurement (see :func:`_claim`).
+#: It is deliberately loud -- a reader must not mistake it for a substrate name.
+_CONTRADICTORY = "CONTRADICTORY SUBSTRATE CLAIMS"
+
+
 def _claim(
     table: dict[str, Any],
     sources: dict[str, str],
@@ -641,13 +801,22 @@ def _claim(
     row: dict[str, Any],
     path: str,
     substrate: str,
-) -> None:
+) -> str:
     """Record one imported measurement, refusing to overwrite a different one.
 
     Two tracks may legitimately carry the same row (a re-serialised payload), but
     two DIFFERENT measurements of the same (phase, model) make the artifact
     depend on the order of ``--track`` arguments. That is the operator's call to
     make, not a silent last-write-wins.
+
+    Matching numbers are not a free pass on provenance either: an identical row
+    attested to two DIFFERENT substrates cannot be true about both, and the
+    substrate is what says whether a number was bought on the bake bridge or on
+    Farplane. Both claims are recorded verbatim -- the artifact shows the
+    contradiction instead of dropping the second because the numbers matched --
+    and the returned string is the gap the caller adds to ``incomplete``, so a
+    contested provenance cannot ship an executable config. Returns ``""`` when
+    the claim is clean.
     """
     if model in table:
         if _canonical(table[model]) != _canonical(row):
@@ -657,10 +826,24 @@ def _claim(
                 "reconcile them before merging"
             )
         sources[model] = f"{sources[model]}; {path} (identical)"
-        return
+        prior = substrates.get(model, "")
+        if substrate == prior:
+            return ""
+        substrates[model] = (
+            f"{prior}; also {substrate} (via {path})"
+            if prior.startswith(_CONTRADICTORY) else
+            f"{_CONTRADICTORY} for an identical {phase} row: "
+            f"{prior or '(unrecorded)'} and {substrate} (via {path})"
+        )
+        return (
+            f"{model}: the {phase} row is claimed by two substrates "
+            f"({prior or '(unrecorded)'} and {substrate} via {path}); the "
+            "numbers match but their provenance does not"
+        )
     table[model] = row
     sources[model] = path
     substrates[model] = substrate
+    return ""
 
 
 def _check_gate_row(
@@ -763,9 +946,12 @@ def merge(
                 )
                 continue
             _check_gate_row(path, cfg, model, row, gate_K)
-            _claim(diversity, sources["diversity"], substrate_by_phase["diversity"],
-                   phase="diversity", model=model, row=row, path=path,
-                   substrate=substrate)
+            gap = _claim(
+                diversity, sources["diversity"], substrate_by_phase["diversity"],
+                phase="diversity", model=model, row=row, path=path,
+                substrate=substrate)
+            if gap:
+                incomplete.append(gap)
         for model, row in (data.get("latency") or {}).items():
             if row.get("median_step_s") is None:
                 incomplete.append(
@@ -773,9 +959,12 @@ def merge(
                     f"({row.get('error') or 'no step completed'})"
                 )
                 continue
-            _claim(latency, sources["latency"], substrate_by_phase["latency"],
-                   phase="latency", model=model, row=row, path=path,
-                   substrate=substrate)
+            gap = _claim(
+                latency, sources["latency"], substrate_by_phase["latency"],
+                phase="latency", model=model, row=row, path=path,
+                substrate=substrate)
+            if gap:
+                incomplete.append(gap)
 
     reliability: dict[str, Any] = {}
     reconstructions: dict[str, Any] = {}
@@ -783,20 +972,26 @@ def merge(
         rebuilt = gate_from_journal(
             model, journal_dir, gate_K=gate_K, lat_steps=lat_steps
         )
-        _claim(diversity, sources["diversity"], substrate_by_phase["diversity"],
-               phase="diversity", model=model, row=rebuilt["diversity"],
-               path=rebuilt["journals"]["diversity"],
-               substrate=f"{reconstruct_substrate} (attested, reconstructed)")
+        gap = _claim(
+            diversity, sources["diversity"], substrate_by_phase["diversity"],
+            phase="diversity", model=model, row=rebuilt["diversity"],
+            path=rebuilt["journals"]["diversity"],
+            substrate=f"{reconstruct_substrate} (attested, reconstructed)")
+        if gap:
+            incomplete.append(gap)
         if rebuilt["latency"]["median_step_s"] is None:
             incomplete.append(
                 f"{model}: no step latency recoverable from "
                 f"{rebuilt['journals']['latency']}"
             )
         else:
-            _claim(latency, sources["latency"], substrate_by_phase["latency"],
-                   phase="latency", model=model, row=rebuilt["latency"],
-                   path=rebuilt["journals"]["latency"],
-                   substrate=f"{reconstruct_substrate} (attested, reconstructed)")
+            gap = _claim(
+                latency, sources["latency"], substrate_by_phase["latency"],
+                phase="latency", model=model, row=rebuilt["latency"],
+                path=rebuilt["journals"]["latency"],
+                substrate=f"{reconstruct_substrate} (attested, reconstructed)")
+            if gap:
+                incomplete.append(gap)
         reliability[model] = rebuilt["reliability"]
         reconstructions[model] = rebuilt["reconstruction"]
         incomplete.extend(rebuilt["incomplete"])
@@ -1074,10 +1269,16 @@ def merge(
         "overlap_gate": {
             "branch_materialize_s": materialize_s,
             "branch_materialize_source": materialize_source,
+            # The key bench.tier05.write_markdown renders as this number's
+            # provenance. Without it the report would attribute an operator's
+            # --branch-materialize-s (or a caps value) to a Tier-0 soak p50.
+            "branch_materialize_detail": materialize_source,
             "b_arm_in_arms": b_in_arms,
             "charged_tail_s": tail_for_sizing,
             "priority_tail_s": tail_for(c_model),
-            # b_arm_models is the key bench.tier05.write_markdown renders.
+            # b_arm_models is the key bench.tier05.write_markdown renders; the
+            # frozen config below carries this same list under the canonical
+            # arm_b_models name that consumers read.
             "b_arm_models": [
                 mdl for mdl in admitted
                 if b_in_arms and verdicts[mdl]["b_arm_admitted"]
@@ -1091,6 +1292,25 @@ def merge(
             },
         },
     }
+    # A config is executable only when NOTHING about the evidence is open.
+    # `incomplete` is exactly the list of gaps this merge could not fill, and an
+    # evidence gap is a config gap: a model sized off a latency row that never
+    # arrived, or a pilot with no task, is not a frozen measurement. Leaving it
+    # out of this decision is what let an INCOMPLETE artifact ship a FROZEN,
+    # executable config. The three structural blockers are still checked
+    # independently, so a future change that stops journalling one of them
+    # cannot quietly re-admit an unrunnable config.
+    frozen_reasons: list[str] = [
+        text for blocked, text in (
+            (not sizing_fits,
+             f"the sized pilot (T={T:.0f}s, {want_tasks} task(s), "
+             f"{replicates} replicate(s)) does not fit the wall-clock budget"),
+            (not primary, "no task cleared the task-sanity selection"),
+            (bool(b_blocked),
+             "arm B is not admitted for " + ", ".join(b_blocked)),
+        ) if blocked
+    ] + [f"incomplete evidence -- {item}" for item in incomplete]
+    executable = not frozen_reasons
     payload["frozen_pilot_config"] = {
         "arms": list(arms),
         "models": admitted,
@@ -1109,6 +1329,11 @@ def merge(
         "hints_required_models": [
             mdl for mdl, v in verdicts.items() if v["hints_required"]
         ],
+        # The canonical key every consumer reads (run_tier1 restricts its B-arm
+        # cells to it). The overlap_gate block above keeps the b_arm_models
+        # spelling because that is the key bench.tier05.write_markdown renders;
+        # this list is that same list, never a second derivation of it.
+        "arm_b_models": list(payload["overlap_gate"]["b_arm_models"]),
         # The priority block belongs to the c_model, whichever model that is;
         # every other admitted model contributes the A/B contrast only -- and
         # only for arms this pilot actually runs. A model whose arm B is not
@@ -1126,13 +1351,21 @@ def merge(
         "T_rule": t_choice["rule"],
         "T_relaxed": t_choice["relaxed"],
         "constraint_violations": t_choice["violations"],
-        "status": (
-            "FROZEN" if sizing_fits and primary and not b_blocked else "REFUSED"
-        ),
-        "executable": bool(sizing_fits and primary and not b_blocked),
+        "status": "FROZEN" if executable else "REFUSED",
+        "executable": executable,
+        # `reasons` is what run_tier1 quotes when it refuses the config;
+        # `blockers` is the same list under the key write_markdown renders. One
+        # source, two consumer spellings -- never two different lists.
+        "reasons": frozen_reasons,
+        "blockers": frozen_reasons,
         "pre_registered": True,
         "labelled": "TIER-1 PILOT (reduced T/tasks/replicates), not the full matrix",
     }
+    if not executable:
+        payload["frozen_pilot_config"]["error"] = (
+            "Tier 0.5 evidence is incomplete or the pre-registered constraints "
+            "are violated: refusing to emit an executable Tier-1 pilot config"
+        )
     return payload
 
 
@@ -1321,6 +1554,92 @@ def append_provenance(payload: dict[str, Any], path: str) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
+def _atomic_write_text(path: str, text: str) -> None:
+    """Replace ``path`` with ``text`` in one rename, never a truncated file."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def write_refusal(
+    out_path: str, md_path: str, *, reason: str, requested: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace the designated outputs with a non-executable refusal marker.
+
+    A refusal that writes nothing is not fail-closed: ``--from-tier05`` reads
+    whichever ``tier05.json`` is on disk, so a PREVIOUS merge's FROZEN config
+    would survive this one's refusal and be launched as though this merge had
+    blessed it. The marker replaces both designated outputs atomically, carries
+    ``status``/``executable`` a consumer already refuses to run
+    (:func:`bench.run_tier1.config_from_tier05`), and names the refusal so the
+    operator does not have to reconstruct it from a lost stderr line.
+    """
+    payload: dict[str, Any] = {
+        "ts": time.time(),
+        "tier": "0.5 (canonical)",
+        "status": "refused",
+        "incomplete": [reason],
+        "refusal": {"reason": reason, "requested": requested},
+        # The measurement blocks stay present and EMPTY: a consumer that reads
+        # them sees no evidence rather than a stale merge's evidence.
+        "config": dict(requested),
+        "sources": {},
+        "latency": {},
+        "diversity": {},
+        "tasks": [],
+        "task_errors": [],
+        "verdicts": {},
+        "reconstructions": {},
+        "frozen_pilot_config": {
+            "status": "REFUSED",
+            "executable": False,
+            "error": (
+                "the Tier 0.5 merge refused to reconcile its inputs, so no "
+                "pilot config was frozen"
+            ),
+            "reasons": [reason],
+            "arms": [],
+            "models": [],
+            "tasks": [],
+            "arm_b_models": [],
+            "priority_cells": [],
+            "pre_registered": True,
+            "labelled": "TIER-1 PILOT (reduced T/tasks/replicates), not the full matrix",
+        },
+    }
+    atomic_write_json(out_path, payload)
+    _atomic_write_text(md_path, "\n".join([
+        "# Tier 0.5 (canonical merge): REFUSED",
+        "",
+        f"The merge refused its inputs: {reason}",
+        "",
+        "No pilot config is frozen and no measurement is reported here. The "
+        "companion JSON carries `frozen_pilot_config.executable = false`, so "
+        "`run_tier1 --from-tier05` refuses it; fix the input the reason names "
+        "and re-run the merge.",
+        "",
+        "Requested inputs:",
+        "",
+        "```json",
+        json.dumps(requested, indent=2, sort_keys=True, default=str),
+        "```",
+        "",
+    ]))
+    return payload
+
+
 def _cli() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Merge Tier 0.5 measurement tracks")
     ap.add_argument("--track", action="append", default=[],
@@ -1367,7 +1686,10 @@ def _cli() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """0 = complete artifact, 1 = artifact written but INCOMPLETE, 2 = refused."""
+    """Exit codes: 0 = complete artifact, 1 = artifact written but INCOMPLETE,
+    2 = refused (the designated outputs are replaced with a non-executable
+    refusal marker, so no earlier FROZEN artifact survives this run).
+    """
     args = _cli().parse_args(argv)
     try:
         payload = merge(
@@ -1390,9 +1712,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             allow_relaxation=args.allow_t_relaxation,
         )
     except MergeError as exc:
-        # No artifact: a merge that cannot justify its numbers writes nothing,
-        # so a stale tier05.json is never mistaken for this run's result.
-        print(f"REFUSED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        # The refusal is the artifact: replacing the designated outputs with a
+        # non-executable marker is what stops a previous run's FROZEN tier05.json
+        # from being consumed by --from-tier05 as if this merge had produced it.
+        reason = f"{type(exc).__name__}: {exc}"
+        print(f"REFUSED: {reason}", file=sys.stderr)
+        marker = write_refusal(
+            args.out, args.md, reason=reason,
+            requested={
+                "tracks": list(args.track),
+                "reconstruct": list(args.reconstruct),
+                "journal_dir": args.journal_dir,
+                "tasks": args.tasks,
+                "models": [m for m in args.models.split(",") if m],
+                "arms": [a for a in args.arms.split(",") if a],
+                "c_model": args.c_model,
+                "m": args.m,
+                "K": args.K,
+                "gate_K": args.gate_K,
+                "tier0": args.tier0,
+            },
+        )
+        print(json.dumps({
+            "status": marker["status"],
+            "refusal": marker["refusal"]["reason"],
+            "frozen_pilot_config": marker["frozen_pilot_config"],
+            "json": args.out, "md": args.md,
+        }, indent=2, default=str))
         return 2
     atomic_write_json(args.out, payload)
     write_markdown(payload, args.md)

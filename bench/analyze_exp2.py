@@ -13,6 +13,12 @@ Outputs:
 
 No bootstrapping, no simulation: Exp 1's published best-of-K numbers are reused
 as published.  Every derived number carries the file it came from.
+
+Evidence gate: a verdict cell's result row must be BOUND to the journal digest
+it claims to come from -- by ``journal_session``, else by the digest's own
+``run_finished`` identity fields -- and a digest merged from several append
+sessions (``exp2_extract --session all``) is a diagnostic, never verdict
+evidence.  An unbindable cell makes the block INCONCLUSIVE; it never decides.
 """
 from __future__ import annotations
 
@@ -119,6 +125,31 @@ def geomean_of(vals: list[Any], n: int = 4) -> Any:
     return rnd(st.geometric_mean(xs), n)
 
 
+def retention_stats(vals: list[Any]) -> dict[str, Any]:
+    """Median/min over the DEFINED retentions; undefined when there are none."""
+    xs = [v for v in vals if is_num(v)]
+    return {"values": vals, "n_defined": len(xs),
+            "median": rnd(st.median(xs), 4) if xs else None,
+            "min": rnd(min(xs), 4) if xs else None}
+
+
+def span_of(vals: list[Any], n: int = 3) -> list[Any]:
+    """``[min, max]`` over the defined values; ``[None, None]`` when empty."""
+    xs = [v for v in vals if is_num(v)]
+    return [rnd(min(xs), n), rnd(max(xs), n)] if xs else [None, None]
+
+
+def utc_of(ts: Any) -> str | None:
+    """UTC stamp for a journal timestamp; None when the cell never recorded one."""
+    return (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+            if is_num(ts) else None)
+
+
+def all_num(vals: list[Any]) -> bool:
+    """True when every value is a real measurement (empty list is not)."""
+    return bool(vals) and all(is_num(v) for v in vals)
+
+
 def items_of(probe: dict) -> int | None:
     a, b = probe.get("start_count"), probe.get("end_count")
     return None if a is None or b is None else int(round(b - a))
@@ -140,13 +171,39 @@ def probe_at(trail: list[dict], step: int) -> dict | None:
     return None
 
 
-def check_digest(jn: str, e: dict) -> dict:
+def digest_merge_reason(e: dict) -> str:
+    """Why a digest is not exactly one append session ('' when it is one).
+
+    ``bench/exp2_extract.py --session all`` MERGES every append session found in
+    a journal into a single digest: probe trails, selections and step counts
+    from different runs of the same cell are summed into one record.  That view
+    is a legitimate DIAGNOSTIC, and it can never be bound to the one run whose
+    result row the verdict reads, so it is not verdict evidence.
+    """
+    if e.get("merged_sessions"):
+        return "the extractor marked it merged (`--session all`)"
+    sel, sid = e.get("session_selector"), e.get("session")
+    if sel == "all" or sid == "all":
+        return ("extracted with `--session all`: every append session in the "
+                "journal is merged into this digest")
+    sessions = e.get("sessions")
+    if isinstance(sessions, list) and len(sessions) > 1 and sid not in sessions:
+        return (f"the journal holds {len(sessions)} append sessions "
+                f"({sessions}) and the digest's session {sid!r} names none of them")
+    return ""
+
+
+def check_digest(jn: str, e: dict, *, verdict: bool = False) -> dict:
     """Refuse a stale or error-carrying journal digest.
 
     ``bench/exp2_extract.py`` reports every malformed record it saw; a digest
     with parse errors is not evidence and no number is derived from it.  A
     digest that predates that reporting cannot be distinguished from a clean
     one, so it is refused too.
+
+    ``verdict=True`` is the gate for the cells the pre-registered rule reads: it
+    additionally refuses a MERGED (``--session all`` / multi-session) digest,
+    which stays admissible for the diagnostic reads only.
     """
     if not isinstance(e, dict):
         raise DigestError(f"{EXTRACT} :: {jn} is not a digest object")
@@ -167,7 +224,98 @@ def check_digest(jn: str, e: dict) -> dict:
         print(f"[analyze] warning: {jn}: journal ends in a torn record "
               f"(dropped by the extractor; every complete record was read)",
               file=sys.stderr)
+    merged = digest_merge_reason(e)
+    if merged and verdict:
+        raise DigestError(
+            f"{EXTRACT} :: {jn} is a MERGED digest -- {merged}. A merged digest "
+            f"cannot be bound to the single run whose result row the verdict "
+            f"reads, so it is DIAGNOSTICS ONLY; re-extract that journal with "
+            f"`--session latest|<id>` before using it as verdict evidence")
+    if merged:
+        print(f"[analyze] warning: {jn}: merged digest -- {merged}; admissible "
+              f"as a diagnostic, never as verdict evidence", file=sys.stderr)
     return e
+
+
+def digest_run_finished(e: dict) -> dict | None:
+    """The digest's own ``run_finished`` record, when the journal carried one."""
+    rf = e.get("run_finished")
+    if isinstance(rf, list) and rf and isinstance(rf[-1], dict):
+        return rf[-1]
+    for ev in reversed(e.get("events") or []):
+        if isinstance(ev, dict) and ev.get("name") == "run_finished":
+            return ev
+    return None
+
+
+def same_value(x: Any, y: Any) -> bool:
+    """Equality that treats two JSON floats of the same number as the same."""
+    if is_num(x) and is_num(y):
+        return abs(x - y) <= 1e-9 * max(1.0, abs(x), abs(y))
+    return x == y
+
+
+def bind_row_to_digest(run: dict, jn: str, e: dict) -> dict:
+    """Bind one block result row to the digest that must have produced it.
+
+    ``arms.py`` stamps every result row AND its ``run_finished`` journal record
+    with ``journal_session``, so a row and a digest can be checked to agree on
+    which append session the numbers came from.  A row carrying the field MUST
+    name the digest's session exactly.  A legacy row without it falls back to
+    the digest's own ``run_finished`` identity fields (run_id, endpoint, steps).
+    A digest with no ``run_finished`` record, or one exposing none of those
+    fields, leaves the row UNVERIFIABLE: not a parse error, but not
+    decision-grade evidence either (the caller refuses it for the verdict).
+
+    Raises ``DigestError`` on a POSITIVE mismatch -- that row was not produced
+    by that journal, which invalidates the whole read rather than one cell.
+    """
+    dsid = e.get("session")
+    rsid = run.get("journal_session")
+    binding: dict[str, Any] = {
+        "row_journal_session": rsid, "digest_session": dsid,
+        "compared_fields": {}, "verified": False, "method": "", "why": "",
+    }
+    if rsid:
+        if not dsid or dsid == "all" or rsid != dsid:
+            raise DigestError(
+                f"{EXTRACT} :: {jn} is session {dsid!r} but the result row for "
+                f"{run.get('arm')}|r{run.get('replicate')} was written by journal "
+                f"session {rsid!r}: the digest and the row are not the same run")
+        binding.update(method="journal_session", verified=True)
+        return binding
+    rf = digest_run_finished(e)
+    if rf is None:
+        binding.update(
+            method="unverifiable",
+            why="the row carries no journal_session (legacy arms.py) and the "
+                "digest holds no run_finished record to bind it to")
+        return binding
+    identity, mismatched = {}, []
+    for f in ("run_id", "endpoint_throughput", "steps"):
+        if f not in rf or (f == "run_id" and not rf.get(f)):
+            continue        # the extractor slims some fields out of the record
+        identity[f] = {"row": run.get(f), "digest": rf.get(f)}
+        if not same_value(run.get(f), rf.get(f)):
+            mismatched.append(f)
+    binding["compared_fields"] = identity
+    if mismatched:
+        raise DigestError(
+            f"{EXTRACT} :: {jn} does not describe the result row for "
+            f"{run.get('arm')}|r{run.get('replicate')}: its run_finished record "
+            f"disagrees on {mismatched} "
+            f"({ {f: identity[f] for f in mismatched} }) -- the digest is from a "
+            f"different run or a different append session")
+    if {"endpoint_throughput", "steps"} <= set(identity):
+        binding.update(method="run_finished_fields", verified=True,
+                       why="legacy row bound by the digest's run_finished "
+                           "identity fields, not by journal_session")
+        return binding
+    binding.update(
+        method="unverifiable",
+        why=f"the row carries no journal_session and the digest's run_finished "
+            f"record exposes only {sorted(identity) or 'no'} identity field(s)")
+    return binding
 
 
 def check_manifest(D: dict) -> dict[tuple[str, int], dict]:
@@ -264,7 +412,13 @@ def build_cells(D: dict) -> list[dict]:
     for run in D["codex"]["runs"]:
         jn = Path(run["journal_path"]).stem if run.get("journal_path") else jkey(
             run["arm"], MODEL_SLUG, run["replicate"])
-        e = check_digest(jn, D["ex"][jn])
+        if jn not in D["ex"]:
+            raise DigestError(f"{EXTRACT} has no digest for {jn}: the cell's "
+                              f"journal was never extracted, so its result row "
+                              f"cannot be bound to any journal evidence")
+        # verdict=True: the pre-registered cells refuse a merged digest (R2C3)
+        e = check_digest(jn, D["ex"][jn], verdict=True)
+        binding = bind_row_to_digest(run, jn, e)
         t0 = e["t_start_ts"]
         if t0 is None:
             raise DigestError(f"{EXTRACT} :: {jn} has no T_start event: the cell's "
@@ -273,9 +427,11 @@ def build_cells(D: dict) -> list[dict]:
         probes = sorted(e["probes"], key=lambda p: (p["ts"]))
         term = [p for p in probes if p["probe_kind"] == "terminal"]
         endpoint_probe = None
+        measured = [p for p in term if is_num(p["throughput"])]
         if run["arm"] == "AxK":
             # arm endpoint = max over the 8 seat terminals (endpoint_source names it)
-            endpoint_probe = max(term, key=lambda p: p["throughput"]) if term else None
+            endpoint_probe = (max(measured, key=lambda p: p["throughput"])
+                              if measured else None)
         elif term:
             endpoint_probe = term[0]
         sel = sorted(e["branch_selections"], key=lambda s: s["round"])
@@ -288,6 +444,10 @@ def build_cells(D: dict) -> list[dict]:
             "replicate": run["replicate"],
             "status": run["status"],
             "journal": f"bench/journal/exp2/{jn}.jsonl",
+            "journal_session": e.get("session"),
+            "journal_sessions": e.get("sessions"),
+            "session_binding": binding,
+            "evidence_bound": binding["verified"],
             "endpoint_throughput": run["endpoint_throughput"],
             "endpoint_source": run["endpoint_source"],
             "endpoint_quota_normalised": rnd(ep / QUOTA, 4) if is_num(ep) else None,
@@ -354,6 +514,9 @@ def deployment_read(cells: list[dict]) -> dict:
     endpoint number, and (for B) both pre-registered floors cleared.  Anything
     else is INCONCLUSIVE -- an invalid cell cannot decide the null any more than
     it can decide the alternative.
+
+    Evidence binding is part of validity: a cell whose result row cannot be
+    bound to its journal digest (R2C3) is reported and refused for the verdict.
     """
     pairs_cells = pair_primary(cells)
     B = [b for b, _ in pairs_cells]
@@ -364,10 +527,12 @@ def deployment_read(cells: list[dict]) -> dict:
         width_ok = (c["median_k_effective"] or 0) >= WIDTH_FLOOR
         status_ok = c["status"] == "ok"
         ep_ok = is_num(c["endpoint_throughput"])
+        bound = bool(c.get("evidence_bound"))
         reasons = ([] if dose_ok else ["invalid_dose"]) + \
                   ([] if width_ok else ["invalid_width"]) + \
                   ([] if status_ok else ["status_%s" % c["status"]]) + \
-                  ([] if ep_ok else ["invalid_endpoint"])
+                  ([] if ep_ok else ["invalid_endpoint"]) + \
+                  ([] if bound else ["unbound_journal_evidence"])
         floors.append({
             "cell": c["cell"],
             "dose_measured": c["dose_measured"], "dose_floor": DOSE_FLOOR,
@@ -377,19 +542,25 @@ def deployment_read(cells: list[dict]) -> dict:
             "width_floor": WIDTH_FLOOR, "width_valid": width_ok,
             "status": c["status"], "status_valid": status_ok,
             "endpoint_valid": ep_ok,
+            "evidence_bound": bound,
+            "evidence_binding": c.get("session_binding", {}).get("method", "absent"),
             "verdict": "VALID" if not reasons else " + ".join(reasons),
         })
     for c in A:
         status_ok = c["status"] == "ok"
         ep_ok = is_num(c["endpoint_throughput"])
+        bound = bool(c.get("evidence_bound"))
         reasons = ([] if status_ok else ["status_%s" % c["status"]]) + \
-                  ([] if ep_ok else ["invalid_endpoint"])
+                  ([] if ep_ok else ["invalid_endpoint"]) + \
+                  ([] if bound else ["unbound_journal_evidence"])
         floors.append({
             "cell": c["cell"], "dose_measured": 0, "dose_floor": None,
             "dose_valid": True, "rounds_k_effective": [], "median_k_effective": None,
             "width_floor": None, "width_valid": True,
             "status": c["status"], "status_valid": status_ok,
             "endpoint_valid": ep_ok,
+            "evidence_bound": bound,
+            "evidence_binding": c.get("session_binding", {}).get("method", "absent"),
             "verdict": ("VALID (control: never converges; floors do not apply)"
                         if not reasons else " + ".join(reasons)),
         })
@@ -430,7 +601,8 @@ def deployment_read(cells: list[dict]) -> dict:
         "rule": ("CONFIRMED iff all six endpoints are valid AND "
                  "min(B-iterated) > max(A*K-from-S); any overlap, including "
                  "2-of-3 separation -> 'one-shot suffices'. An invalid cell "
-                 "(floor breach, non-ok status, missing endpoint) decides "
+                 "(floor breach, non-ok status, missing endpoint, or a result "
+                 "row that cannot be bound to its journal session) decides "
                  "NEITHER: that block is INCONCLUSIVE"),
         "manifest": [f"{a}|r{r}" for a, r in MANIFEST],
         "six_endpoints": {
@@ -445,6 +617,15 @@ def deployment_read(cells: list[dict]) -> dict:
         "invalid_cells": invalid,
         "endpoints_complete": complete,
         "floors": floors,
+        "evidence_binding": {
+            "rule": ("every result row must be bound to its journal digest: by "
+                     "journal_session when the row carries one, else by the "
+                     "digest's own run_finished identity fields. An unbindable "
+                     "row is not decision-grade evidence"),
+            "per_cell": {f["cell"]: f["evidence_binding"] for f in floors},
+            "unbound_cells": [f["cell"] for f in floors if not f["evidence_bound"]],
+            "all_bound": all(f["evidence_bound"] for f in floors),
+        },
         "min_B": rnd(minB), "max_AxK": rnd(maxA),
         "min_B_gt_max_AxK": separated,
         "pairs": pairs,
@@ -621,38 +802,55 @@ def mechanism_read(cells: list[dict], D: dict) -> dict:
 # 3. decay read
 # --------------------------------------------------------------------------
 def decay_read(cells: list[dict], D: dict) -> dict:
+    """Peak-vs-terminal retention per cell.
+
+    Every secondary statistic here is UNDEFINED rather than zero when the cell
+    it comes from is invalid: a B cell that never converged has no selection to
+    charge decay against and no post-convergence trail, and an arm with no
+    measured probe has no peak.  Those rows are emitted as undefined (with the
+    reason attached) so an INCONCLUSIVE block still produces its artifact.
+    """
     rows = []
     for c in cells:
+        seats: list[str] = []
+        peaks: list[float | None] = []
+        terms: list[float | None] = []
+        best_seat = None
         if c["arm"] in ("B", "Bonce"):
             lineage = [p["throughput"] for p in c["probe_trail"]
-                       if p["kind"] in ("terminal", "parity")]
+                       if p["kind"] in ("terminal", "parity") and is_num(p["throughput"])]
             for br in c["branch_rounds"]:
                 w = br["scores"].get(br["winner"])
-                if w is not None:
+                if is_num(w):
                     lineage.append(w)
-            selection = (c["branch_rounds"][-1]["scores"].get(
-                c["branch_rounds"][-1]["winner"]) if c["branch_rounds"] else None)
+            last = c["branch_rounds"][-1] if c["branch_rounds"] else None
+            selection = last["scores"].get(last["winner"]) if last else None
             peak = max(lineage) if lineage else None
+            note = (None if selection is not None else
+                    "undefined -- this cell never converged, so it has no "
+                    "selection to charge decay against")
         else:  # AxK / A -- the arm's line(s) are the seats; selection happens AT T
             seats = sorted({p["branch"] for p in c["probe_trail"]})
-            peaks, terms = [], []
             for s in seats:
-                tr = [p["throughput"] for p in c["probe_trail"] if p["branch"] == s]
+                tr = [p["throughput"] for p in c["probe_trail"]
+                      if p["branch"] == s and is_num(p["throughput"])]
                 tm = [p["throughput"] for p in c["probe_trail"]
                       if p["branch"] == s and p["kind"] == "terminal"]
-                peaks.append(max(tr))
+                peaks.append(max(tr) if tr else None)
                 terms.append(tm[0] if tm else None)
-            peak = max(peaks)
+            measured = [p for p in peaks if is_num(p)]
+            peak = max(measured) if measured else None
             selection = None  # no mid-run selection to charge decay against
-            best_seat = max(range(len(seats)), key=lambda i: (terms[i] or 0.0))
+            if seats:
+                best_seat = max(range(len(seats)), key=lambda i: (terms[i] or 0.0))
+            note = ("n/a -- this arm selects at T, so its endpoint IS its "
+                    "selection; decay is charged per seat")
         term = c["endpoint_throughput"]
         row = {
             "cell": c["cell"], "arm": c["arm"], "replicate": c["replicate"],
             "peak_on_surviving_lineage": rnd(peak) if peak is not None else None,
             "selection_quality": rnd(selection) if selection is not None else None,
-            "selection_quality_note": (None if selection is not None else
-                                       "n/a -- this arm selects at T, so its endpoint "
-                                       "IS its selection; decay is charged per seat"),
+            "selection_quality_note": note,
             "terminal_at_T": rnd(term),
             "retention": rnd(term / peak, 4) if peak and is_num(term) else None,
             "post_peak_decay_pct": (rnd(100.0 * (1 - term / peak), 2)
@@ -663,13 +861,20 @@ def decay_read(cells: list[dict], D: dict) -> dict:
             "margin_vs_S2_items": (c["endpoint_items"] - 76)
                                   if c["endpoint_items"] is not None else None,
         }
+        row["retention_defined"] = row["retention"] is not None
+        if row["retention"] is None:
+            row["retention_undefined_because"] = (
+                "no measured peak on this cell's probe trail" if peak is None else
+                "no measured endpoint at T" if not is_num(term) else
+                "the measured peak is zero, so retention has no denominator")
         if c["arm"] in ("AxK", "A"):
             row["per_seat_peak_vs_terminal"] = [
-                {"seat": seats[i], "peak": rnd(peaks[i]),
+                {"seat": seats[i],
+                 "peak": rnd(peaks[i]) if peaks[i] is not None else None,
                  "terminal": rnd(terms[i]) if terms[i] is not None else None,
                  "retention": rnd((terms[i] or 0.0) / peaks[i], 4) if peaks[i] else None}
                 for i in range(len(seats))]
-            row["winning_seat"] = seats[best_seat]
+            row["winning_seat"] = seats[best_seat] if best_seat is not None else None
             row["seats_that_lost_ground"] = sum(
                 1 for i in range(len(seats))
                 if peaks[i] and (terms[i] or 0.0) < 0.9 * peaks[i])
@@ -681,31 +886,48 @@ def decay_read(cells: list[dict], D: dict) -> dict:
     for c in cells:
         if c["arm"] != "B":
             continue
+        if not c["round_boundaries_s"] or not c["branch_rounds"]:
+            tails.append({
+                "cell": c["cell"], "last_convergence_t_s": None,
+                "selection_quality": None, "post_convergence_probes": [],
+                "note": "undefined -- this cell never converged, so it has no "
+                        "post-convergence trail",
+            })
+            continue
         t_last = c["round_boundaries_s"][-1]
+        last = c["branch_rounds"][-1]
         tail = [p for p in c["probe_trail"] if p["t_s"] > t_last]
         tails.append({
             "cell": c["cell"], "last_convergence_t_s": t_last,
-            "selection_quality": rnd(c["branch_rounds"][-1]["scores"][
-                c["branch_rounds"][-1]["winner"]]),
+            "selection_quality": rnd(last["scores"].get(last["winner"])),
             "post_convergence_probes": [
                 {"t_s": p["t_s"], "step": p["step"], "throughput": rnd(p["throughput"]),
                  "kind": p["kind"]} for p in tail],
+            "note": None,
         })
     # null-action decay curve recovered from the labelled-invalid k3 cell
-    e = D["ex"]["B-k3-iron_plate_throughput-r2"]
-    t0 = e["t_start_ts"]
-    null_curve = []
-    for s in sorted(e["branch_selections"], key=lambda x: x["round"]):
-        vals = [v.get("probe_throughput") for v in s["scores"].values()
-                if v.get("probe_throughput") is not None]
-        null_curve.append({"round": s["round"], "t_s": rnd(s["ts"] - t0, 1),
-                           "n": len(vals), "median": rnd(st.median(vals)),
-                           "max": rnd(max(vals))})
-    tp = [p for p in e["probes"] if p["probe_kind"] == "terminal"]
-    if tp:
-        null_curve.append({"round": "terminal", "t_s": rnd(tp[0]["ts"] - t0, 1),
-                           "n": 1, "median": rnd(tp[0]["throughput"]),
-                           "max": rnd(tp[0]["throughput"])})
+    e = D["ex"].get("B-k3-iron_plate_throughput-r2")
+    null_curve: list[dict] = []
+    null_unavailable = None
+    t0 = e.get("t_start_ts") if isinstance(e, dict) else None
+    if not isinstance(e, dict):
+        null_unavailable = ("the k3 r2 diagnostic journal is not in this digest, "
+                            "so the substrate curve was not recovered")
+    elif t0 is None:
+        null_unavailable = ("the k3 r2 digest has no T_start event, so its probe "
+                            "timestamps cannot be placed on a t=0 axis")
+    else:
+        for s in sorted(e["branch_selections"], key=lambda x: x["round"]):
+            vals = [v.get("probe_throughput") for v in s["scores"].values()
+                    if is_num(v.get("probe_throughput"))]
+            null_curve.append({"round": s["round"], "t_s": rnd(s["ts"] - t0, 1),
+                               "n": len(vals), "median": median_of(vals),
+                               "max": rnd(max(vals)) if vals else None})
+        tp = [p for p in e["probes"] if p["probe_kind"] == "terminal"]
+        if tp:
+            null_curve.append({"round": "terminal", "t_s": rnd(tp[0]["ts"] - t0, 1),
+                               "n": 1, "median": rnd(tp[0]["throughput"]),
+                               "max": rnd(tp[0]["throughput"])})
     return {
         "registered_as": "Decay read (design doc, pre-registered mid-block from "
                          "B|codex|r2 diagnostics)",
@@ -717,10 +939,8 @@ def decay_read(cells: list[dict], D: dict) -> dict:
         "rows": rows,
         "regressed_cells": [r["cell"] for r in rows if r["flag"] == "REGRESSED"],
         "n_regressed": sum(1 for r in rows if r["flag"] == "REGRESSED"),
-        "B_retention": {"values": Bret, "median": rnd(st.median(Bret), 4),
-                        "min": rnd(min(Bret), 4)},
-        "AxK_retention": {"values": Aret, "median": rnd(st.median(Aret), 4),
-                          "min": rnd(min(Aret), 4)},
+        "B_retention": retention_stats(Bret),
+        "AxK_retention": retention_stats(Aret),
         "B_post_convergence_trails": tails,
         "sustainability_robustness_asymmetry": (
             "max-over-8-at-T is robust to individual line decay; a single "
@@ -730,13 +950,20 @@ def decay_read(cells: list[dict], D: dict) -> dict:
             "artifact -- and it is sustainability-robustness, NOT selection failure: "
             "at every B convergence the selector chose among healthy branches."
             % (100 * st.median(Aret), 100 * min(Aret),
-               100 * st.median(Bret), 100 * min(Bret))),
+               100 * st.median(Bret), 100 * min(Bret))
+            if Bret and Aret else
+            "UNDEFINED on this block: retention needs a measured peak AND a "
+            "measured endpoint at T, and %s. No asymmetry is claimed."
+            % ("neither arm has one defined cell" if not Bret and not Aret else
+               "B has no cell with both" if not Bret else
+               "A*K has no cell with both")),
         "null_action_decay_curve": {
             "source": "bench/journal/exp2/B-k3-iron_plate_throughput-r2.jsonl "
                       "(labelled-invalid k3 cell: 2,508 provider 403s, ZERO executed "
                       "agent steps -- so its probe trail measures the substrate, not "
                       "an agent)",
             "curve": null_curve,
+            "unavailable_because": null_unavailable,
             "reading": "Left alone, S2's factory holds ~76 plates/60s for ~1,600s, "
                        "falls to ~17 by t=2,114s and to 0.0 by t=2,652s. At "
                        "T=4,200s the do-nothing counterfactual is ZERO, not 76.",
@@ -759,19 +986,24 @@ def matched_steps_read(cells: list[dict]) -> dict:
         b_line: dict[int, float] = {}
         for br in b["branch_rounds"]:
             step = br["round"] * M
-            b_line[step] = br["scores"][br["winner"]]
+            b_line[step] = br["scores"].get(br["winner"])
         for p in b["probe_trail"]:
             if p["kind"] in ("parity", "terminal") and p["branch"] == "main":
                 b_line[p["step"]] = p["throughput"]
         seats: dict[str, dict[int, float]] = {}
         for p in a["probe_trail"]:
             seats.setdefault(p["branch"], {})[p["step"]] = p["throughput"]
-        common = set(b_line)
-        for s in seats.values():
-            common &= set(s)
+        # a step index only counts as matched where BOTH sides measured a value:
+        # a missing or non-numeric probe is no depth to compare at.
+        common = {s for s, v in b_line.items() if is_num(v)}
+        for sv in seats.values():
+            common &= {s for s, v in sv.items() if is_num(v)}
+        if not seats:
+            common = set()
         if not common:
             rows.append({"replicate": b["replicate"], "matched_step": None,
-                         "note": "no step index common to B's line and all 8 seats"})
+                         "note": "no step index carries a measured value on both "
+                                 "B's line and all 8 seats"})
             continue
         s_star = max(common)
         b_val = b_line[s_star]
@@ -887,17 +1119,20 @@ def dose_response(cells: list[dict]) -> dict:
 def wall_clock(cells: list[dict]) -> dict:
     rows = []
     for c in cells:
-        t = c["timings"]
-        raw, att = t["raw_s"], t["attributed_s"]
+        t = c["timings"] or {}
+        raw, att = t.get("raw_s") or {}, t.get("attributed_s") or {}
+        total = t.get("attributed_total_s")
         rows.append({
             "cell": c["cell"],
-            "wall_s": rnd(t["wall_s"], 1),
+            "wall_s": rnd(t.get("wall_s"), 1),
             "end_to_end_s": c["end_to_end_s"],
             "attributed_s": {k: rnd(v, 1) for k, v in att.items()},
             "raw_s": {k: rnd(v, 1) for k, v in raw.items()},
-            "infra_fraction_attributed": t["infra_fraction_attributed"],
-            "llm_fraction_attributed": rnd(att["llm_wait"] / t["attributed_total_s"], 4),
-            "n_intervals": t["n_intervals"],
+            "infra_fraction_attributed": t.get("infra_fraction_attributed"),
+            "llm_fraction_attributed": (rnd(att["llm_wait"] / total, 4)
+                                        if is_num(att.get("llm_wait")) and total
+                                        else None),
+            "n_intervals": t.get("n_intervals"),
         })
     # drift guard: measured op latencies vs the settled constants
     drift = []
@@ -918,8 +1153,15 @@ def wall_clock(cells: list[dict]) -> dict:
                 "p50_vs_constant": rnd(op["p50"] / const, 3) if const else None,
             })
     forks = [d for d in drift if d["op"] == "fork"]
+    snaps = [d for d in drift if d["op"] == "snapshot"]
+    dels = [d for d in drift if d["op"] == "delete_sandbox"]
     n_fork = sum(d["n"] for d in forks)
     fork_fail = sum(d["fails"] for d in forks)
+    fork_p50 = span_of([d["p50_s"] for d in forks], 1)
+    fork_p95 = span_of([d["p95_s"] for d in forks], 1)
+    snap_p50 = span_of([d["p50_s"] for d in snaps], 1)
+    del_p50 = span_of([d["p50_s"] for d in dels], 1)
+    measured = all(v is not None for v in fork_p50 + fork_p95 + snap_p50 + del_p50)
     return {
         "per_cell": rows,
         "bucket_definition": ("attributed_s splits the run's wall clock into "
@@ -931,17 +1173,10 @@ def wall_clock(cells: list[dict]) -> dict:
             "rows": drift,
             "fork_total": n_fork,
             "fork_failures": fork_fail,
-            "fork_p50_range_s": [min(d["p50_s"] for d in forks),
-                                 max(d["p50_s"] for d in forks)],
-            "fork_p95_max_s": max(d["p95_s"] for d in forks),
-            "delete_p50_range_s": [min(d["p50_s"] for d in drift
-                                       if d["op"] == "delete_sandbox"),
-                                   max(d["p50_s"] for d in drift
-                                       if d["op"] == "delete_sandbox")],
-            "snapshot_p50_range_s": [min(d["p50_s"] for d in drift
-                                         if d["op"] == "snapshot"),
-                                     max(d["p50_s"] for d in drift
-                                         if d["op"] == "snapshot")],
+            "fork_p50_range_s": fork_p50,
+            "fork_p95_max_s": fork_p95[1],
+            "delete_p50_range_s": del_p50,
+            "snapshot_p50_range_s": snap_p50,
             "verdict": ("Fork p50 %.1f-%.1fs (p95 max %.1fs) against the 32s solo "
                         "constant and the 758s p95-contended constant: this block ran "
                         "in the CONTENDED regime throughout, 1.7-3.8x the solo "
@@ -955,13 +1190,17 @@ def wall_clock(cells: list[dict]) -> dict:
                         "short after retries (13 successful forks for 6+7 children), "
                         "which is the k_effective=7 that cell's fork_wave record "
                         "reports. No drift beyond the settled envelope."
-                        % (min(d["p50_s"] for d in forks),
-                           max(d["p50_s"] for d in forks),
-                           max(d["p95_s"] for d in forks),
-                           min(d["p50_s"] for d in drift if d["op"] == "snapshot"),
-                           max(d["p50_s"] for d in drift if d["op"] == "snapshot"),
-                           min(d["p50_s"] for d in drift if d["op"] == "delete_sandbox"),
-                           max(d["p50_s"] for d in drift if d["op"] == "delete_sandbox"),
+                        % (fork_p50[0], fork_p50[1], fork_p95[1],
+                           snap_p50[0], snap_p50[1], del_p50[0], del_p50[1],
+                           fork_fail, n_fork)
+                        if measured else
+                        "NOT READ on this block: the cells report no %s latencies, "
+                        "so there is nothing to compare against the settled "
+                        "constants. %d/%d fork attempts failed."
+                        % (", ".join(n for n, v in (("fork", fork_p50[0]),
+                                                    ("snapshot", snap_p50[0]),
+                                                    ("delete_sandbox", del_p50[0]))
+                                     if v is None) or "expected",
                            fork_fail, n_fork)),
         },
     }
@@ -973,10 +1212,14 @@ def wall_clock(cells: list[dict]) -> dict:
 def collision_audit(cells: list[dict]) -> dict:
     by = {c["arm"]: c for c in cells}
     bo, ac = by["Bonce"], by["A"]
-    same = bo["endpoint_throughput"] == ac["endpoint_throughput"]
+    same = (bo["endpoint_throughput"] == ac["endpoint_throughput"]
+            and is_num(bo["endpoint_throughput"]))
     return {
-        "observation": "Bonce and A-continue report bit-identical endpoints "
-                       f"({bo['endpoint_throughput']!r}).",
+        "observation": ("Bonce and A-continue report bit-identical endpoints "
+                        f"({bo['endpoint_throughput']!r})." if same else
+                        f"Bonce reports {bo['endpoint_throughput']!r} and "
+                        f"A-continue {ac['endpoint_throughput']!r}: no collision "
+                        f"to audit on this block."),
         "bit_identical": same,
         "explanation": ("the probe returns an INTEGER item delta over a measured "
                         "tick window and normalises: throughput = items * 3600 / "
@@ -993,8 +1236,7 @@ def collision_audit(cells: list[dict]) -> dict:
                 "end_tick": bo["endpoint_end_tick"],
                 "start_count": bo["endpoint_start_count"],
                 "end_count": bo["endpoint_end_count"],
-                "endpoint_ts_utc": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(bo["endpoint_ts"])),
+                "endpoint_ts_utc": utc_of(bo["endpoint_ts"]),
                 "arm_step_records": bo["steps_arm_total_records"],
                 "llm_calls": bo["llm"]["n"],
                 "probe_trail_len": len(bo["probe_trail"]),
@@ -1007,8 +1249,7 @@ def collision_audit(cells: list[dict]) -> dict:
                 "end_tick": ac["endpoint_end_tick"],
                 "start_count": ac["endpoint_start_count"],
                 "end_count": ac["endpoint_end_count"],
-                "endpoint_ts_utc": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(ac["endpoint_ts"])),
+                "endpoint_ts_utc": utc_of(ac["endpoint_ts"]),
                 "arm_step_records": ac["steps_arm_total_records"],
                 "llm_calls": ac["llm"]["n"],
                 "probe_trail_len": len(ac["probe_trail"]),
@@ -1070,21 +1311,38 @@ def _cell_verdict(c: dict) -> str:
     return "VALID"
 
 
+def k3_cell(cells: list[dict], prefix: str, suffix: str = "") -> dict:
+    """The named k3 diagnostic cell, or a clear refusal if the block changed."""
+    for c in cells:
+        if c["cell"].startswith(prefix) and c["cell"].endswith(suffix):
+            return c
+    raise ManifestError(f"{BLOCK_K3} has no {prefix}...{suffix} cell: the k3 "
+                        f"diagnostic block is not the recorded 3-cell set")
+
+
 # --------------------------------------------------------------------------
 # 9. k3 block
 # --------------------------------------------------------------------------
 def k3_block(D: dict) -> dict:
+    """The labelled-invalid k3 diagnostic block (never verdict evidence)."""
     cells = []
     for run in D["k3"]["runs"]:
         jn = Path(run["journal_path"]).stem if run.get("journal_path") else None
-        e = D["ex"][jn]
+        e = D["ex"].get(jn)
+        if not isinstance(e, dict):
+            raise DigestError(f"{EXTRACT} has no digest for the k3 cell {jn}: "
+                              f"re-extract before reading the k3 block")
         t0 = e["t_start_ts"]
         p403 = [i for i in e["incidents"] if "403" in (i["detail"] or "")]
         sel = sorted(e["branch_selections"], key=lambda s: s["round"])
         waves = sorted(e["fork_waves"], key=lambda w: w["round"])
         term = [p for p in e["probes"] if p["probe_kind"] == "terminal"]
-        endp = (max(term, key=lambda p: p["throughput"]) if run["arm"] == "AxK" and term
+        measured = [p for p in term if is_num(p["throughput"])]
+        endp = (max(measured, key=lambda p: p["throughput"])
+                if run["arm"] == "AxK" and measured
                 else (term[0] if term else None))
+        # t=0 is the T_start event; without it the 403 window has no axis
+        t403 = [i["ts"] - t0 for i in p403] if t0 is not None else []
         cells.append({
             "cell": f"{run['arm']}|k3|{TASK}|r{run['replicate']}",
             "journal": f"bench/journal/exp2/{jn}.jsonl",
@@ -1097,13 +1355,12 @@ def k3_block(D: dict) -> dict:
             "step_records_executed": sum(v["n"] for v in e["steps"].values()),
             "llm": {k: e["llm"][k] for k in ("n", "mean_s", "p50", "p95", "outcomes")},
             "n_403_incidents": len(p403),
-            "first_403_t_s": rnd(min(i["ts"] - t0 for i in p403), 1) if p403 else None,
-            "last_403_t_s": rnd(max(i["ts"] - t0 for i in p403), 1) if p403 else None,
+            "first_403_t_s": rnd(min(t403), 1) if t403 else None,
+            "last_403_t_s": rnd(max(t403), 1) if t403 else None,
         })
-    by = {c["cell"].split("|")[0] + c["cell"][-2:]: c for c in cells}
-    b1 = next(c for c in cells if c["cell"].startswith("B|k3") and c["cell"].endswith("r1"))
-    a1 = next(c for c in cells if c["cell"].startswith("AxK|k3"))
-    b2 = next(c for c in cells if c["cell"].startswith("B|k3") and c["cell"].endswith("r2"))
+    b1 = k3_cell(cells, "B|k3", "r1")
+    a1 = k3_cell(cells, "AxK|k3")
+    b2 = k3_cell(cells, "B|k3", "r2")
     return {
         "recorded_deviation": ("design doc :: Execution deviation (2026-08-10 ~20:10Z) "
                                "-- k3 block aborted at cell 3/8, Kimi quota exhausted "
@@ -1188,15 +1445,18 @@ def codex_deviations(D: dict) -> dict:
                    "EmptyCompletion" if "EmptyCompletion" in d else
                    "bridge_error" if "BridgeError" in d else
                    i["incident_kind"] or "?")
-            tax.setdefault(tag, []).append(i["ts"] - t0)
+            # a digest with no T_start has no t=0 axis: the incident is counted,
+            # its offset stays undefined
+            tax.setdefault(tag, []).append(None if t0 is None else i["ts"] - t0)
         retried = sum(v for k, v in e["llm"]["attempts"].items() if k != "1")
         rows.append({
             "journal": f"bench/journal/exp2/{jn}.jsonl",
             "llm_calls": e["llm"]["n"],
             "llm_errors": e["llm"]["outcomes"].get("error", 0),
             "retried_attempts": retried,
-            "incident_taxonomy": {k: {"n": len(v), "first_t_s": rnd(min(v), 1),
-                                      "last_t_s": rnd(max(v), 1)}
+            "incident_taxonomy": {k: {"n": len(v),
+                                      "first_t_s": rnd(min(v), 1) if all_num(v) else None,
+                                      "last_t_s": rnd(max(v), 1) if all_num(v) else None}
                                   for k, v in sorted(tax.items())},
         })
     return {
@@ -1281,6 +1541,12 @@ def build(D: dict) -> dict:
             "k3_block": str(BLOCK_K3),
             "exp1": str(EXP1),
             "journal_digest": str(EXTRACT),
+            "journal_digest_provenance": {
+                jn: {"session": e.get("session"), "sessions": e.get("sessions"),
+                     "session_selector": e.get("session_selector"),
+                     "merged": bool(digest_merge_reason(e)),
+                     "merged_reason": digest_merge_reason(e) or None}
+                for jn, e in sorted(D["ex"].items()) if isinstance(e, dict)},
             "journals": sorted({c["journal"] for c in cells}
                                | {c["journal"] for c in k3["cells"]}),
         },
@@ -1299,7 +1565,7 @@ def build(D: dict) -> dict:
         "k3_block": k3,
         "exp1_reference": exp1_ref,
         "limitations": LIMITATIONS,
-        "final_answer": FINAL_ANSWER,
+        "final_answer": final_answer(dep, mech, dec, ms, wc, exp1_ref),
     }
 
 
@@ -1350,38 +1616,129 @@ LIMITATIONS = [
     "always collapses diversity'.",
 ]
 
-FINAL_ANSWER = (
-    "Is Farplane useful for LLM fan-out exploration? Yes, but not as an iteration "
-    "engine at this dose and horizon. What is PROVEN across Exp 1 and Exp 2: fork "
-    "exactness (children bit-identical, live-RAM state carried), so a forked line is "
-    "a real continuation and not a re-simulation; one-shot fan-out from a checkpoint "
-    "buys a large, measured gain -- Exp 1's best-of-8 was +86.5% (wave 1) and +71.0% "
-    "(wave 2) over a single draw, and Exp 2's A*K arm converts that into the top "
-    "endpoint in all three pairs; and checkpoint provisioning works as advertised "
-    "(A*K stands up eight byte-identical S2 continuations from one snapshot in 177s "
-    "of create-from-snapshot work, p50 6.1s each, and B re-forks 7 children per "
-    "round throughout T -- 65 fork attempts across the block with 3 failures). What "
-    "FAILED here: convergent iteration. At dose 2-3 with K=8 over T=4200s, "
-    "B-iterated lost all three pairs (min B 5.00 vs max A*K 300.0), lost the "
-    "matched-agent-step read too (2 of 3), and its mechanism read shows why -- after "
-    "the first convergence the eight seats mostly stop producing separable outcomes "
-    "(4 of the 5 rounds after round 1 have selection gain <= 0.07, against a round-1 "
-    "median of 0.97 and Exp 1's 0.74-1.41 at m=12), so those rounds pay a full fork "
-    "wave for a near-degenerate draw, and the single surviving line then carries all "
-    "the decay risk that max-over-8 diversifies away (B retains 56% of its peak at "
-    "T, worst case 4.4%; A*K retains 100%, worst case 49.9%). What remains UNTESTED: "
-    "high-dose iteration (>3 rounds, which needs either a longer T or cheaper forks "
-    "than this deployment's 53.5-120.6s p50); tasks where the state does not decay, "
-    "so "
-    "that a terminal instantaneous probe measures construction rather than "
-    "sustainment; and the expensive-prefix regime the crossover chart was meant to "
-    "map -- when rebuilding state costs more than forking it, fork-and-converge may "
-    "pay for itself on provisioning economics alone, independent of whether "
-    "iteration improves the outcome distribution. The engineering decision this "
-    "block was built to make: use Farplane to fan out ONCE from an expensive "
-    "checkpoint and to checkpoint/rewind/destructively measure -- do not build a "
-    "convergent-iteration pipeline on it at this width and fork cost."
-)
+
+def pct_gain(v: Any) -> str:
+    """A published gain as a signed percentage, or an explicit 'not measured'."""
+    return f"+{100.0 * v:.1f}%" if is_num(v) else "not measured"
+
+
+def pct_of(v: Any) -> str:
+    """A ratio as a percentage, or 'UNDEFINED' when it was never measured."""
+    return f"{100.0 * v:.1f}%" if is_num(v) else "UNDEFINED"
+
+
+def final_answer(dep: dict, mech: dict, dec: dict, ms: dict,
+                 wc: dict, exp1_ref: dict) -> str:
+    """Section 10, DERIVED FROM THE VERDICT STATE.
+
+    The recorded answer is whatever the pre-registered three-state read says.
+    Under INCONCLUSIVE nothing is asserted for or against iteration -- the text
+    is non-decisive and the engineering decision is explicitly deferred -- so
+    this section can never claim the iteration hypothesis failed on a block that
+    did not test it.  The mechanics paragraph is verdict-independent: fork
+    exactness, one-shot gain and provisioning are measured facts either way.
+    """
+    state = dep["verdict_state"]
+    bk = exp1_ref["best_of_k_published"]
+    g1 = (bk.get("1") or {}).get("8", {}).get("gain_over_k1")
+    g2 = (bk.get("2") or {}).get("8", {}).get("gain_over_k1")
+    fg = wc["drift_guard"]
+    dv = mech["diversity_evidence"]
+    n_pairs = len(dep["pairs"])
+    collapsed = len(dv["rounds_ge2_with_gain_below_0_10"])
+    later = (collapsed + len(dv["rounds_ge2_that_kept_diversity"])
+             + len(dv["rounds_ge2_with_undefined_gain"]))
+    Bret, Aret = dec["B_retention"], dec["AxK_retention"]
+    fork_p50 = fg["fork_p50_range_s"]
+    mechanics = (
+        "What is PROVEN across Exp 1 and Exp 2, and does not depend on the "
+        "deployment verdict: fork exactness (children bit-identical, live-RAM "
+        "state carried), so a forked line is a real continuation and not a "
+        "re-simulation; one-shot fan-out from a checkpoint buys a large, measured "
+        "gain -- Exp 1's best-of-8 was %s (wave 1) and %s (wave 2) over a single "
+        "draw; and checkpoint provisioning works as advertised (A*K stands up "
+        "eight byte-identical S2 continuations from one snapshot, and B re-forks "
+        "its children every round throughout T -- %s fork attempts across the "
+        "block with %s failures). "
+        % (pct_gain(g1), pct_gain(g2), fg["fork_total"], fg["fork_failures"]))
+    untested = (
+        "What remains UNTESTED: high-dose iteration (>3 rounds, which needs "
+        "either a longer T or cheaper forks than this deployment's %s-%ss fork "
+        "p50); tasks where the state does not decay, so that a terminal "
+        "instantaneous probe measures construction rather than sustainment; and "
+        "the expensive-prefix regime the crossover chart was meant to map -- when "
+        "rebuilding state costs more than forking it, fork-and-converge may pay "
+        "for itself on provisioning economics alone, independent of whether "
+        "iteration improves the outcome distribution. "
+        % (fmt(fork_p50[0], 1), fmt(fork_p50[1], 1)))
+    if state == "NOT CONFIRMED":
+        return (
+            "Is Farplane useful for LLM fan-out exploration? Yes, but not as an "
+            "iteration engine at this dose and horizon. " + mechanics +
+            "Exp 2's A*K arm converts that one-shot gain into the top endpoint in "
+            "%d of %d pairs. What FAILED here: convergent iteration. At dose 2-3 "
+            "with K=8 over T=%.0fs, B-iterated lost %d of %d pairs (min B %s vs "
+            "max A*K %s), lost the matched-agent-step read too (%d of %d), and its "
+            "mechanism read shows why -- after the first convergence the eight "
+            "seats mostly stop producing separable outcomes (%d of the %d rounds "
+            "after round 1 have selection gain <= 0.10, against a round-1 median "
+            "of %s), so those rounds pay a full fork wave for a near-degenerate "
+            "draw, and the single surviving line then carries all the decay risk "
+            "that max-over-8 diversifies away (B retains %s of its peak at T, "
+            "worst case %s; A*K retains %s, worst case %s). "
+            % (n_pairs - dep["pairs_won_by_B"], n_pairs, T_S,
+               n_pairs - dep["pairs_won_by_B"], n_pairs,
+               fmt(dep["min_B"], 2), fmt(dep["max_AxK"], 2),
+               n_pairs - ms["pairs_won_by_B"], len(ms["rows"]),
+               collapsed, later, fmt(dv["round1_gain_median"], 2),
+               pct_of(Bret["median"]), pct_of(Bret["min"]),
+               pct_of(Aret["median"]), pct_of(Aret["min"]))
+            + untested +
+            "The engineering decision this block was built to make: use Farplane "
+            "to fan out ONCE from an expensive checkpoint and to "
+            "checkpoint/rewind/destructively measure -- do not build a "
+            "convergent-iteration pipeline on it at this width and fork cost.")
+    if state == "CONFIRMED":
+        return (
+            "Is Farplane useful for LLM fan-out exploration? Yes, and at this "
+            "dose and horizon iterated fan-out-and-converge is the better use of "
+            "it. " + mechanics +
+            "What the pre-registered rule RECORDS here: convergent iteration "
+            "beats one-shot fan-out on a complete, valid manifest -- every "
+            "B-iterated endpoint clears every A*K endpoint (min B %s > max A*K "
+            "%s), B took %d of %d pairs, and the matched-agent-step read agrees in "
+            "%d of %d. B retains %s of its peak at T (worst case %s) against "
+            "A*K's %s (worst case %s), so the single surviving line is carrying "
+            "its decay risk and still winning. "
+            % (fmt(dep["min_B"], 2), fmt(dep["max_AxK"], 2),
+               dep["pairs_won_by_B"], n_pairs, ms["pairs_won_by_B"], len(ms["rows"]),
+               pct_of(Bret["median"]), pct_of(Bret["min"]),
+               pct_of(Aret["median"]), pct_of(Aret["min"]))
+            + untested +
+            "The engineering decision this block was built to make: fan out from "
+            "an expensive checkpoint AND converge -- at this width and fork cost "
+            "the convergence pays for itself.")
+    why = ("; ".join(f"{i['cell']} {i['why']}" for i in dep["invalid_cells"])
+           or "an endpoint is missing or not a number")
+    return (
+        "Is Farplane useful for LLM fan-out exploration? On this block the "
+        "ITERATION QUESTION IS NOT ANSWERED. " + mechanics +
+        "What is NOT established here: anything for or against convergent "
+        "iteration. The pre-registered rule needs every cell of the %d-cell "
+        "manifest to be valid and every result row to be bound to its journal "
+        "session; this block is INCONCLUSIVE (%s). An invalid or unbindable cell "
+        "decides NEITHER the null nor the alternative, so the numbers in the "
+        "sections above are DIAGNOSTICS: they describe what the surviving cells "
+        "did, they are not a verdict, and no deployment reading may be taken from "
+        "them -- including the %d-of-%d pair count and the matched-step count, "
+        "which are reported for completeness only. "
+        % (len(MANIFEST), why, dep["pairs_won_by_B"], n_pairs)
+        + untested +
+        "The engineering decision this block was built to make is DEFERRED until "
+        "the invalid cells are re-run: fan-out-ONCE from an expensive checkpoint "
+        "already stands on Exp 1 and on this block's mechanics evidence, and the "
+        "convergent-iteration question needs a clean manifest before any "
+        "pipeline decision rests on it.")
 
 
 # --------------------------------------------------------------------------
@@ -1494,6 +1851,22 @@ def render_md(R: dict) -> str:
       f"`branch_selection` records (dose = one per complete re-convergence) in each "
       f"B cell's journal under `bench/journal/exp2/`.")
     A("")
+    eb = dep["evidence_binding"]
+    A("**Evidence binding.** Every endpoint above is bound to the journal session "
+      "that produced it — by `journal_session` when the result row carries one, "
+      "else by the digest's own `run_finished` identity fields. A row that cannot "
+      "be bound, or a digest merged from several append sessions, is not "
+      "decision-grade evidence.")
+    A("")
+    A(md_table(["cell", "binding", "bound"],
+               [[f["cell"], f["evidence_binding"],
+                 "yes" if f["evidence_bound"] else "**NO**"]
+                for f in dep["floors"]]))
+    A("")
+    if not eb["all_bound"]:
+        A("> Unbindable cells: " + ", ".join(f"`{c}`" for c in eb["unbound_cells"])
+          + " — reported, refused for the verdict.")
+        A("")
     if dep["decision_grade"]:
         A(f"All six primary endpoints are valid (**{dep['all_endpoints_valid']}**): "
           f"every B cell cleared both floors, every cell reported `status=ok`, so "
@@ -1701,9 +2074,14 @@ def render_md(R: dict) -> str:
       "healthy branches, and the line then decayed *after* the last convergence.")
     A("")
     for t in dec["B_post_convergence_trails"]:
-        A(f"- **`{t['cell']}`** — last convergence at t={t['last_convergence_t_s']:.0f}s "
-          f"picked **{t['selection_quality']:.2f}**; the promoted line then probed: "
-          + (", ".join(f"{p['throughput']:.1f}@{p['t_s']:.0f}s"
+        if t.get("note"):
+            A(f"- **`{t['cell']}`** — {t['note']}.")
+            continue
+        A(f"- **`{t['cell']}`** — last convergence at "
+          f"t={fmt(t['last_convergence_t_s'], 0)}s "
+          f"picked **{fmt(t['selection_quality'], 2)}**; the promoted line then "
+          f"probed: "
+          + (", ".join(f"{fmt(p['throughput'], 1)}@{fmt(p['t_s'], 0)}s"
                        for p in t["post_convergence_probes"]) or "no further probe "
              "before T (only 27 post-convergence steps, below the m=33 parity cadence)")
           + ".")
@@ -1740,7 +2118,7 @@ def render_md(R: dict) -> str:
             continue
         A(f"- **`{r['cell']}`** (winning seat `{r['winning_seat']}`, "
           f"{r['seats_that_lost_ground']}/8 seats lost >10% of their peak): "
-          + ", ".join(f"{s['seat']} {s['peak']:.0f}→{s['terminal']:.0f}"
+          + ", ".join(f"{s['seat']} {fmt(s['peak'], 0)}→{fmt(s['terminal'], 0)}"
                       for s in r["per_seat_peak_vs_terminal"]))
     A("")
     A("> Source: per-seat `probe` records (`parity` + `terminal`) in each `AxK-…` "
@@ -1755,16 +2133,22 @@ def render_md(R: dict) -> str:
     A("")
     A(md_table(["pair", "matched step", "B line", "B source", "A×K best-of-8",
                 "Δ", "B/A×K", "winner", "B arm step records", "A×K step records to T"],
-               [[f"r{r['replicate']}", r["matched_step"], fmt(r["B_line_throughput"], 3),
-                 r["B_line_source"], fmt(r["AxK_best_of_8"], 3), fmt(r["delta"], 3),
-                 fmt(r["ratio"], 3), r["winner"], r["B_arm_total_step_records"],
-                 r["AxK_arm_step_records_to_T"]] for r in ms["rows"]]))
+               [[f"r{r['replicate']}", r["matched_step"],
+                 fmt(r.get("B_line_throughput"), 3),
+                 r.get("B_line_source") or r.get("note"),
+                 fmt(r.get("AxK_best_of_8"), 3), fmt(r.get("delta"), 3),
+                 fmt(r.get("ratio"), 3), r.get("winner"),
+                 r.get("B_arm_total_step_records"),
+                 r.get("AxK_arm_step_records_to_T")] for r in ms["rows"]]))
     A("")
     A("Per-seat values at the matched depth:")
     A("")
     for r in ms["rows"]:
+        if r["matched_step"] is None:
+            A(f"- r{r['replicate']}: {r.get('note', 'no matched depth')}")
+            continue
         A(f"- r{r['replicate']} @ step {r['matched_step']}: "
-          + ", ".join(f"{k} {v:.1f}" for k, v in r["AxK_seat_throughputs"].items()))
+          + ", ".join(f"{k} {fmt(v, 1)}" for k, v in r["AxK_seat_throughputs"].items()))
     A("")
     A(f"> Source: B line from `branch_selection` winner probes at each round boundary "
       f"plus `probe` records (`branch=\"main\"`) on the promoted line; A×K from "
@@ -1818,10 +2202,10 @@ def render_md(R: dict) -> str:
     A("")
     A("```mermaid")
     A("graph LR")
-    A(f"  D0[\"dose 0 · A×K<br/>{dr['points'][0]['value']:.1f}\"] --> "
-      f"D1[\"dose 1 · B-once<br/>{dr['points'][1]['value']:.1f}\"]")
-    A(f"  D1 --> D23[\"dose 2-3 · B-iterated<br/>{dr['points'][2]['value']:.1f}\"]")
-    A(f"  F[\"no fan-out · A-continue<br/>{dr['floor']['value']:.1f}\"]")
+    A(f"  D0[\"dose 0 · A×K<br/>{fmt(dr['points'][0]['value'], 1)}\"] --> "
+      f"D1[\"dose 1 · B-once<br/>{fmt(dr['points'][1]['value'], 1)}\"]")
+    A(f"  D1 --> D23[\"dose 2-3 · B-iterated<br/>{fmt(dr['points'][2]['value'], 1)}\"]")
+    A(f"  F[\"no fan-out · A-continue<br/>{fmt(dr['floor']['value'], 1)}\"]")
     A("```")
     A("")
 
@@ -1836,11 +2220,11 @@ def render_md(R: dict) -> str:
     rows = []
     for r in wc["per_cell"]:
         a = r["attributed_s"]
-        rows.append([r["cell"], fmt(r["wall_s"], 0), fmt(a["llm_wait"], 0),
-                     fmt(a["infra_fork"], 0), fmt(a["infra_snapshot"], 0),
-                     fmt(a["infra_expose"], 0), fmt(a["infra_delete"], 0),
-                     fmt(a["infra_poll"], 0), fmt(a["probe"], 0),
-                     fmt(a["rollout_exec"], 0), fmt(a["other"], 0),
+        rows.append([r["cell"], fmt(r["wall_s"], 0), fmt(a.get("llm_wait"), 0),
+                     fmt(a.get("infra_fork"), 0), fmt(a.get("infra_snapshot"), 0),
+                     fmt(a.get("infra_expose"), 0), fmt(a.get("infra_delete"), 0),
+                     fmt(a.get("infra_poll"), 0), fmt(a.get("probe"), 0),
+                     fmt(a.get("rollout_exec"), 0), fmt(a.get("other"), 0),
                      fmt(r["infra_fraction_attributed"], 3)])
     A(md_table(["cell", "wall", "llm_wait", "fork", "snapshot", "expose", "delete",
                 "poll", "probe", "rollout_exec", "other", "infra frac"], rows))
@@ -1853,9 +2237,12 @@ def render_md(R: dict) -> str:
     A("")
     A(md_table(["cell", "raw llm_wait", "raw fork", "raw probe", "raw rollout_exec",
                 "raw/wall"],
-               [[r["cell"], fmt(r["raw_s"]["llm_wait"], 0), fmt(r["raw_s"]["infra_fork"], 0),
-                 fmt(r["raw_s"]["probe"], 0), fmt(r["raw_s"]["rollout_exec"], 0),
-                 fmt(sum(r["raw_s"].values()) / r["wall_s"], 2)]
+               [[r["cell"], fmt(r["raw_s"].get("llm_wait"), 0),
+                 fmt(r["raw_s"].get("infra_fork"), 0),
+                 fmt(r["raw_s"].get("probe"), 0),
+                 fmt(r["raw_s"].get("rollout_exec"), 0),
+                 fmt(sum(v for v in r["raw_s"].values() if is_num(v)) / r["wall_s"], 2)
+                 if r["wall_s"] else None]
                 for r in wc["per_cell"]]))
     A("")
     A(f"> Source: `bench/results/exp2_block_codex.json` :: `runs[].timings`, itself "
@@ -1913,7 +2300,8 @@ def render_md(R: dict) -> str:
                 "incident taxonomy (n, first t, last t)"],
                [[f"`{Path(r['journal']).name}`", r["llm_calls"], r["llm_errors"],
                  r["retried_attempts"],
-                 "; ".join(f"{k} n={v['n']} [{v['first_t_s']:.0f}–{v['last_t_s']:.0f}s]"
+                 "; ".join(f"{k} n={v['n']} "
+                           f"[{fmt(v['first_t_s'], 0)}–{fmt(v['last_t_s'], 0)}s]"
                            for k, v in r["incident_taxonomy"].items()) or "none"]
                 for r in cdv["rows"]]))
     A("")
@@ -1992,14 +2380,14 @@ def render_md(R: dict) -> str:
       "AxK|k3|r1 shows 8,101 vs 1,495, and B|k3|r2 shows 1,353 vs ZERO.")
     A("")
     an = k3["anecdote"]
-    A("> ### ANECDOTE — `%s` = %.1f" % (an["cell"], an["endpoint"]))
+    A("> ### ANECDOTE — `%s` = %s" % (an["cell"], fmt(an["endpoint"], 1)))
     A("> ")
-    A("> The one clean iterated run in the k3 block: endpoint **%.1f** "
-      "(%d items / 3600 ticks) at T, **dose %d**, **k_effective %s**, "
-      "**%d** LLM calls at **%.1fs** mean latency, **zero** unrecovered provider "
+    A("> The one clean iterated run in the k3 block: endpoint **%s** "
+      "(%s items / 3600 ticks) at T, **dose %s**, **k_effective %s**, "
+      "**%s** LLM calls at **%ss** mean latency, **zero** unrecovered provider "
       "failures, **zero** 403s."
-      % (an["endpoint"], an["endpoint_items"], an["dose"], an["k_effective"],
-         an["llm_calls"], an["llm_mean_s"]))
+      % (fmt(an["endpoint"], 1), fmt(an["endpoint_items"]), fmt(an["dose"]),
+         an["k_effective"], fmt(an["llm_calls"]), fmt(an["llm_mean_s"], 1)))
     A("> ")
     A("> **Evidence boundary.** %s" % an["evidence_boundary"])
     A("")
@@ -2030,7 +2418,8 @@ def render_md(R: dict) -> str:
     A("")
 
     # ---- 10. ANSWER ----
-    A("## 10. The honest answer")
+    A("## 10. " + ("The honest answer" if dep["verdict_state"] != "INCONCLUSIVE"
+                   else "The honest answer: this block does not answer it"))
     A("")
     A(R["final_answer"])
     A("")
@@ -2044,12 +2433,14 @@ def main() -> int:
     except (ManifestError, DigestError) as exc:
         print(f"[analyze] REFUSED: {exc}", file=sys.stderr)
         return 1
-    md = render_md(R)
+    # the JSON artifact is the evidence and is written FIRST: a rendering fault
+    # in the prose must never cost the analysis it describes.
     atomic_write_json(OUT_JSON, R, indent=1)
-    OUT_MD.write_text(md)
     print(f"wrote {OUT_JSON} ({OUT_JSON.stat().st_size/1024:.0f} KB)")
-    print(f"wrote {OUT_MD} ({OUT_MD.stat().st_size/1024:.0f} KB)")
     print("VERDICT:", R["verdict_headline"])
+    md = render_md(R)
+    OUT_MD.write_text(md)
+    print(f"wrote {OUT_MD} ({OUT_MD.stat().st_size/1024:.0f} KB)")
     return 0
 
 

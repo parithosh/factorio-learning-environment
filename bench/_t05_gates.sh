@@ -26,7 +26,18 @@ for pair in "kimi-for-coding:kfc" "codex/gpt-5.6-sol:codex"; do
   else
     fail_flag=(--fail)
   fi
-  if ! curl -sS "${fail_flag[@]}" -m 120 -X POST "${BAKE}/reset" \
+  # The bake bridge over TCP requires the shared token; without the header every
+  # /reset answers 401 and every model loses its measurement. The token is only
+  # ever expanded inside the argument array -- never echoed, never in a
+  # command trace -- so it does not leak into the gate log.
+  auth=()
+  if [[ -n "${FLE_BRIDGE_TOKEN:-}" ]]; then
+    auth=(-H "Authorization: Bearer ${FLE_BRIDGE_TOKEN}")
+  fi
+  # ${auth[@]+...}: an empty array under `set -u` is an error before bash 4.4,
+  # and an unauthenticated bridge must still get its reset.
+  if ! curl -sS "${fail_flag[@]}" ${auth[@]+"${auth[@]}"} -m 120 \
+       -X POST "${BAKE}/reset" \
        -H 'content-type: application/json' -d '{}'; then
     echo
     echo "== FAILED reset for ${model}: the factory it would measure is the"

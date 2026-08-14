@@ -23,10 +23,14 @@ Protocol implemented here, exactly as specified:
    captured with ``/state-save`` and restored onto EVERY child (the capture
    source included, so the treatment is uniform) with ``/state-restore``
    immediately before the rollouts start, so all K branches begin from
-   identical world content.  Per-child game ticks are recorded either way; if
+   identical world content -- and the barrier must PROVE it: every surviving
+   child's post-restore entity count has to be readable and identical, a child
+   whose count cannot be read is dropped as a missing draw, and counts that
+   disagree ABORT the wave.  Per-child game ticks are recorded either way; if
    the bridge's state endpoints are unavailable the wave runs only while the
-   measured tick skew is inside ``Exp1Config.barrier_skew_tolerance_ticks`` and
-   is ABORTED with no draws past it.  Then all 8 branches run CONCURRENTLY,
+   measured tick skew (UNKNOWN, hence an abort, when any child's tick cannot be
+   read) is inside ``Exp1Config.barrier_skew_tolerance_ticks`` and is ABORTED
+   with no draws past it.  Then all 8 branches run CONCURRENTLY,
    each with ONE divergent strategy hint injected into its first user turn
    through the existing hints mechanism (:data:`bench.llm.HINT_TEMPLATE`).
    Each branch runs 12 steps and is probed EN ROUTE after steps 4, 8 and 12
@@ -196,14 +200,18 @@ EXPERIMENT_KEY = "exp1-decorrelation-gate"
 
 #: Config keys that define what a recorded draw MEANS. Draws taken under
 #: different values of these are different measurements and are never mixed, so
-#: a resume whose config disagrees on any of them is refused. Everything else
-#: (paths, budgets, bootstrap seed and resamples) is operational: it may change
-#: on a resume and the change is recorded rather than rejected.
+#: a resume whose config disagrees on any of them is refused. ``waves`` is one of
+#: them: the pre-registered wave complement (two, plus a conditional third on
+#: disagreement) is what :func:`evaluate_gate` reads, so growing or shrinking it
+#: mid-measurement changes the verdict's own definition. Everything else (paths,
+#: budgets, bootstrap seed and resamples) is operational: it may change on a
+#: resume and the change is recorded rather than rejected.
 MEASUREMENT_KEYS: tuple[str, ...] = (
     "template_snap",
     "model",
     "task_key",
     "k",
+    "waves",
     "steps",
     "probe_every",
     "bake_steps",
@@ -231,6 +239,27 @@ def config_delta(
         for k in keys
         if saved.get(k) != current.get(k)
     }
+
+
+def recorded_draws(state: Mapping[str, Any]) -> int:
+    """How many SCORED draws a results file already holds.
+
+    A state with draws is evidence under one protocol: it is what makes a
+    resume's config agreement load-bearing (see :meth:`Exp1Runner._load_state`).
+    A branch counts once it has at least one probe score; an aborted wave, a
+    bake-only state and a wave of pure failures hold none.
+    """
+    total = 0
+    for wave in state.get("waves") or []:
+        if not isinstance(wave, Mapping):
+            continue
+        for branch in wave.get("branches") or []:
+            scores = branch.get("scores") if isinstance(branch, Mapping) else None
+            if isinstance(scores, Mapping) and any(
+                v is not None for v in scores.values()
+            ):
+                total += 1
+    return total
 
 
 #: Timing-summary fields that are RATIOS or bookkeeping, not additive seconds.
@@ -1017,9 +1046,21 @@ class BarrierSkewError(RuntimeError):
     """A wave's children could not be released from a common start.
 
     Raised after the wave's evidence (barrier record, per-branch reasons) is
-    saved: an unequal start is a repeatable confound under positional hints, so
-    the wave is recorded with no draws instead of being measured.
+    saved: an unequal -- or merely unverified -- start is a repeatable confound
+    under positional hints, so the wave is recorded with no draws instead of
+    being measured. Either the start skew was unknown or past tolerance, or the
+    state round-trip did not leave the survivors on one verified world.
     """
+
+
+#: Barrier outcomes that are NOT a measurable start: an unknown/too-large start
+#: skew, or a state round-trip whose result could not be shown to be one world.
+BARRIER_ABORTS: frozenset[str] = frozenset({"aborted_skew", "aborted_content"})
+
+
+def barrier_aborted(barrier: Mapping[str, Any]) -> bool:
+    """Did this barrier record refuse to release its wave?"""
+    return barrier.get("outcome") in BARRIER_ABORTS
 
 
 def _tick_or_none(meta: Mapping[str, Any]) -> int | None:
@@ -1036,8 +1077,18 @@ def _tick_or_none(meta: Mapping[str, Any]) -> int | None:
 
 
 def _skew(ticks: Iterable[int | None]) -> int | None:
-    """Spread of the readable ticks; ``None`` when none of them is readable."""
-    known = [t for t in ticks if t is not None]
+    """Spread of the ticks; ``None`` when ANY of them is unreadable.
+
+    The spread of a SUBSET is not the wave's start skew: it would let a pair of
+    agreeing children pass the tolerance while a child whose tick could not be
+    read is released anyway, which is the confound the tolerance exists to catch.
+    A wave with no children measures nothing, so an empty input is ``None`` too.
+    """
+    known: list[int] = []
+    for tick in ticks:
+        if tick is None:
+            return None
+        known.append(tick)
     return max(known) - min(known) if known else None
 
 
@@ -1115,8 +1166,12 @@ class Exp1Runner:
         Resuming it with a different value for any of :data:`MEASUREMENT_KEYS`
         would mix two measurements under one verdict, and an unreadable file used
         to be replaced by a fresh state (silently overwriting the run it could
-        not parse). Both are refused. Operational changes -- paths, budget,
-        bootstrap seed and resamples -- are allowed and recorded.
+        not parse). Both are refused. So is resuming a file that ALREADY HOLDS
+        DRAWS but is silent about a measurement key: an unrecorded key is an
+        unverifiable one, and analysing pre-barrier draws under the barriered
+        protocol is the same confound as analysing draws from another config.
+        Operational changes -- paths, budget, bootstrap seed and resamples -- are
+        allowed and recorded.
         """
         path = self.cfg.results_path
         current = self.cfg.to_dict()
@@ -1158,6 +1213,25 @@ class Exp1Runner:
                 "to this measurement; pass a new --results path."
             )
         recorded = [k for k in MEASUREMENT_KEYS if k in saved]
+        legacy = [k for k in MEASUREMENT_KEYS if k not in saved]
+        drawn = recorded_draws(state)
+        # A key the saved config never recorded cannot be COMPARED, so checking
+        # only the recorded ones lets a file predating a measurement key resume
+        # under the new protocol -- exactly how draws taken before the fork
+        # barrier existed would end up analysed as if they had been barriered.
+        # Once the file holds draws, silence about a measurement key is a
+        # mismatch: it is refused with the same instruction as a disagreement.
+        if legacy and drawn:
+            raise RuntimeError(
+                f"refusing to resume {path}: it holds {drawn} recorded draw(s) but "
+                "its config never recorded "
+                + ", ".join(legacy)
+                + f" (now {', '.join(f'{k}={current.get(k)!r}' for k in legacy)}), so "
+                "those draws cannot be shown to have been measured under this "
+                "protocol. Draws from two measurement configs are never mixed under "
+                "one verdict: run this config into a NEW --results (and --report) "
+                "path, and keep this file as the record of the older measurement."
+            )
         mismatch = config_delta(saved, current, recorded)
         if mismatch:
             raise RuntimeError(
@@ -1172,11 +1246,11 @@ class Exp1Runner:
                 "or restore the recorded config to continue this one."
             )
         fingerprint = measurement_fingerprint(current)
-        # Keys this file predates cannot be checked -- they are named in the
-        # artefact rather than waved through silently.
-        legacy = [k for k in MEASUREMENT_KEYS if k not in saved]
+        # No draws yet: the file is a bake-only (or all-aborted) state, so a key
+        # it predates is named in the artefact rather than waved through silently.
         if legacy:
             fingerprint["legacy_unrecorded_keys"] = legacy
+            fingerprint["legacy_unrecorded_draws"] = drawn
         ops = config_delta(
             saved, current, [k for k in current if k not in MEASUREMENT_KEYS]
         )
@@ -1404,10 +1478,10 @@ class Exp1Runner:
         # measured until they are back on a common start (see _release_barrier).
         unusable: dict[int, str] = {}
         barrier = await self._release_barrier(w, nodes, unusable)
-        if barrier.get("outcome") == "aborted_skew":
-            # An unequal start is not a measurement: the children are torn down,
-            # the wave is recorded with no draws, and the abort is re-raised
-            # after the evidence is saved.
+        if barrier_aborted(barrier):
+            # An unequal -- or unverified -- start is not a measurement: the
+            # children are torn down, the wave is recorded with no draws, and the
+            # abort is re-raised after the evidence is saved.
             await asyncio.gather(
                 *(self._delete(node) for node in nodes.values()),
                 return_exceptions=True,
@@ -1458,7 +1532,7 @@ class Exp1Runner:
             "wave": w,
             "snapshot": s2,
             "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "status": "aborted" if barrier.get("outcome") == "aborted_skew" else "ok",
+            "status": "aborted" if barrier_aborted(barrier) else "ok",
             "k_requested": cfg.k,
             "k_drawn": sum(1 for b in branches if b["status"] == "ok"),
             "required_draws": self.required_draws,
@@ -1467,18 +1541,33 @@ class Exp1Runner:
             "branches": branches,
             "metrics": wave_metrics(branches, self.ms),
         }
+        # Every ATTEMPT at this wave number, kept out of ``waves`` so the gate
+        # keeps reading one record per wave: a retry REPLACES the wave record, so
+        # without this ledger a successful retry would erase the evidence that an
+        # earlier attempt was aborted at the barrier (see :meth:`analyze`).
+        attempts: list[dict[str, Any]] = self.state.setdefault("wave_attempts", [])
+        attempts.append({
+            "wave": w,
+            "attempt": sum(1 for a in attempts if a.get("wave") == w) + 1,
+            "utc": wave_rec["started_utc"],
+            "status": wave_rec["status"],
+            "k_drawn": wave_rec["k_drawn"],
+            "barrier_outcome": barrier.get("outcome"),
+            "abort_reason": barrier.get("abort_reason"),
+        })
         self.state["waves"] = [
             x for x in self.state.get("waves", []) if x.get("wave") != w
         ] + [wave_rec]
         self.state["waves"].sort(key=lambda x: x["wave"])
         self.journal.event("wave_done", wave=w, k_drawn=wave_rec["k_drawn"],
                            status=wave_rec["status"],
+                           attempt=attempts[-1]["attempt"],
                            barrier=barrier.get("outcome"),
                            metrics={m: {k: v for k, v in rec.items()
                                         if not k.startswith("_")}
                                     for m, rec in wave_rec["metrics"].items()})
         self.save()
-        if barrier.get("outcome") == "aborted_skew":
+        if barrier_aborted(barrier):
             raise BarrierSkewError(barrier["abort_reason"])
         return wave_rec
 
@@ -1527,8 +1616,13 @@ class Exp1Runner:
         baseline after this, so those resets are inside every draw's baseline.
 
         A child whose restore fails is DROPPED as a missing draw -- never left to
-        run from an unequal start. If the state endpoints are unavailable at all,
-        the wave proceeds only while the measured tick skew is inside
+        run from an unequal start. The round-trip then has to PROVE it: every
+        survivor's post-restore entity count must be readable and identical. A
+        survivor whose count cannot be read is dropped as a missing draw too, and
+        counts that DISAGREE (or none readable at all) abort the wave -- nothing
+        says which of two worlds the barrier meant to produce. If the state
+        endpoints are unavailable at all, the wave proceeds only while the measured
+        tick skew (unknown when ANY child's tick is unreadable) is inside
         ``cfg.barrier_skew_tolerance_ticks``, and is aborted past it.
         """
         if not nodes:
@@ -1592,9 +1686,10 @@ class Exp1Runner:
                 if node is not None:
                     await self._delete(node)
             post = await self._child_meta(w, nodes) if nodes else {}
-            counts = [
-                m["entity_count"] for m in post.values() if m["entity_count"] is not None
-            ]
+            counts = {f"w{w}b{i}": post[i]["entity_count"] for i in sorted(post)}
+            readable = {b: c for b, c in counts.items() if c is not None}
+            unreadable = [b for b, c in counts.items() if c is None]
+            distinct = sorted(set(readable.values()))
             rec.update(
                 # No survivor is not an equalised wave: it is a wave with no
                 # usable child left, and every branch is already recorded as a
@@ -1604,14 +1699,15 @@ class Exp1Runner:
                 restore_failed=failed,
                 post_ticks={f"w{w}b{i}": post[i]["tick"] for i in sorted(post)},
                 post_skew_ticks=_skew(m["tick"] for m in post.values()),
-                post_entity_counts={
-                    f"w{w}b{i}": post[i]["entity_count"] for i in sorted(post)
-                },
-                # Restoring identical state must leave identical world content.
-                # The reads are a few milliseconds apart on separate running
-                # worlds, so a mismatch is reported (and journaled) rather than
-                # treated as proof of failure.
-                entity_counts_equal=bool(counts) and len(set(counts)) == 1,
+                post_entity_counts=counts,
+                # Restoring identical state must leave identical world content, so
+                # this is the barrier's own proof and every survivor has to carry
+                # it: a count that DIFFERS or cannot be READ leaves that child's
+                # start unverified.
+                entity_counts_equal=(
+                    bool(readable) and not unreadable and len(distinct) == 1
+                ),
+                entity_counts_unreadable=unreadable,
                 tick_note=(
                     "/state-restore transplants the world without rewinding the "
                     "Factorio clock, so per-child game ticks stay apart; what the "
@@ -1620,27 +1716,78 @@ class Exp1Runner:
                 ),
                 wall_s=round(time.monotonic() - t0, 3),
             )
-            if not rec["entity_counts_equal"]:
+            if restored and not rec["entity_counts_equal"]:
                 self.run.incident(
                     "barrier_content_unverified",
-                    f"post-restore entity counts differ: {rec['post_entity_counts']}",
+                    f"post-restore entity counts are not one verified value: "
+                    f"{counts}",
                     wave=w,
                 )
+                if len(distinct) > 1 or not readable:
+                    # Nothing identifies which world the barrier was supposed to
+                    # produce, so no child's start is verified: the wave is
+                    # aborted rather than measured from an unproven common state.
+                    rec.update(
+                        outcome="aborted_content",
+                        abort_reason=(
+                            f"wave {w}: the state round-trip did not leave the "
+                            "children on one world -- post-restore entity counts "
+                            + (
+                                f"disagree ({counts})"
+                                if len(distinct) > 1
+                                else f"could not be read at all ({counts})"
+                            )
+                            + ", so the common start is unverified and the wave is "
+                            "aborted rather than measured"
+                        ),
+                    )
+                else:
+                    # Every readable survivor agrees; the children whose content
+                    # could not be read are dropped as missing draws instead of
+                    # being released on an unverified start.
+                    for branch in unreadable:
+                        idx = int(branch.split("b")[-1])
+                        unusable[idx] = (
+                            "barrier content unverified -- post-restore entity "
+                            f"count unreadable (others agree at {distinct[0]}); "
+                            "dropped as a missing draw"
+                        )
+                        node = nodes.pop(idx, None)
+                        if node is not None:
+                            await self._delete(node)
+                    rec["content_unverified_dropped"] = unreadable
+                    rec["restored"] = [b for b in restored if b not in unreadable]
+                    rec["verified_entity_count"] = distinct[0]
+                    rec["wall_s"] = round(time.monotonic() - t0, 3)
+                    if not rec["restored"]:
+                        rec.update(
+                            outcome="aborted_content",
+                            abort_reason=(
+                                f"wave {w}: every child released by the state "
+                                "round-trip had to be dropped as content-unverified "
+                                f"({counts}), leaving no measured draw"
+                            ),
+                        )
             self.journal.event("wave_barrier", wave=w, **rec)
+            if barrier_aborted(rec):
+                self.run.incident("barrier_aborted", rec["abort_reason"], wave=w)
             return rec
         # Degraded path: no state round-trip available, so the only defence is
         # the measured skew itself.
         skew = rec["pre_skew_ticks"]
         tolerance = self.cfg.barrier_skew_tolerance_ticks
         if skew is None:
+            unread = [b for b, t in rec["pre_ticks"].items() if t is None]
+            rec["unreadable_pre_ticks"] = unread
             rec.update(
                 outcome="aborted_skew",
                 abort_reason=(
                     f"wave {w}: the children could not be equalised "
-                    f"({rec.get('capture_error', 'no state capture')}) and no "
-                    "child's game tick could be read, so the start skew is "
-                    "unknown -- the wave is aborted rather than measured from an "
-                    "unverified start"
+                    f"({rec.get('capture_error', 'no state capture')}) and the game "
+                    f"tick of {', '.join(unread) or 'every child'} could not be "
+                    "read, so the wave's start skew is unknown -- the readable "
+                    "children's spread is not this wave's skew, so the wave is "
+                    "aborted rather than measured from an unverified start"
                 ),
             )
         elif skew > tolerance:
@@ -1669,7 +1816,7 @@ class Exp1Runner:
             )
         rec["wall_s"] = round(time.monotonic() - t0, 3)
         self.journal.event("wave_barrier", wave=w, **rec)
-        if rec["outcome"] == "aborted_skew":
+        if barrier_aborted(rec):
             self.run.incident("barrier_aborted", rec["abort_reason"], wave=w)
         return rec
 
@@ -1843,14 +1990,33 @@ class Exp1Runner:
         for per_arm in endpoints_by_arm:
             for label, values in per_arm.items():
                 pooled_by_arm.setdefault(label, []).extend(values)
+        # Abort accounting survives a RETRY: the retry replaces the wave record in
+        # ``waves``, so the aborted attempt is only still visible in the attempt
+        # ledger. The gate above reads ``waves`` (the successful attempt) alone;
+        # this is evidence, not input to the verdict.
+        attempts = [
+            a for a in (self.state.get("wave_attempts") or []) if isinstance(a, dict)
+        ]
+        aborted_waves = sorted(
+            {
+                x["wave"] for x in self.state.get("waves", [])
+                if x.get("status") == "aborted" and x.get("wave") is not None
+            }
+            | {
+                a["wave"] for a in attempts
+                if a.get("status") == "aborted" and a.get("wave") is not None
+            }
+        )
+        completed = {w["wave"] for w in waves}
         analysis: dict[str, Any] = {
             "ms": list(self.ms),
             "endpoint_m": endpoint_m,
             "waves_completed": [w["wave"] for w in waves],
-            "waves_aborted": [
-                x["wave"] for x in self.state.get("waves", [])
-                if x.get("status") == "aborted"
+            "waves_aborted": aborted_waves,
+            "waves_aborted_then_completed": [
+                x for x in aborted_waves if x in completed
             ],
+            "wave_attempts": attempts,
             "required_draws_per_wave": self.required_draws,
             "read_point": self.state.get("read_point"),
             "barriers": [
@@ -1865,6 +2031,8 @@ class Exp1Runner:
                             "outcome", "source_child", "tolerance_ticks",
                             "pre_skew_ticks", "post_skew_ticks",
                             "entity_counts_equal", "restore_failed",
+                            "entity_counts_unreadable", "content_unverified_dropped",
+                            "verified_entity_count", "abort_reason",
                         )
                     },
                 }
@@ -2682,6 +2850,9 @@ def render_report(state: dict[str, Any]) -> str:
         A("|---|---|---|---|---|---|---|---|")
         for b in barriers:
             failed = b.get("restore_failed") or []
+            dropped = [f["branch"] for f in failed] + list(
+                b.get("content_unverified_dropped") or []
+            )
             A(
                 f"| {b.get('wave')} | {b.get('outcome','-')} | "
                 f"{b.get('source_child') or '-'} | "
@@ -2689,7 +2860,7 @@ def render_report(state: dict[str, Any]) -> str:
                 f"{b.get('post_skew_ticks') if b.get('post_skew_ticks') is not None else '-'} | "
                 f"{b.get('tolerance_ticks','-')} | "
                 f"{b.get('entity_counts_equal') if 'entity_counts_equal' in b else '-'} | "
-                f"{', '.join(f['branch'] for f in failed) or 'none'} |"
+                f"{', '.join(dropped) or 'none'} |"
             )
         A("")
         A(
@@ -2697,9 +2868,14 @@ def render_report(state: dict[str, Any]) -> str:
             "clock, so per-child game ticks stay apart after the barrier; what a "
             "probe reads is world CONTENT, and each branch takes its own P5 "
             "baseline immediately after the barrier. A child whose restore failed "
-            "is dropped as a missing draw rather than run from an unequal start; a "
+            "is dropped as a missing draw rather than run from an unequal start, "
+            "and so is a survivor whose post-restore entity count could not be "
+            "read. The barrier must PROVE its result: post-restore entity counts "
+            "that disagree (or cannot be read at all) abort the wave, as does a "
             "wave that could neither be equalised nor shown to be inside the tick "
-            "tolerance is aborted with no draws."
+            "tolerance -- an aborted wave contributes no draws. The measured start "
+            "skew is `-` unless EVERY child's game tick was readable; a subset's "
+            "spread is not the wave's skew."
         )
         unbarriered = [b.get("wave") for b in barriers
                        if b.get("outcome") == "not_recorded"]
@@ -2775,15 +2951,25 @@ def render_report(state: dict[str, Any]) -> str:
             "is systematic, not noise."
         )
     aborted = analysis.get("waves_aborted") or []
+    retried = analysis.get("waves_aborted_then_completed") or []
     if aborted:
         lims.insert(
             0,
             "**Wave(s) "
             + ", ".join(str(w) for w in aborted)
-            + " were ABORTED at the barrier** and contribute no draws: their "
-            "children could not be shown to start from a common state, and an "
-            "unequal start under positional hints is a repeatable confound rather "
-            "than a measurement."
+            + " were ABORTED at the barrier** and that attempt contributed no "
+            "draws: their children could not be shown to start from a common "
+            "state, and an unequal (or unverified) start under positional hints is "
+            "a repeatable confound rather than a measurement."
+            + (
+                " Wave(s) "
+                + ", ".join(str(w) for w in retried)
+                + " were re-run afterwards and the draws above are the SUCCESSFUL "
+                "attempt's; the aborted attempt is kept in `wave_attempts` because "
+                "repeated aborts on a wave number are evidence about the harness, "
+                "not about the strategies."
+                if retried else ""
+            )
         )
     underfilled = (gate.get("underfilled_waves") or []) if gate else []
     if underfilled:

@@ -40,10 +40,12 @@ Dockerfile and forwarded by `supervisord.conf`):
   anything that can route to the host).
 - Client side: `Bridge(url)` defaults its token to `$FLE_BRIDGE_TOKEN`, `Bridge(url,
   token="…")` overrides it, and `Bridge(url, token="")` forces an anonymous client (useful
-  to assert the 401). A 401/403 is raised as a `BridgeError` (`.status` set, never retried,
-  never mistaken for an ingress hiccup) naming which side is wrong, and
-  `wait_healthy()` aborts on it at once instead of polling out its whole deadline — a bad
-  token is a misconfiguration, not a slow boot.
+  to assert the 401). A 401 or 403 is raised as a `BridgeError` (`.status` set, never
+  retried, never mistaken for an ingress hiccup): the 401 names which side of the token is
+  wrong, while a 403 can only be the ingress/proxy refusing the route (the bridge has no
+  403), so it points at the Farplane route instead. `wait_healthy()` aborts on either at
+  once instead of polling out its whole deadline — neither a bad token nor an unpublished
+  route is a slow boot.
 
 Readiness: both listeners are created only **after** full environment init, so a
 successful `GET /health` implies a ready environment (connection-refused == not ready —
@@ -75,8 +77,12 @@ Compressed image for transfer: `/tmp/flebench-image.zst` (401 MiB,
 | unchanged | `/observe` `/score` `/system-prompt` `/game-state` `/reset` `/screenshot`. |
 
 Error responses (all raised as `BridgeError` with `.status` set, none of them retried).
-The server sends `Connection: close` with 400/401/408/411/413 because the request body was
-left unread; the client's `Session` transparently opens a fresh connection next call.
+The server sends `Connection: close` when the request body was left unread — 411, 413, 408
+and the body-framing 400s (malformed/negative `Content-Length`, truncated body, read
+error), plus 401 and 404, which are refused before the body is touched. A 400 raised
+*after* the body was consumed (malformed JSON, non-object JSON) keeps the connection
+alive. Either way the client's `Session` handles it: a closed connection is transparently
+replaced on the next call.
 
 | Status | Body | Cause |
 |---|---|---|
@@ -85,8 +91,14 @@ left unread; the client's `Session` transparently opens a fresh connection next 
 | `408` | `{"error": …}` | the request body stalled mid-read. |
 | `411` | `{"error": …}` | `Transfer-Encoding: chunked`; send `Content-Length` (`requests` does this for `json=`). |
 | `413` | `{"error": "request body exceeds N bytes"}` | body over the cap: 1 MiB, raised to 64 MiB for `/state-restore` and `/reset`. |
-| `500` | `{"error":"internal server error", "correlation_id": "<12 hex>"}` | bridge bug; the traceback stays in `/tmp/fle_bridge.log`. `BridgeError` surfaces the `correlation_id` verbatim — quote it when reporting. |
+| `500` | `{"error":"internal server error", "correlation_id": "<12 hex>"}` | bridge bug; the traceback stays in `/tmp/fle_bridge.log`. `BridgeError` surfaces the `correlation_id` verbatim — quote it when reporting. On a mutating POST it is `ambiguous=True`: the handler can tick the game and *then* raise. |
 | `502/503/504` | ingress HTML | Farplane ingress, not the bridge. Retried up to 3× for GETs; on a mutating POST it raises `BridgeError(ambiguous=True)` instead (a 504 usually means the bridge is *still running* the request). |
+
+Ambiguity rule, in one line: on a non-idempotent call (`/execute` `/probe` `/reset`
+`/state-restore`) **any** 5xx, any transport failure not provably raised before the first
+byte left the socket, and any unparseable 2xx body give `BridgeError(ambiguous=True)`; a
+3xx/4xx is refused before the handler runs and stays unambiguous. `ambiguous=True` means
+reconcile (`/meta`, `/state-save`) or abandon the branch — never replay.
 
 Concurrency model: one RCON connection drives one Factorio process, so every endpoint
 except `/health` serialises behind a single global lock. A `/meta` issued 1 s into a

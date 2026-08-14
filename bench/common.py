@@ -8,7 +8,8 @@ every tier script shares:
 * :class:`RunJournal` -- append-only JSONL evidence: every LLM call with tokens
   and latency, every infra operation, every probe result. Re-runs append, so
   records are grouped into sessions and read back with
-  :func:`load_journal_records`.
+  :func:`load_journal_records`. A tail torn by a killed writer is quarantined
+  to a ``<journal>.torn`` sidecar when the journal is reopened.
 * :class:`Budget` -- wall clock T is the SOLE stopping rule (design v2.3), so
   the deadline is an object that phases interrogate rather than an ad-hoc
   ``time.time()`` comparison scattered through the arm loops.
@@ -21,6 +22,7 @@ reader ever sees a half-written file).
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -286,6 +288,77 @@ class TimingBuckets:
 # ---------------------------------------------------------------------------
 
 
+#: Sidecar holding tails quarantined out of a journal; see :class:`RunJournal`.
+_TORN_SUFFIX = ".torn"
+#: Backwards scan granularity when locating the start of an unterminated line.
+_TORN_SCAN_BLOCK = 65536
+
+
+def _quarantine_torn_tail(path: Path) -> tuple[int, Path] | None:
+    """Move an unterminated final line out of ``path`` into ``path + '.torn'``.
+
+    A journal is reopened in append mode, so a torn last line -- the half
+    written record of a process killed mid-flush -- would be *concatenated*
+    with the next session's ``journal_open``. That spliced line is
+    newline-terminated, so :func:`load_journal_records` no longer sees the one
+    corruption it is allowed to drop (an unterminated tail): it sees
+    permanently malformed evidence in the middle of the file and raises
+    :class:`JournalParseError` on every future strict read, while the new
+    session also loses the ``journal_open`` marker that delimits it. So the
+    fragment is quarantined before the append handle is opened.
+
+    The fragment is appended to the sidecar (newline-terminated, one fragment
+    per line) rather than dropped: it is still evidence about how the previous
+    writer died. Returns ``(bytes_quarantined, sidecar_path)``, or ``None``
+    when there was nothing to repair.
+
+    ``fcntl.flock`` serialises concurrent *repairs* of one journal (two
+    scripts starting on the same path at once). It does not lock out a live
+    writer: every record is a single flushed append, so an unterminated tail
+    means that writer is gone. A journal we cannot even open for repair is
+    left alone -- the append below will report the real problem -- but a
+    failure while writing the sidecar or truncating propagates: silently
+    appending onto a known-torn tail is exactly the corruption to avoid.
+    """
+    try:
+        fh = path.open("r+b")
+    except OSError:
+        return None  # absent, or not ours to touch
+    with fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError:  # pragma: no cover - fs without advisory locks
+            pass
+        size = fh.seek(0, os.SEEK_END)
+        if size == 0:
+            return None
+        fh.seek(size - 1)
+        if fh.read(1) == b"\n":
+            return None
+        # Walk backwards to the start of the unterminated line.
+        cut, tail, pos = 0, b"", size
+        while pos > 0:
+            step = min(_TORN_SCAN_BLOCK, pos)
+            pos -= step
+            fh.seek(pos)
+            chunk = fh.read(step)
+            nl = chunk.rfind(b"\n")
+            if nl >= 0:
+                cut = pos + nl + 1
+                tail = chunk[nl + 1:] + tail
+                break
+            tail = chunk + tail
+        sidecar = path.with_name(path.name + _TORN_SUFFIX)
+        with sidecar.open("ab") as sink:
+            sink.write(tail + b"\n")
+            sink.flush()
+            os.fsync(sink.fileno())
+        fh.truncate(cut)
+        fh.flush()
+        os.fsync(fh.fileno())
+        return len(tail), sidecar
+
+
 class RunJournal:
     """Append-only JSONL evidence file for one run (or one tier script).
 
@@ -304,6 +377,15 @@ class RunJournal:
     it blindly double-counts reruns. Readers MUST go through
     :func:`load_journal_records`, which returns one session at a time and
     defaults to the latest.
+
+    A torn tail -- the unterminated last line of a writer that died mid-flush
+    -- is quarantined at construction, *before* the append handle is opened:
+    the fragment moves to ``<path>.torn`` (append mode, one newline-terminated
+    fragment per line) and is truncated from the journal, under
+    ``fcntl.flock`` on the journal file. Without that, this session's
+    ``journal_open`` would be spliced onto the fragment, producing a single
+    permanently malformed line that breaks every later strict read and hides
+    the session boundary. The quarantine is journalled as an incident.
     """
 
     def __init__(self, path: str | os.PathLike[str], run_id: str | None = None,
@@ -315,11 +397,23 @@ class RunJournal:
         self.session = uuid.uuid4().hex[:12]
         self._lock = threading.Lock()
         self._seq = 0
+        # Before the append handle exists: a tail torn by a dead writer must
+        # not get this session's journal_open spliced onto it (R2C5).
+        torn = _quarantine_torn_tail(self.path)
         self._fh = self.path.open("a", encoding="utf-8")
         self.counts: dict[str, int] = {}
         # Unconditional: the session boundary is what keeps an appended journal
         # readable, so it must not depend on the caller passing meta.
         self.event("journal_open", **(meta or {}))
+        if torn is not None:
+            torn_bytes, sidecar = torn
+            self.incident(
+                kind="journal_torn_tail",
+                detail=(f"quarantined {torn_bytes} unterminated byte(s) left by a "
+                        "previous writer"),
+                torn_bytes=torn_bytes,
+                sidecar=str(sidecar),
+            )
 
     # -- primitives --------------------------------------------------------
     def write(self, kind: str, **fields: Any) -> dict[str, Any]:
@@ -510,17 +604,121 @@ class RunJournal:
         self.close()
 
 
+def _type_name(obj: Any) -> str:
+    try:
+        return type(obj).__name__
+    except Exception:  # pragma: no cover - hostile metaclass
+        return "object"
+
+
+def _unserializable(obj: Any) -> str:
+    """The one fixed shape a value degrades to when nothing else works."""
+    return f"<unserializable: {_type_name(obj)}>"
+
+
+#: Depth ceiling for :func:`_jsonable`. Cycles are broken by identity, but a
+#: legitimately deep structure would still blow the stack, here or inside
+#: ``json.dumps``; a sentinel at depth is better than a dead run.
+_JSONABLE_MAX_DEPTH = 32
+
+
 def _jsonable(obj: Any) -> Any:
+    """``json.dumps(default=...)`` hook that is guaranteed not to raise.
+
+    Journal writes are evidence collection: a payload the harness cannot
+    represent must degrade to a placeholder, never take the run down. Every
+    step here touches arbitrary user code -- ``model_dump``/``to_dict``/
+    ``_asdict`` lookup *and* call, ``vars()``, ``repr()``, container iteration
+    -- so each is guarded individually. And the *whole* returned structure is
+    sanitized, not just its top level, because ``json.dumps`` walks what we
+    hand back and would otherwise still raise on an unsupported dict key or a
+    reference cycle (its own circular-reference check never sees the fresh
+    containers built here). Values json already renders are passed through
+    untouched, so well-behaved payloads serialize to identical bytes.
+    """
+    return _sanitize(obj, set(), 0)
+
+
+def _sanitize(obj: Any, seen: set[int], depth: int) -> Any:
+    # Atoms json renders itself; passing them through byte-for-byte is what
+    # keeps well-behaved payloads unchanged.
+    if obj is None or isinstance(obj, (str, bool, int, float)):
+        return obj
+    if depth >= _JSONABLE_MAX_DEPTH:
+        return _unserializable(obj)
+    oid = id(obj)
+    if oid in seen:
+        return f"<cycle: {_type_name(obj)}>"
+    # Identity is tracked along the current path only, so a value shared by
+    # two siblings is still serialized twice rather than called a cycle.
+    seen.add(oid)
+    try:
+        if isinstance(obj, dict):
+            return _sanitize_mapping(obj, seen, depth)
+        if isinstance(obj, (list, tuple)):
+            return _sanitize_sequence(obj, seen, depth)
+        return _sanitize_object(obj, seen, depth)
+    finally:
+        seen.discard(oid)
+
+
+def _sanitize_key(key: Any) -> Any:
+    # json accepts exactly these key types (rendering them as strings) and
+    # refuses everything else outright, so only the rest needs converting.
+    if key is None or isinstance(key, (str, bool, int, float)):
+        return key
+    try:
+        return str(key)
+    except Exception:
+        return _unserializable(key)
+
+
+def _sanitize_mapping(obj: Any, seen: set[int], depth: int) -> Any:
+    try:
+        items = list(obj.items())
+    except Exception:
+        return _unserializable(obj)
+    out: dict[Any, Any] = {}
+    for key, value in items:
+        # Two exotic keys can stringify the same; last one wins, as it would
+        # in json's own key rendering.
+        out[_sanitize_key(key)] = _sanitize(value, seen, depth + 1)
+    return out
+
+
+def _sanitize_sequence(obj: Any, seen: set[int], depth: int) -> Any:
+    out: list[Any] = []
+    try:
+        for item in obj:
+            out.append(_sanitize(item, seen, depth + 1))
+    except Exception:  # a hostile __iter__ / __next__ midway
+        out.append(_unserializable(obj))
+    return out
+
+
+def _sanitize_object(obj: Any, seen: set[int], depth: int) -> Any:
     for attr in ("model_dump", "to_dict", "_asdict"):
-        fn = getattr(obj, attr, None)
-        if callable(fn):
-            try:
-                return fn()
-            except Exception:  # pragma: no cover - defensive
-                pass
-    if hasattr(obj, "__dict__"):
-        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
-    return repr(obj)
+        try:
+            fn = getattr(obj, attr, None)
+            if not callable(fn):
+                continue
+            dumped = fn()
+        except Exception:  # __getattr__ or the call itself misbehaving
+            continue
+        return _sanitize(dumped, seen, depth + 1)
+    try:
+        namespace = vars(obj)
+        items = list(namespace.items())
+    except Exception:  # no __dict__, or a hostile mapping proxy
+        items = None
+    if items is not None:
+        public = {k: v for k, v in items
+                  if not (isinstance(k, str) and k.startswith("_"))}
+        return _sanitize_mapping(public, seen, depth)
+    try:
+        return repr(obj)
+    except Exception:
+        return _unserializable(obj)
 
 
 class JournalParseError(ValueError):

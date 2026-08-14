@@ -688,6 +688,12 @@ class RunResult:
     orphan_forks: list[dict[str, Any]] = field(default_factory=list)
     model_info: dict[str, Any] = field(default_factory=dict)
     journal_path: str = ""
+    #: The :class:`~bench.common.RunJournal` session id every record of this run
+    #: carries (contract R2C3). A journal path is an APPEND stream that may hold
+    #: several sessions, so this id -- not the path -- is what binds a result row
+    #: to the evidence that produced it; a consumer grading a verdict on journal
+    #: digests must match it exactly.
+    journal_session: str = ""
     #: EVERY seat's terminal probe, not just the winning one. Exp 3 judges
     #: max-over-8-at-T in both arms and reports per-seat distributions, so the
     #: losing endpoints are data, not noise, and must survive into the results
@@ -771,6 +777,13 @@ class Infra:
         #: through it. See :meth:`register_orphan_fork`.
         self.orphan_forks: list[dict[str, Any]] = []
         self.orphan_sources: set[str] = set()
+        #: Outcomes of substrate calls whose awaiting coroutine was cancelled at
+        #: a deadline but which CONCLUDED anyway -- either before the
+        #: cancellation reached us or during a later :meth:`drain`. The world
+        #: moved and the result exists, so it is held here for the caller that
+        #: has to commit it (:meth:`ArmRun.settle_node`): dropping it leaves a
+        #: line whose transcript is one program behind its own sandbox.
+        self.recovered: list[dict[str, Any]] = []
 
     # -- internals ---------------------------------------------------------
     def _finished(self, task: "asyncio.Future", rec: dict[str, Any]) -> None:
@@ -809,6 +822,40 @@ class Infra:
             **rec["extra"],
         )
 
+    def _recover(self, task: "asyncio.Future", rec: dict[str, Any]) -> None:
+        """Keep the outcome of a concluded call nobody is awaiting any more.
+
+        A ``/execute`` abandoned at a step deadline still runs to completion in
+        its worker thread. Its result is the only record of what the program did
+        to the sandbox, so it is stashed rather than dropped and
+        :meth:`ArmRun.settle_node` commits it into the line's bookkeeping.
+        """
+        if rec["cancelled"] or not task.done() or task.cancelled():
+            return
+        exc = task.exception()
+        self.recovered.append({
+            "op": rec["op"],
+            "node_id": rec["node_id"],
+            "branch": rec["branch"],
+            "target": rec["target"],
+            "duration_s": (rec["t1"] if rec["t1"] is not None else time.monotonic())
+            - rec["t0"],
+            "result": None if exc is not None else task.result(),
+            "error": exc,
+        })
+
+    def take_recovered(self, op: str, node_id: str, *,
+                       branch: str = "") -> dict[str, Any] | None:
+        """Pop the most recent recovered outcome of ``op`` on one sandbox."""
+        for i in range(len(self.recovered) - 1, -1, -1):
+            entry = self.recovered[i]
+            if entry["op"] != op or entry["node_id"] != node_id:
+                continue
+            if branch and entry["branch"] != branch:
+                continue
+            return self.recovered.pop(i)
+        return None
+
     async def _timed(self, op: str, bucket: str, fn: Callable[[], Any], *,
                      target: str = "", branch: str = "", node_id: str = "",
                      **extra: Any) -> Any:
@@ -829,6 +876,9 @@ class Infra:
             if task.done():
                 self._settle(task, rec,
                              exc=None if rec["cancelled"] else task.exception())
+                # Concluded before the cancellation reached us: the result is
+                # real and the caller still has to commit it.
+                self._recover(task, rec)
             raise
         except BaseException as exc:  # noqa: BLE001 - journaled then re-raised
             self._settle(task, rec, exc=exc)
@@ -866,6 +916,7 @@ class Infra:
                 continue
             exc = None if rec["cancelled"] else task.exception()
             self._settle(task, rec, exc=exc, outcome="settled_after_deadline")
+            self._recover(task, rec)
             out.append({"op": rec["op"], "target": rec["target"],
                         "node_id": rec["node_id"],
                         "outcome": "settled_after_deadline"})
@@ -1102,10 +1153,19 @@ class Trajectory:
     last_ticks: int = 0
     curve: Curve = field(default_factory=Curve)
     terminal_probe: dict[str, Any] | None = None
-    #: Non-empty -> this line's sandbox was left holding a substrate call this
-    #: run could not join, so the line is PARTIAL: it stops stepping and is
-    #: never probed again (see :meth:`ArmRun.settle_node`).
+    #: Non-empty -> this line's transcript and its sandbox have come apart, so
+    #: the line is PARTIAL: it stops stepping and is never probed again. Causes:
+    #: a substrate call this run could not join (:meth:`ArmRun.settle_node`), a
+    #: step result that could not be recovered, an AMBIGUOUS bridge call
+    #: (contract R2C4), or a branch round that left no scorable state
+    #: (:meth:`BranchingRun._round_unscorable`). PARTIAL always implies the
+    #: sandbox is QUARANTINED (:meth:`ArmRun.fail_line`).
     partial: str = ""
+    #: Set when a step's ``/execute`` was abandoned at its deadline and its
+    #: result has NOT been committed yet: ``{"step": int, "code_chars": int}``.
+    #: :meth:`ArmRun.settle_node` commits it from the recovered outcome (the
+    #: program concluded, so the world moved) or ends the line.
+    pending_exec: dict[str, Any] | None = None
 
 
 class ArmRun:
@@ -1173,12 +1233,20 @@ class ArmRun:
         A call that outlives the join quarantines the sandbox and marks the line
         PARTIAL: it stops stepping and is never measured, because there is no
         honest way to measure a factory something else is still building.
+
+        A call that SETTLED during the join is a different story: the program
+        concluded, so the world moved and its result exists -- it just has no
+        reader left. :meth:`commit_recovered_step` writes it into this line's
+        bookkeeping (feedback, score counters, journal record) before the loop
+        reuses the line, and ends the line when the outcome cannot be recovered
+        at all: the next turn would otherwise say "Continue" to a factory the
+        transcript has never seen.
         """
         drained = await self.infra.drain(self.cfg.step_timeout_s,
                                         node_id=traj.node.id)
         stuck = [d for d in drained if d["outcome"] == "abandoned"]
         if not stuck and traj.node.id not in self.infra.abandoned_nodes:
-            return True
+            return self.commit_recovered_step(traj, reason=reason)
         detail = (
             f"{reason}: "
             + (", ".join(f"{d['op']} on {d['target']}" for d in stuck)
@@ -1188,6 +1256,7 @@ class ArmRun:
         )
         self.quarantine(traj.node, detail, branch=traj.tid)
         traj.partial = detail
+        traj.pending_exec = None
         return False
 
     def quarantine(self, node: Node, detail: str, *, branch: str = "") -> None:
@@ -1196,6 +1265,128 @@ class ArmRun:
             return
         self.quarantined.add(node.id)
         self.incident("node_quarantined", detail, target=node.name, branch=branch)
+
+    def fail_line(self, traj: Trajectory, detail: str, *, kind: str) -> None:
+        """End a line whose sandbox this run can no longer account for.
+
+        PARTIAL implies QUARANTINED, always: a line stops because its transcript
+        and its world have come apart, and the only alternative to retiring the
+        sandbox is publishing a probe of it as this line's endpoint.
+        """
+        self.incident(kind, detail, branch=traj.tid, target=traj.node.name)
+        self.quarantine(traj.node, detail, branch=traj.tid)
+        if not traj.partial:
+            traj.partial = detail
+        traj.pending_exec = None
+
+    @staticmethod
+    def is_ambiguous(exc: BaseException) -> bool:
+        """A bridge failure whose effect on the game is UNKNOWN (contract R2C4).
+
+        ``bench.bridge_client`` sets ``ambiguous=True`` on every non-idempotent
+        call (``/execute``, ``/probe``, ``/state-restore``) that hit any 5xx, any
+        transport failure not provably pre-send, or a 2xx it could not parse.
+        Duck-typed on purpose: the fakes and the real client both answer it, and
+        arms.py must not import the HTTP layer to ask.
+        """
+        return bool(getattr(exc, "ambiguous", False))
+
+    def fail_node_ambiguous(self, node: Node, exc: BaseException, *, op: str,
+                            branch: str = "", step: int = 0) -> str:
+        """Retire a sandbox after an ambiguous mutating call (contract R2C4).
+
+        Never retried and never reused: the call may have reached the game and
+        never reported what it did, so nothing measured on this sandbox afterward
+        can be reconciled with the transcript that asked for it.
+        """
+        detail = (
+            f"{op} on {node.name} failed AMBIGUOUSLY "
+            f"({type(exc).__name__}: {exc})"[:600]
+            + f"; the call may have reached the game and never reported what it "
+            f"did, so {node.name} is quarantined without retry"
+        )
+        self.incident("bridge_ambiguous", detail, target=node.name, branch=branch,
+                      step=step, op=op)
+        self.quarantine(node, detail, branch=branch)
+        return detail
+
+    def commit_recovered_step(self, traj: Trajectory, *, reason: str) -> bool:
+        """Commit the step whose ``/execute`` settled after its own deadline.
+
+        The join in :meth:`settle_node` proved nothing is running on this
+        sandbox any more, which means the abandoned program CONCLUDED: it moved
+        the world and produced a result nobody read. Committing it is what keeps
+        the next turn from prompting "Continue" against a factory the transcript
+        never saw -- and what keeps the score counters, the tick baseline and the
+        journal's step record from skipping a step that really ran.
+
+        Returns False (line ended) when the outcome cannot be recovered or the
+        call was ambiguous; True when there was nothing pending, when the result
+        was committed, or when the call failed unambiguously (which
+        ``bench.bridge_client`` guarantees means the game was not touched).
+        """
+        pending = traj.pending_exec
+        if pending is None:
+            # Cancelled before any program was sent: agent_step already handed
+            # the consumed feedback back to the next attempt.
+            return True
+        traj.pending_exec = None
+        step = int(pending["step"])
+        entry = self.infra.take_recovered("execute", traj.node.id, branch=traj.tid)
+        if entry is None:
+            self.fail_line(
+                traj,
+                f"{reason}: step {step}'s /execute was abandoned at its deadline "
+                f"and its outcome could not be recovered; line {traj.tid} is "
+                "partial and stops here",
+                kind="step_result_lost",
+            )
+            return False
+        exc = entry["error"]
+        if exc is not None:
+            if self.is_ambiguous(exc):
+                detail = self.fail_node_ambiguous(
+                    traj.node, exc, op="execute", branch=traj.tid, step=step,
+                )
+                if not traj.partial:
+                    traj.partial = detail
+                return False
+            # Unambiguous failure: the program never reached the game, so this
+            # is an ordinary environment error, told to the model as one.
+            traj.errors += 1
+            detail = f"{type(exc).__name__}: {exc}"
+            traj.conv.pending_feedback = EXEC_ERROR_FEEDBACK.format(
+                step=step, error=detail[:800]
+            )
+            self.incident("execute_failed",
+                          f"{detail} (settled {entry['duration_s']:.1f}s after it "
+                          f"was abandoned at the step deadline)",
+                          branch=traj.tid, step=step)
+            return True
+        res = entry["result"]
+        if not isinstance(res, dict):
+            self.fail_line(
+                traj,
+                f"{reason}: step {step}'s /execute settled with "
+                f"{type(res).__name__}, which is not a result this line can "
+                f"continue from; line {traj.tid} is partial and stops here",
+                kind="step_result_lost",
+            )
+            return False
+        self.incident(
+            "step_result_recovered",
+            f"{reason}: step {step}'s /execute settled "
+            f"{entry['duration_s']:.1f}s after it was abandoned; its result is "
+            "committed to this line instead of being dropped",
+            branch=traj.tid, step=step,
+        )
+        self.journal.event("step_result_recovered", step=step, branch=traj.tid,
+                           duration_s=round(float(entry["duration_s"]), 3),
+                           target=entry["target"])
+        self._commit_execute(traj, res, step=step,
+                             code_chars=int(pending["code_chars"]),
+                             exec_s=float(entry["duration_s"]))
+        return True
 
     def hints_for(self, n: int, *, offset: int = 0) -> list[str] | None:
         """The n per-seat strategy hints, or None when hinting is off.
@@ -1264,7 +1455,11 @@ class ArmRun:
             # NOT an environment error. The step deadline fired and the program
             # is STILL RUNNING in its worker thread; swallowing this would let
             # the caller march on to a terminal probe that races a live
-            # mutation. Re-raise; Infra keeps the call for the pre-probe drain.
+            # mutation. Re-raise; Infra keeps the call for the pre-probe drain,
+            # and the step is recorded as UNCOMMITTED so the join that settles
+            # it can write its result into this line (:meth:`settle_node`)
+            # instead of dropping a program the world has already seen.
+            traj.pending_exec = {"step": step, "code_chars": len(sample.code)}
             self.incident(
                 "step_deadline_cancelled",
                 f"execute abandoned at the T deadline after "
@@ -1273,6 +1468,19 @@ class ArmRun:
             )
             raise
         except BaseException as exc:  # noqa: BLE001 - env error, charged to T
+            if self.is_ambiguous(exc):
+                # Contract R2C4: the call may have run the program and never
+                # reported what it did. Telling the model "your program errored"
+                # would be a claim about a world nobody read, so the sandbox is
+                # quarantined, the line is partial and nothing is retried.
+                traj.errors += 1
+                detail = self.fail_node_ambiguous(
+                    traj.node, exc, op="execute", branch=traj.tid, step=step,
+                )
+                if not traj.partial:
+                    traj.partial = detail
+                return {"error": True, "parsed": True, "exception": detail,
+                        "ambiguous": True}
             traj.errors += 1
             detail = f"{type(exc).__name__}: {exc}"
             traj.conv.pending_feedback = EXEC_ERROR_FEEDBACK.format(
@@ -1280,7 +1488,19 @@ class ArmRun:
             )
             self.incident("execute_failed", detail, branch=traj.tid, step=step)
             return {"error": True, "parsed": True, "exception": detail}
-        exec_s = time.monotonic() - t0
+        return self._commit_execute(traj, res, step=step,
+                                    code_chars=len(sample.code),
+                                    exec_s=time.monotonic() - t0)
+
+    def _commit_execute(self, traj: Trajectory, res: dict[str, Any], *, step: int,
+                        code_chars: int, exec_s: float) -> dict[str, Any]:
+        """Feedback, score counters and journal record for ONE concluded program.
+
+        Shared by the normal path and by :meth:`commit_recovered_step`: a program
+        that concluded after its step deadline moved the same world and produced
+        the same kind of result, so it earns the same bookkeeping rather than
+        being dropped on the floor.
+        """
         production = float(res.get("production_score", 0.0) or 0.0)
         automated = float(res.get("automated_score", 0.0) or 0.0)
         ticks = int(res.get("ticks", 0) or 0)
@@ -1298,7 +1518,7 @@ class ArmRun:
             next_step=step + 1,
         )
         self.journal.step_result(
-            step=step, branch=traj.tid, code_chars=len(sample.code),
+            step=step, branch=traj.tid, code_chars=code_chars,
             production_score=production, automated_score=automated, ticks=ticks,
             error=bool(res.get("error")), exec_s=exec_s, output_head=output[:400],
         )
@@ -1328,6 +1548,12 @@ class ArmRun:
         except asyncio.CancelledError:
             raise  # deadline, not an env error -- Infra holds it for the drain
         except BaseException as exc:  # noqa: BLE001
+            if self.is_ambiguous(exc):
+                # Contract R2C4: the baseline program may have run. The branch is
+                # unscorable either way (no P5 zero) and its sandbox is retired,
+                # so nothing steps, probes or re-seeds on it again.
+                self.fail_node_ambiguous(node, exc, op="execute", branch=branch)
+                return None
             self.incident("baseline_read_failed", f"{type(exc).__name__}: {exc}",
                           branch=branch)
             return None
@@ -1392,6 +1618,14 @@ class ArmRun:
         except asyncio.CancelledError:
             raise  # deadline, not a probe failure
         except BaseException as exc:  # noqa: BLE001 - probe failure is survivable
+            if self.is_ambiguous(exc):
+                # Contract R2C4: /probe is a mutating call (it advances the game
+                # by the measurement window). An ambiguous failure means an
+                # unknown slice of that window may have been applied, so the
+                # sandbox is quarantined instead of measured or reused.
+                self.fail_node_ambiguous(node, exc, op="probe", branch=branch,
+                                         step=step)
+                return None
             self.incident(
                 "probe_failed", f"{type(exc).__name__}: {exc}",
                 branch=branch, step=step, cold=cold,
@@ -1450,6 +1684,14 @@ class ArmRun:
         probe = await self.probe_line(traj.node, branch=traj.tid, step=traj.step,
                                       kind=kind)
         if probe is None:
+            if traj.node.id in self.quarantined and not traj.partial:
+                # An ambiguous /probe (contract R2C4) retired this sandbox mid
+                # line: there is no reconciled world left to step on, so the
+                # line stops here instead of prompting against an unknown state.
+                traj.partial = (
+                    f"{traj.node.name} was quarantined during this line's {kind} "
+                    f"probe; line {traj.tid} is partial and stops here"
+                )
             return
         traj.conv.inject(self.probe_block(probe))
         traj.curve.add(t_s=self.budget.elapsed_s(), step=traj.step,
@@ -1508,13 +1750,21 @@ class ArmRun:
                 try:
                     state = await asyncio.to_thread(node.bridge.state_save)
                     self._dump_state(f"final-{i:02d}-{node.label}", state)
+                except asyncio.CancelledError:
+                    raise  # teardown is best effort, cancellation is not
                 except BaseException as exc:  # noqa: BLE001
                     self.incident("state_dump_failed",
                                   f"{type(exc).__name__}: {exc}",
                                   target=node.name)
+        # Deliberate best-effort teardown loops: one node's delete must not stop
+        # the others, so every failure is journaled and the loop goes on. A
+        # CANCELLATION is not such a failure -- the whole teardown is being torn
+        # down -- so it is re-raised before the broad catch.
         for node in list(nodes):
             try:
                 await self.infra.delete(node)
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001
                 self.incident("teardown_delete_failed", f"{type(exc).__name__}: {exc}",
                               target=node.name)
@@ -1532,6 +1782,8 @@ class ArmRun:
                 continue
             try:
                 await self.infra.delete_snapshot(snap)
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001
                 self.incident("teardown_snapshot_delete_failed",
                               f"{type(exc).__name__}: {exc}", target=snap)
@@ -1564,6 +1816,13 @@ class ArmRun:
                       "honest endpoint")
             self.quarantine(traj.node, detail, branch=traj.tid)
             traj.partial = detail
+            traj.pending_exec = None
+        elif traj.pending_exec is not None:
+            # The global drain above may have settled THIS line's abandoned
+            # /execute. That program is the last thing that happened to this
+            # factory, so its result is committed before the endpoint is read
+            # rather than left out of the line's counters and journal.
+            self.commit_recovered_step(traj, reason="terminal drain")
         probe = await self.probe_line(
             traj.node, branch=traj.tid, step=traj.step, kind="terminal"
         )
@@ -1635,7 +1894,13 @@ async def _sequential_loop(
             return float("inf")
         return until_s - run.budget.elapsed_s()
 
-    while not run.budget.expired() and leg_left_s() > 0.0:
+    if traj.partial:
+        # Handed in already broken (an ambiguous bridge call, a lost step result
+        # or a round that could not be scored): a PARTIAL line never steps again.
+        run.incident("line_partial_no_steps", traj.partial, branch=traj.tid,
+                     step=traj.step)
+        return
+    while not run.budget.expired() and leg_left_s() > 0.0 and not traj.partial:
         is_branch_step = (traj.step % cfg.m) == 0
         hint = hint_at_branch if (is_branch_step and hint_at_branch) else None
         deadline_s = min(run.step_deadline_s(), leg_left_s())
@@ -1663,6 +1928,8 @@ async def _sequential_loop(
             # after the leg boundary would only spend the next leg's clock.
             if not run.budget.expired() and leg_left_s() > 0.0:
                 await run.parity_probe(traj)
+            if traj.partial:
+                return
             if stop_at_boundary is not None and stop_at_boundary():
                 return
 
@@ -1880,6 +2147,8 @@ class BranchingRun(ArmRun):
         else:
             try:
                 await self.infra.delete_snapshot(snap, branch=f"r{round_idx}")
+            except asyncio.CancelledError:
+                raise  # torn down mid-cleanup; the reaper owns the residue
             except BaseException as exc:  # noqa: BLE001
                 self.incident("branch_snapshot_delete_failed",
                               f"{type(exc).__name__}: {exc}", branch=f"r{round_idx}")
@@ -1911,6 +2180,14 @@ class BranchingRun(ArmRun):
                 except asyncio.CancelledError:
                     raise  # the deadline, not a restore failure: never retried
                 except BaseException as exc:  # noqa: BLE001
+                    if self.is_ambiguous(exc):
+                        # Contract R2C4: a restore that may have half-applied is
+                        # NEVER retried -- a second restore onto an unknown state
+                        # is not a recovery. The pool sandbox is quarantined
+                        # (release() drops it for good) and the branch is skipped.
+                        self.fail_node_ambiguous(node, exc, op="state_restore",
+                                                 branch=branch)
+                        break
                     self.incident(
                         "child_restore_failed",
                         f"attempt {attempt + 1}: {type(exc).__name__}: {exc}",
@@ -2042,18 +2319,29 @@ class BranchingRun(ArmRun):
         score.endpoint_production = traj.last_production
         score.endpoint_automated = traj.last_automated
         rollout_s = time.monotonic() - t0
-        # None for a quarantined sandbox, which is what keeps a branch whose
-        # program never concluded out of the selection below.
+        # None for a quarantined sandbox, a /probe that failed and a window that
+        # never closed -- in every case this branch HAS NO MEASUREMENT.
         probe = await self.probe_line(node, branch=bid, step=traj.step, kind="branch")
         if probe is not None:
             score.probe_throughput = probe["throughput"]
             traj.curve.add(t_s=self.budget.elapsed_s(), step=traj.step,
                            throughput=probe["throughput"], branch=bid, kind="branch")
+        unscorable = unscorable or traj.partial
+        if probe is None and not unscorable:
+            # A branch with no probe cannot be RANKED: ``ScoreRecord.rank_key``
+            # reads a missing throughput as 0.0, so the historical-flow tie-break
+            # decides the round and can promote a seat nobody ever measured.
+            unscorable = (
+                f"branch {bid} has no branch probe: the fixed-window measurement "
+                "this round ranks on failed, timed out or was skipped"
+            )
+            self.incident("branch_unscorable", unscorable, branch=bid,
+                          step=traj.step)
         return BranchOutcome(
             branch=bid, conv=conv, node=node, score=score, steps=traj.step - base_step,
             candidate_chars=len(candidate.code or ""), errors=traj.errors,
             probe=probe, rollout_s=rollout_s, last_ticks=traj.last_ticks,
-            unscorable=unscorable or traj.partial,
+            unscorable=unscorable,
         )
 
     # -- the round ---------------------------------------------------------
@@ -2168,24 +2456,50 @@ class BranchingRun(ArmRun):
         )
         good: list[BranchOutcome] = []
         for i, out in enumerate(outcomes):
+            if isinstance(out, asyncio.CancelledError):
+                # gather(return_exceptions=True) CAPTURES cancellation. The round
+                # is being torn down, not failing, and nothing below may pretend
+                # otherwise.
+                raise out
             if isinstance(out, BaseException):
                 self.incident("branch_failed", f"{type(out).__name__}: {out}",
                               branch=f"r{round_idx}b{i}")
             else:
                 good.append(out)
+        dead = _provider_dead(outcomes)
+        if dead is not None:
+            # The quota is gone. The caller's generic recovery would sample it
+            # again with a fallback step and swallow the cause in its own broad
+            # catch, so it goes up NOW -- before anything is promoted or adopted.
+            self.incident("round_provider_dead", f"{type(dead).__name__}: {dead}",
+                          branch=f"r{round_idx}")
+            raise dead
         if not good:
-            raise RuntimeError(f"round {round_idx}: every branch failed")
-        # Ranking is over branches that CAN be ranked: no P5 baseline, or a
-        # sandbox left with a call this run could not join, means the numbers
-        # are not comparable with their siblings'. Excluded branches stay in
-        # the journal, and their transcripts are archived, as diagnostics.
+            # No branch state survived, and the pre-round main is not a fallback:
+            # its turn was consumed by this wave and its sandbox ran this round's
+            # first candidate, so its transcript and its world have come apart.
+            detail = (
+                f"round {round_idx}: every branch failed, so no branch state "
+                "survived; the canonical line cannot resume from the pre-round "
+                "main, whose turn was consumed here and whose sandbox this round "
+                "already mutated"
+            )
+            self.fail_line(main, detail, kind="line_partial_round_failed")
+            await self.release(
+                [n for n in branch_nodes if n.id != main.node.id], keep=None,
+            )
+            raise RuntimeError(detail)
+        # Ranking is over branches that CAN be ranked: no P5 baseline, no branch
+        # probe, or a sandbox left with a call this run could not join, means the
+        # numbers are not comparable with their siblings'. Excluded branches stay
+        # in the journal, and their transcripts are archived, as diagnostics.
         scorable = [o for o in good if not o.unscorable]
         excluded = {o.branch: o.unscorable for o in good if o.unscorable}
         if not scorable:
-            raise RuntimeError(
-                f"round {round_idx}: none of the {len(good)} surviving branch(es) "
-                f"is scorable ({'; '.join(excluded.values())})"
-            )
+            raise RuntimeError(await self._round_unscorable(
+                main, good, branch_nodes, prefix=prefix, base_step=base_step,
+                round_idx=round_idx, excluded=excluded,
+            ))
 
         winner = max(scorable, key=lambda o: o.score.rank_key())
         losers = [o for o in good if o is not winner]
@@ -2248,6 +2562,78 @@ class BranchingRun(ArmRun):
         await self.release(branch_nodes, keep=winner.node, main_before=main.node)
         return new_main
 
+    async def _round_unscorable(
+        self, main: Trajectory, good: Sequence[BranchOutcome],
+        branch_nodes: Sequence[Node], *, prefix: Conversation, base_step: int,
+        round_idx: int, excluded: dict[str, str],
+    ) -> str:
+        """No branch of this round can be ranked: move the line, claim nothing.
+
+        There is no winner -- the round produced no comparable measurement -- but
+        there is also no way back. The pre-round main handed its turn to the wave
+        and its sandbox ran this round's first candidate, so resuming it would
+        prompt "Continue" against a world its transcript never saw. One branch is
+        therefore ADOPTED for canonical continuity only, IN PLACE, so the
+        caller's recovery runs on state that actually exists: journaled as an
+        adoption and not a selection, with no probe block injected (there is no
+        measurement to inject) and every other branch released and archived.
+
+        When nothing is adoptable -- every survivor sits on a quarantined sandbox
+        -- the line ends as PARTIAL instead. Returns the message the caller
+        raises, so the round is still a failure to the loop above.
+        """
+        reason = ("; ".join(excluded.values()))[:1000]
+        self.journal.write("round_unscorable", round=round_idx, excluded=excluded,
+                           branches=len(good), step=base_step)
+        main_before = main.node
+        adoptable = [o for o in good if o.node.id not in self.quarantined]
+        if not adoptable:
+            detail = (
+                f"round {round_idx}: none of the {len(good)} surviving branch(es) "
+                f"is scorable and every one sits on a quarantined sandbox "
+                f"({reason}); the canonical line ends here rather than resume the "
+                "pre-round main, whose turn was consumed and whose sandbox this "
+                "round mutated"
+            )
+            self.fail_line(main, detail, kind="line_partial_round_unscorable")
+            await self.release(
+                [n for n in branch_nodes if n.id != main_before.id], keep=None,
+            )
+            return detail
+        adopted = adoptable[0]
+        for o in good:
+            if o is adopted:
+                continue
+            # P4: these transcripts are artifacts, never re-prompted.
+            self.journal.archive_branch(
+                branch=o.branch, step=base_step + o.steps,
+                messages=o.conv.messages[len(prefix.messages):],
+                score=o.score.to_dict(), reason="unscorable-round",
+            )
+        main.node = adopted.node
+        main.conv = adopted.conv
+        main.step = base_step + adopted.steps
+        main.errors += adopted.errors
+        main.last_production = adopted.score.endpoint_production
+        main.last_automated = adopted.score.endpoint_automated
+        main.last_ticks = adopted.last_ticks
+        main.pending_exec = None
+        detail = (
+            f"round {round_idx}: none of the {len(good)} surviving branch(es) is "
+            f"scorable ({reason}); {adopted.branch} was adopted for canonical "
+            "continuity only -- it is not a selection and this round measured "
+            "nothing"
+        )
+        self.incident("round_unscorable_adopted", detail, branch=adopted.branch)
+        self.journal.write(
+            "branch_adoption", round=round_idx, adopted=adopted.branch,
+            selection=False, reason="round_unscorable", step=main.step,
+            sandbox=adopted.node.name, excluded=excluded,
+        )
+        await self.release(branch_nodes, keep=adopted.node,
+                           main_before=main_before)
+        return detail
+
     # -- arm-specific hooks ------------------------------------------------
     async def materialize(
         self, main: Node, want: int, round_idx: int
@@ -2290,11 +2676,17 @@ class ForkBranchingRun(BranchingRun):
         self, nodes: Sequence[Node], *, keep: Node | None,
         main_before: Node | None = None,
     ) -> None:
+        # Deliberate best-effort cleanup loop: one loser's delete must not keep
+        # the round from releasing the rest, so failures are journaled and the
+        # loop continues. A CANCELLATION is not one of those failures -- the run
+        # itself is going away -- so it is re-raised before the broad catch.
         for node in nodes:
             if keep is not None and node.id == keep.id:
                 continue
             try:
                 await self.infra.delete(node)
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:  # noqa: BLE001
                 self.incident("loser_delete_failed", f"{type(exc).__name__}: {exc}",
                               target=node.name)
@@ -2386,6 +2778,16 @@ async def _branching_loop(run: BranchingRun, main: Trajectory) -> Trajectory:
                          branch=f"r{round_idx}")
             if run.budget.expired():
                 break
+            if main.partial:
+                # The round could not leave a line this run can account for
+                # (:meth:`BranchingRun._round_unscorable`). A fallback step would
+                # prompt against a sandbox whose state nobody can reconcile.
+                run.journal.event(
+                    "convergence_stopped", rounds_completed=round_idx - 1,
+                    reason="canonical_line_partial", detail=main.partial[:500],
+                    remaining_s=round(run.budget.remaining_s(), 3), step=main.step,
+                )
+                break
             # Fall back to a plain sequential step so the run keeps compounding.
             try:
                 await asyncio.wait_for(
@@ -2394,6 +2796,10 @@ async def _branching_loop(run: BranchingRun, main: Trajectory) -> Trajectory:
                 )
             except asyncio.CancelledError:
                 raise  # the T deadline, not a fallback-step failure
+            except ProviderDead:
+                # The quota is gone: the round's own recovery cannot be the thing
+                # that hides it from the orchestrator.
+                raise
             except BaseException as exc2:  # noqa: BLE001
                 run.incident("fallback_step_failed", f"{type(exc2).__name__}: {exc2}")
                 break
@@ -2637,6 +3043,12 @@ async def _hybrid_select(
                       f"{run.cfg.step_timeout_s:.0f}s join")
             run.quarantine(traj.node, detail, branch=traj.tid)
             traj.partial = detail
+            traj.pending_exec = None
+        elif traj.pending_exec is not None:
+            # The drain above settled this seat's abandoned /execute. Its result
+            # is what the seat is about to be RANKED on, so it is committed
+            # rather than dropped.
+            run.commit_recovered_step(traj, reason="Exp-3 selection drain")
     probes = await asyncio.gather(
         *(
             run.probe_line(t.node, branch=t.tid, step=t.step, kind="selection")
@@ -2666,12 +3078,29 @@ async def _hybrid_select(
         scored.append((traj, score, probe))
     # Quarantined seats are journaled with the rest (that record IS the leg-1
     # distribution) but must never be promoted: leg 2 would run on a sandbox
-    # this run cannot account for.
-    eligible = [s for s in scored if not s[0].partial]
+    # this run cannot account for. An UNMEASURED seat is excluded for a second
+    # reason: ``ScoreRecord.rank_key`` reads a missing probe as 0.0 throughput,
+    # so the historical-flow tie-break would settle Exp 3's ONLY selection
+    # between seats nobody measured.
+    excluded: dict[str, str] = {}
+    eligible: list[tuple[Trajectory, ScoreRecord, dict[str, Any] | None]] = []
+    for traj, score, probe in scored:
+        if traj.partial:
+            excluded[traj.tid] = traj.partial
+        elif probe is None:
+            excluded[traj.tid] = (
+                f"seat {traj.tid} has no selection probe: the fixed-window "
+                "measurement this selection ranks on failed, timed out or was "
+                "skipped"
+            )
+            run.incident("seat_unscorable", excluded[traj.tid], branch=traj.tid,
+                         step=traj.step)
+        else:
+            eligible.append((traj, score, probe))
     if not eligible:
         raise RuntimeError(
-            "Exp-3 selection: every leg-1 seat was left with a substrate call "
-            f"this run could not join ({len(scored)} seat(s)); there is no "
+            f"Exp-3 selection: none of the {len(scored)} leg-1 seat(s) is "
+            f"scorable ({'; '.join(excluded.values())}); there is no measured "
             "state leg 2 could honestly descend from"
         )
     winner, winner_score, winner_probe = max(eligible, key=lambda s: s[1].rank_key())
@@ -2679,7 +3108,9 @@ async def _hybrid_select(
         "round": 1,
         "phase": 1,
         "winner": winner.tid,
-        "k_effective": len(scored),
+        "k_effective": len(eligible),
+        "seats_scored": len(scored),
+        "excluded": excluded,
         "scores": {
             traj.tid: {
                 **score.to_dict(),
@@ -3142,6 +3573,10 @@ def _new_result(run: ArmRun) -> RunResult:
         replicate=cfg.replicate, K=cfg.K, m=cfg.m, T_s=cfg.T_s,
         entity=run.entity, quota=run.quota, model_info=run.llm.model_info(),
         journal_path=str(run.journal.path),
+        # Contract R2C3: the journal is an append stream of SESSIONS, so the
+        # path alone does not identify this run's evidence -- the session id
+        # does, and a consumer grading a verdict has to match it.
+        journal_session=run.journal.session,
     )
 
 
@@ -3169,10 +3604,15 @@ def _finish(run: ArmRun, result: RunResult, trajs: Sequence[Trajectory], *,
         best_traj, best_probe = max(probed, key=lambda p: p[1]["throughput"])
         result.endpoint_throughput = best_probe["throughput"]
         result.endpoint_source = best_traj.tid
-    if not probed:
+    if not trajs:
         result.status = "partial"
-        result.error = result.error or "no terminal probe"
+        result.error = result.error or (
+            "no line to measure: this run produced no trajectory at all"
+        )
     elif unmeasured:
+        # ONE coverage diagnostic, including the 0-of-N case: "no terminal probe"
+        # said nothing about WHICH lines went unmeasured, and 0 of N is the case
+        # where that list matters most.
         result.status = "partial"
         result.error = result.error or (
             f"partial seat coverage: {len(probed)} of {len(trajs)} line(s) "
@@ -3790,8 +4230,12 @@ async def live_smoke(
     llm = make_client(model, journal=journal)
     run = build_run(cfg, farplane=LoopbackFarplane(base_url),
                     bridge_factory=lambda url: Bridge(url), llm=llm, journal=journal)
+    # ``run_id`` and the journal path are part of the REPORT: the caller writes
+    # the results file, and a default path that does not carry this id
+    # overwrites the previous smoke's evidence (see :func:`main`).
     out: dict[str, Any] = {"model": model, "task": task, "base_url": base_url,
-                           "steps": []}
+                           "run_id": run_id, "journal_path": str(journal.path),
+                           "journal_session": journal.session, "steps": []}
     try:
         node = await run.provision_main("live")
         out["system_prompt_chars"] = len(run.system_prompt)
@@ -5994,10 +6438,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             live_smoke(base_url=args.live_url, model=args.model, task=args.task,
                        steps=args.live_steps)
         )
-        payload = json.dumps(report, indent=2)
-        out = args.out or "bench/results/live_smoke.json"
+        # The smoke's run id is unique per invocation, so its DEFAULT results
+        # path is too: a fixed bench/results/live_smoke.json overwrote the
+        # previous smoke's evidence, which is the only thing a smoke report is
+        # for. An explicit --out still wins.
+        run_id = str(report.get("run_id") or "live_smoke")
+        out = args.out or os.path.join(ArmConfig.results_dir, f"{run_id}.json")
+        report["results_path"] = out
         atomic_write_json(out, report)
-        print(payload)
+        print(json.dumps(report, indent=2))
         return 0 if report.get("ok") else 1
     cfg = ArmConfig(arm=args.arm, model=args.model, task_key=args.task,
                     replicate=args.replicate, T_s=args.T, K=args.K, m=args.m,
